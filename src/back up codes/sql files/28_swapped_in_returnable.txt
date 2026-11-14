@@ -1,0 +1,212 @@
+-- =====================================================================
+-- Chinito Scento - STEP 2: a piece swapped in on an invoice can be returned on that same invoice.
+-- Run in the Supabase SQL Editor AFTER files 24, 25, 26 and 27. Safe to re-run.
+-- BACKUP FIRST: this file replaces the request functions for returns.
+--
+-- THE PROBLEM
+--   Invoice INV-34 sold PERFUME-A. The customer swapped it for CUCAMELLA (an approved exchange).
+--   Until now the customer could not return CUCAMELLA on INV-34, because CUCAMELLA is not a
+--   line of that invoice.
+--
+-- THE RULE (nothing about how a return is booked or approved changes)
+--   * A piece that came out as a replacement on an APPROVED exchange / damaged replacement is
+--     "swapped in". It can be returned on the same invoice, once, like any other piece.
+--   * Each swapped-in piece remembers which approved RT slip put it in the customer's hands
+--     (the new column source_return_id). A piece from the original invoice has source_return_id empty.
+--   * What the customer paid for a swapped-in piece is what they paid for the piece they gave up
+--     (the swap was at the same collection price), so a refund returns exactly that.
+--   * Its cost is what that replacement really cost when it left stock, read from the stock
+--     movement log. A good piece that comes back goes into Finished Goods at that cost;
+--     a damaged piece is written off at that cost. Same journal entries as today.
+--   * A swapped-in piece can itself be swapped again (the chain is followed to the original line
+--     for the collection price).
+--   * Pending and approved requests both count, so the same piece can never be returned twice.
+--
+-- NOT TOUCHED: approve_sales_return, reject_sales_return, the customer ledger, balances,
+-- already-approved or rejected returns. The only change to existing data is one new empty column.
+-- =====================================================================
+
+-- ---------- 1. One new column ---------------------------------------------
+alter table public.sales_returns
+  add column if not exists source_return_id uuid references public.sales_returns(id);
+create index if not exists sales_returns_source_idx on public.sales_returns (source_return_id)
+  where source_return_id is not null;
+
+-- ---------- 2. One item of a request (internal) ------------------------------
+-- New last parameter p_source: the approved return row whose replacement piece is coming back.
+-- Empty = a piece from the original invoice (same behaviour as before).
+drop function if exists public.request_sales_return_line(bigint,uuid,date,uuid,uuid,int,text,text,uuid,text);
+
+create or replace function public.request_sales_return_line(
+  p_no bigint, p_batch uuid,
+  p_date date, p_sale uuid, p_size uuid, p_qty int, p_reason text, p_resolution text,
+  p_repl_size uuid, p_notes text, p_source uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  s public.sales;
+  src public.sales_returns;
+  cur public.sales_returns;
+  v_sold int;
+  v_used int;
+  v_price numeric(14,2);
+  v_paid numeric;
+  v_unit_cost numeric(14,4);
+  v_out_cost numeric;
+  v_repl uuid;
+  v_rp public.perfume_sizes;
+  v_refund numeric(14,2) := 0;
+  v_guard int := 0;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_reason is null or p_reason not in ('wrong_item','damaged','returned') then
+    raise exception 'Choose why the item is coming back.';
+  end if;
+  if not ((p_reason = 'wrong_item' and p_resolution = 'exchange')
+       or (p_reason = 'damaged' and p_resolution in ('refund','replace'))
+       or (p_reason = 'returned' and p_resolution = 'refund')) then
+    raise exception 'That outcome does not fit the reason.';
+  end if;
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many pieces are coming back.'; end if;
+
+  -- lock the invoice so two requests cannot claim the same piece at the same moment
+  select * into s from public.sales where id = p_sale for update;
+  if not found or s.status <> 'Posted' then raise exception 'Choose a sale that has been invoiced.'; end if;
+
+  if p_source is null then
+    -- a piece from the original invoice
+    select coalesce(sum(qty), 0), max(coalesce(list_price, unit_price)),
+           case when sum(qty) > 0 then sum(amount) / sum(qty) else 0 end,
+           case when sum(qty) > 0 then sum(cost) / sum(qty) else 0 end
+      into v_sold, v_price, v_paid, v_unit_cost
+    from public.sale_lines where sale_id = p_sale and size_id = p_size;
+    if v_sold = 0 then raise exception 'That item is not on this sale.'; end if;
+
+    select coalesce(sum(qty), 0) into v_used
+    from public.sales_returns
+    where sale_id = p_sale and size_id = p_size and source_return_id is null
+      and status in ('Pending','Approved');
+  else
+    -- a piece swapped in by an earlier approved exchange / replacement on this same invoice
+    select * into src from public.sales_returns
+     where id = p_source and sale_id = p_sale and status = 'Approved'
+       and resolution in ('exchange','replace') and repl_size_id is not null;
+    if not found then raise exception 'That swapped-in piece was not found on this invoice.'; end if;
+    if src.repl_size_id <> p_size then raise exception 'That is not the piece that was swapped in.'; end if;
+    v_sold := src.qty;
+
+    -- what the customer paid: the same as for the piece they gave up (the swap was at the same price)
+    v_paid := src.unit_price;
+
+    -- what the replacement really cost when it left stock (from the stock movement log)
+    select -sum(m.cost) into v_out_cost
+      from public.stock_movements m
+     where m.ref_type = 'sales_return' and m.ref_id = src.id and m.move_type = 'out';
+    if v_out_cost is null then
+      raise exception 'The stock record of this swapped-in piece was not found, so it cannot be returned here.';
+    end if;
+    v_unit_cost := round(v_out_cost / src.qty, 4);
+
+    -- collection price: follow the chain back to the original invoice line
+    cur := src;
+    while cur.source_return_id is not null and v_guard < 20 loop
+      select * into cur from public.sales_returns where id = cur.source_return_id;
+      v_guard := v_guard + 1;
+    end loop;
+    select max(coalesce(list_price, unit_price)) into v_price
+      from public.sale_lines where sale_id = p_sale and size_id = cur.size_id;
+    if v_price is null then raise exception 'The original invoice line of this piece was not found.'; end if;
+
+    select coalesce(sum(qty), 0) into v_used
+    from public.sales_returns
+    where source_return_id = p_source and status in ('Pending','Approved');
+  end if;
+
+  if p_qty > v_sold - v_used then
+    raise exception 'Only % piece(s) of this item can still be returned on this sale.', v_sold - v_used;
+  end if;
+
+  if p_resolution in ('exchange','replace') then
+    v_repl := coalesce(p_repl_size, p_size);
+    select ps.* into v_rp
+      from public.perfume_sizes ps join public.perfumes pf on pf.id = ps.perfume_id
+     where ps.id = v_repl and ps.is_active and pf.status <> 'Discontinued';
+    if not found then raise exception 'Choose a valid replacement item.'; end if;
+    if v_rp.price <> v_price then
+      raise exception 'The replacement must have the same collection price (%) as the item that was sold.', v_price;
+    end if;
+  else
+    v_repl := null;
+    v_refund := round(p_qty * v_paid, 2);
+  end if;
+
+  insert into public.sales_returns
+    (id, return_no, batch_id, return_date, sale_id, reason, resolution, size_id, qty, repl_size_id,
+     unit_price, unit_cost, refund_amount, notes, source_return_id)
+  values
+    (v_id, coalesce(p_no, nextval('public.sales_return_no_seq')), p_batch,
+     coalesce(p_date, (now() at time zone 'Asia/Manila')::date), p_sale, p_reason, p_resolution, p_size, p_qty, v_repl,
+     round(v_paid, 2), v_unit_cost, v_refund, nullif(trim(coalesce(p_notes, '')), ''), p_source);
+  return v_id;
+end;
+$$;
+
+-- ---------- 3. Several items in one request (one RT number) ------------------------
+-- p_lines item: { size_id, qty, reason, resolution, repl_size_id, source_return_id }
+-- source_return_id is optional: leave it out (or null) for a piece from the original invoice.
+create or replace function public.request_sales_return_batch(
+  p_date date, p_sale uuid, p_notes text, p_lines jsonb
+) returns int
+language plpgsql security definer set search_path = public as $$
+declare
+  v_batch uuid := gen_random_uuid();
+  v_no    bigint;
+  v_line  jsonb;
+  v_id    uuid;
+  v_n     int := 0;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 1 then
+    raise exception 'Add at least one item to return.';
+  end if;
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    v_id := public.request_sales_return_line(
+      v_no, v_batch, p_date, p_sale,
+      nullif(v_line->>'size_id', '')::uuid,
+      coalesce((v_line->>'qty')::int, 0),
+      v_line->>'reason',
+      v_line->>'resolution',
+      nullif(v_line->>'repl_size_id', '')::uuid,
+      p_notes,
+      nullif(v_line->>'source_return_id', '')::uuid
+    );
+    if v_no is null then
+      select return_no into v_no from public.sales_returns where id = v_id;
+    end if;
+    v_n := v_n + 1;
+  end loop;
+
+  return v_n;
+end;
+$$;
+
+-- ---------- 4. Permissions -----------------------------------------------------------
+revoke all on function public.request_sales_return_line(bigint,uuid,date,uuid,uuid,int,text,text,uuid,text,uuid) from public, anon, authenticated;
+revoke all on function public.request_sales_return_batch(date,uuid,text,jsonb) from public, anon;
+grant execute on function public.request_sales_return_batch(date,uuid,text,jsonb) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- Checks (run one at a time) --------------------------------------------------
+-- 1) The new column exists:
+-- select column_name from information_schema.columns
+--  where table_name = 'sales_returns' and column_name = 'source_return_id';
+-- 2) Only ONE version of the line function should exist (expect 1 row, 11 arguments):
+-- select proname, pronargs from pg_proc
+--  where pronamespace = 'public'::regnamespace and proname = 'request_sales_return_line';
+-- 3) After a test: swap a piece on a test invoice, approve it, then return the swapped-in piece.
+--    The new row should point to the swap:
+-- select return_no, status, reason, resolution, size_id, qty, source_return_id
+--   from public.sales_returns order by created_at desc limit 5;

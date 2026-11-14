@@ -1,0 +1,133 @@
+-- =====================================================================
+-- Chinito Scento - CLEAN SLATE for testing
+-- Run in the Supabase SQL Editor.   *** THIS DELETES DATA AND CANNOT BE UNDONE ***
+--
+-- STEP 0  look at what is there now (safe, read only)
+-- STEP 1  delete all TRANSACTIONS and restart the numbering at 1
+-- STEP 2  (optional, commented out) also delete the MASTER DATA
+-- STEP 3  check that everything is empty
+--
+-- ALWAYS KEPT (never touched by this file):
+--   * Users and logins: public.profiles and Supabase Authentication > Users
+--   * Chart of accounts: public.accounts
+--   * Business settings: public.business_settings (maceration days, normal loss %, ...)
+--   * The tables, views, functions and policies themselves (only rows are deleted)
+--
+-- Why TRUNCATE: the journal and the stock log are locked against DELETE on purpose, so a
+-- normal DELETE would be refused. TRUNCATE is not blocked by those locks.
+-- There is deliberately no CASCADE: if some table I do not know about points at these
+-- tables, the whole script stops with an error and NOTHING is deleted.
+-- =====================================================================
+
+
+-- ---------------------------------------------------------------------
+-- STEP 0 - what is in the database right now (run this first, on its own)
+-- ---------------------------------------------------------------------
+select 'journal_entries' as tbl, count(*) as rows from public.journal_entries
+union all select 'sales',              count(*) from public.sales
+union all select 'sales_returns',      count(*) from public.sales_returns
+union all select 'customer_payments',  count(*) from public.customer_payments
+union all select 'purchases',          count(*) from public.purchases
+union all select 'supplier_payments',  count(*) from public.supplier_payments
+union all select 'maceration_batches', count(*) from public.maceration_batches
+union all select 'bottling_runs',      count(*) from public.bottling_runs
+union all select 'packaging_runs',     count(*) from public.packaging_runs
+union all select 'stock_writeoffs',    count(*) from public.stock_writeoffs
+union all select 'stock_layers',       count(*) from public.stock_layers
+union all select '-- customers (master)',  count(*) from public.customers
+union all select '-- suppliers (master)',  count(*) from public.suppliers
+union all select '-- perfumes (master)',   count(*) from public.perfumes
+union all select '-- materials (master)',  count(*) from public.materials
+union all select '-- profiles (kept)',     count(*) from public.profiles;
+
+
+-- ---------------------------------------------------------------------
+-- STEP 1 - delete every transaction, keep customers / suppliers / perfumes / materials
+-- Run this whole block together.
+-- ---------------------------------------------------------------------
+begin;
+
+truncate table
+  -- accounting
+  public.journal_lines,
+  public.journal_entries,
+  -- sales and collections
+  public.customer_payment_allocations,
+  public.customer_payments,
+  public.sales_returns,
+  public.sale_lines,
+  public.sales,
+  -- purchasing, installments and supplier payments
+  public.installment_payments,
+  public.interest_accruals,
+  public.purchase_installments,
+  public.purchase_installment_plans,
+  public.payment_allocations,
+  public.supplier_payments,
+  public.purchase_lines,
+  public.purchases,
+  -- production and stock
+  public.packaging_runs,
+  public.bottling_runs,
+  public.maceration_inputs,
+  public.maceration_batches,
+  public.stock_writeoffs,
+  public.stock_movements,
+  public.stock_layers;
+
+-- numbering starts again at 1 (INV-0001, MB-0001, BT-0001, PK-0001, ...)
+alter sequence public.journal_no_seq          restart with 1;
+alter sequence public.sale_no_seq             restart with 1;
+alter sequence public.invoice_no_seq          restart with 1;
+alter sequence public.sales_return_no_seq     restart with 1;
+alter sequence public.customer_payment_no_seq restart with 1;
+alter sequence public.purchase_no_seq         restart with 1;
+alter sequence public.payment_no_seq          restart with 1;
+alter sequence public.maceration_no_seq       restart with 1;
+alter sequence public.bottling_no_seq         restart with 1;
+alter sequence public.packaging_no_seq        restart with 1;
+alter sequence public.writeoff_no_seq         restart with 1;
+
+commit;
+
+
+-- ---------------------------------------------------------------------
+-- STEP 2 (OPTIONAL) - ALSO delete customers, suppliers, perfumes, sizes and prices,
+-- raw materials and reorder levels. Only run this if you want to re-enter those too.
+-- Remove the leading "-- " from the lines below, then run STEP 1 first if you have not.
+-- ---------------------------------------------------------------------
+-- begin;
+--
+-- truncate table
+--   public.stock_thresholds,     -- reorder levels (no foreign key, so it must be listed)
+--   public.customer_credit,
+--   public.customers,
+--   public.suppliers,
+--   public.perfume_sizes,
+--   public.perfumes,
+--   public.materials;
+--
+-- alter sequence public.material_code_seq restart with 1;   -- RM codes
+-- alter sequence public.perfume_sku_seq   restart with 1;   -- CS-001, CS-002, ...
+--
+-- commit;
+
+
+-- ---------------------------------------------------------------------
+-- STEP 3 - check (every transaction row should be 0; profiles should still have your users)
+-- ---------------------------------------------------------------------
+select 'journal_entries' as tbl, count(*) as rows from public.journal_entries
+union all select 'journal_lines',      count(*) from public.journal_lines
+union all select 'sales',              count(*) from public.sales
+union all select 'customer_payments',  count(*) from public.customer_payments
+union all select 'purchases',          count(*) from public.purchases
+union all select 'maceration_batches', count(*) from public.maceration_batches
+union all select 'bottling_runs',      count(*) from public.bottling_runs
+union all select 'packaging_runs',     count(*) from public.packaging_runs
+union all select 'stock_layers',       count(*) from public.stock_layers
+union all select 'stock_movements',    count(*) from public.stock_movements
+union all select '-- profiles (kept)',  count(*) from public.profiles
+union all select '-- accounts (kept)',  count(*) from public.accounts;
+
+-- the inventory screen should now be empty too (needs the app session, so just look at Stock & Alerts):
+-- select * from public.inventory_status;

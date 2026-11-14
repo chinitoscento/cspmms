@@ -1,0 +1,60 @@
+-- =====================================================================
+-- Chinito Scento - return / exchange of SEVERAL items from one invoice in one request.
+-- Run after 09_sales.sql (and your later sales updates). Safe to re-run.
+--
+-- It changes nothing about how a return is valued, approved or booked.
+-- It simply calls your existing request_sales_return once per item, all inside ONE transaction:
+-- either every item is accepted or none is. The rows are linked by a batch_id so the owner can
+-- approve or reject them together.
+-- Each item keeps its own reason and outcome (a swap and a damaged refund can be in the same request).
+-- =====================================================================
+
+alter table public.sales_returns add column if not exists batch_id uuid;
+create index if not exists sales_returns_batch_idx on public.sales_returns (batch_id) where batch_id is not null;
+
+-- p_lines: [{ "size_id": uuid, "qty": 2, "reason": "wrong_item" | "damaged",
+--             "resolution": "exchange" | "refund" | "replace", "repl_size_id": uuid or null }]
+create or replace function public.request_sales_return_batch(
+  p_date date, p_sale uuid, p_notes text, p_lines jsonb
+) returns int
+language plpgsql security definer set search_path = public as $$
+declare
+  v_batch uuid := gen_random_uuid();
+  v_line  jsonb;
+  v_id    uuid;
+  v_n     int := 0;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 1 then
+    raise exception 'Add at least one item to return.';
+  end if;
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    -- each call checks the item is on the invoice, how many can still come back (counting the lines
+    -- already added in this same request), and that a replacement has the same price
+    v_id := public.request_sales_return(
+      p_date,
+      p_sale,
+      nullif(v_line->>'size_id', '')::uuid,
+      coalesce((v_line->>'qty')::int, 0),
+      v_line->>'reason',
+      v_line->>'resolution',
+      nullif(v_line->>'repl_size_id', '')::uuid,
+      p_notes
+    );
+    update public.sales_returns set batch_id = v_batch where id = v_id;
+    v_n := v_n + 1;
+  end loop;
+
+  return v_n;
+end;
+$$;
+
+revoke all on function public.request_sales_return_batch(date, uuid, text, jsonb) from public, anon;
+grant execute on function public.request_sales_return_batch(date, uuid, text, jsonb) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- Check (run on its own): the column should exist
+-- select column_name from information_schema.columns
+--  where table_name = 'sales_returns' and column_name = 'batch_id';

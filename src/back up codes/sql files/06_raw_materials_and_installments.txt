@@ -1,0 +1,814 @@
+-- =====================================================================
+-- Chinito Scento - Phase 2b: Raw Materials catalog, pouch packaging,
+-- credit installments with accrued interest.
+-- Run in the Supabase SQL Editor AFTER 05_inventory_procurement_production.
+-- Safe to re-run.
+-- Sole proprietor, non-VAT, pesos.
+-- =====================================================================
+
+-- ---------- 0. Interest accounts and settings ------------------------
+alter table public.business_settings
+  add column if not exists interest_expense_code text,
+  add column if not exists interest_payable_code text;
+
+do $$
+declare
+  v_exp text;
+  v_pay text;
+  v_n int;
+  v_type public.accounts.type%type;
+  v_side public.accounts.normal_side%type;
+  v_cash public.accounts.cash_class%type;
+begin
+  select interest_expense_code, interest_payable_code into v_exp, v_pay
+  from public.business_settings where id;
+
+  -- Interest Expense (expense)
+  if v_exp is null or not exists (select 1 from public.accounts where code = v_exp) then
+    select code into v_exp from public.accounts
+     where type = 'expense' and lower(name) like 'interest expense%' order by code limit 1;
+    if v_exp is null then
+      select coalesce(max(code::int), 6000) + 10 into v_n
+        from public.accounts where type = 'expense' and code ~ '^6[0-9]+$';
+      while exists (select 1 from public.accounts where code = v_n::text) loop v_n := v_n + 10; end loop;
+      select type, normal_side, cash_class into v_type, v_side, v_cash from public.accounts where code = '5110';
+      insert into public.accounts (code, name, type, normal_side, cash_class, is_system)
+      values (v_n::text, 'Interest Expense', v_type, v_side, v_cash, true);
+      v_exp := v_n::text;
+    end if;
+  end if;
+
+  -- Interest Payable (liability), modelled on Accounts Payable (2000)
+  if v_pay is null or not exists (select 1 from public.accounts where code = v_pay) then
+    select code into v_pay from public.accounts
+     where lower(name) like 'interest payable%' order by code limit 1;
+    if v_pay is null then
+      select coalesce(max(code::int), 2000) + 10 into v_n
+        from public.accounts where code ~ '^2[0-9]+$';
+      while exists (select 1 from public.accounts where code = v_n::text) loop v_n := v_n + 10; end loop;
+      select type, normal_side, cash_class into v_type, v_side, v_cash from public.accounts where code = '2000';
+      insert into public.accounts (code, name, type, normal_side, cash_class, is_system)
+      values (v_n::text, 'Interest Payable', v_type, v_side, v_cash, true);
+      v_pay := v_n::text;
+    end if;
+  end if;
+
+  update public.business_settings set interest_expense_code = v_exp, interest_payable_code = v_pay where id;
+end $$;
+
+-- ---------- 1. Raw material categories ------------------------------
+do $$
+declare r record;
+begin
+  for r in select conname from pg_constraint
+            where conrelid = 'public.materials'::regclass and contype = 'c'
+              and pg_get_constraintdef(oid) ilike '%bottle_sticker%'
+  loop
+    execute format('alter table public.materials drop constraint %I', r.conname);
+  end loop;
+end $$;
+
+alter table public.materials drop constraint if exists materials_category_chk;
+alter table public.materials add constraint materials_category_chk
+  check (category in ('oil','solvent','bottle','bottle_sticker','box','box_sticker','pouch','pouch_sticker','wrap','other'));
+
+-- A material with stock history keeps its category and unit (they decide which
+-- account its cost sits in); a material with stock on hand cannot be deactivated.
+create or replace function public.materials_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if (new.category <> old.category or new.unit <> old.unit)
+     and exists (select 1 from public.stock_layers where material_id = old.id) then
+    raise exception 'This material already has stock history, so its category and unit cannot be changed. Add a new material instead.';
+  end if;
+  if old.is_active and not new.is_active
+     and exists (select 1 from public.stock_layers where material_id = old.id and qty_remaining > 0) then
+    raise exception 'This material still has stock on hand, so it cannot be deactivated yet.';
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists materials_guard_trg on public.materials;
+create trigger materials_guard_trg before update on public.materials
+  for each row execute function public.materials_guard();
+
+-- ---------- 2. Packaging: box set OR pouch set ----------------------
+alter table public.packaging_runs
+  add column if not exists pouch_material_id        uuid references public.materials(id),
+  add column if not exists pouch_sticker_material_id uuid references public.materials(id);
+
+drop function if exists public.record_packaging(date,uuid,int,uuid,uuid,uuid,int,text);
+
+-- Box set: box + box sticker + wrap.  Pouch set: pouch + pouch sticker (+ wrap if you use it).
+create or replace function public.record_packaging(
+  p_date date, p_size uuid, p_qty int, p_spoiled int, p_notes text,
+  p_box uuid default null, p_box_sticker uuid default null, p_wrap uuid default null,
+  p_pouch uuid default null, p_pouch_sticker uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_spoiled int := coalesce(p_spoiled, 0);
+  v_sz public.perfume_sizes;
+  v_pf public.perfumes;
+  v_bottled numeric(14,2);
+  v_t numeric; v_s numeric;
+  v_mats numeric(14,2) := 0;
+  v_spoil numeric(14,2) := 0;
+  v_finished numeric(14,2);
+  v_lines jsonb := '[]'::jsonb;
+  v_je uuid;
+  v_label text;
+  v_pouch_set boolean := (p_pouch is not null or p_pouch_sticker is not null);
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many pieces were packaged.'; end if;
+  if v_spoiled < 0 then raise exception 'Spoiled units cannot be negative.'; end if;
+
+  if v_pouch_set then
+    if p_pouch is null or p_pouch_sticker is null then raise exception 'Choose both the pouch and the pouch sticker.'; end if;
+    if p_box is not null or p_box_sticker is not null then raise exception 'Use either a box set or a pouch set, not both.'; end if;
+  else
+    if p_box is null or p_box_sticker is null or p_wrap is null then raise exception 'Choose the box, box sticker and wrap.'; end if;
+  end if;
+
+  select * into v_sz from public.perfume_sizes where id = p_size and is_active;
+  if not found then raise exception 'Choose a perfume size.'; end if;
+  select * into v_pf from public.perfumes where id = v_sz.perfume_id and status <> 'Discontinued';
+  if not found then raise exception 'This perfume is discontinued.'; end if;
+
+  v_no := nextval('public.packaging_no_seq');
+  v_label := 'PK-' || lpad(v_no::text, 4, '0');
+
+  v_bottled := public.stock_out('bottled', v_sz.id, p_qty, v_date, 'packaging', v_id);
+
+  if v_pouch_set then
+    select o_total, o_spoiled into v_t, v_s
+      from public.consume_material(p_pouch, 'pouch', p_qty, v_spoiled, v_date, 'packaging', v_id);
+    v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+    select o_total, o_spoiled into v_t, v_s
+      from public.consume_material(p_pouch_sticker, 'pouch_sticker', p_qty, v_spoiled, v_date, 'packaging', v_id);
+    v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+  else
+    select o_total, o_spoiled into v_t, v_s
+      from public.consume_material(p_box, 'box', p_qty, v_spoiled, v_date, 'packaging', v_id);
+    v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+    select o_total, o_spoiled into v_t, v_s
+      from public.consume_material(p_box_sticker, 'box_sticker', p_qty, v_spoiled, v_date, 'packaging', v_id);
+    v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+  end if;
+  if p_wrap is not null then
+    select o_total, o_spoiled into v_t, v_s
+      from public.consume_material(p_wrap, 'wrap', p_qty, v_spoiled, v_date, 'packaging', v_id);
+    v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+  end if;
+
+  v_finished := v_bottled + (v_mats - v_spoil);
+  if v_finished + v_spoil <= 0 then
+    raise exception 'The materials used have no recorded cost, so nothing can be posted.';
+  end if;
+
+  if v_finished > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1330', 'debit', v_finished, 'memo', v_label || ' ' || v_pf.name || ' ' || v_sz.size_ml || ' ml'));
+  end if;
+  if v_spoil > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '5110', 'debit', v_spoil, 'memo', 'Spoiled packaging materials'));
+  end if;
+  if v_bottled > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1320', 'credit', v_bottled, 'memo', 'Bottled perfume used'));
+  end if;
+  if v_mats > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1220', 'credit', v_mats, 'memo', 'Packaging materials used'));
+  end if;
+
+  v_je := public.post_module_entry(v_date, v_label,
+            'Packaging ' || v_label || ' - ' || p_qty || ' x ' || v_pf.name || ' ' || v_sz.size_ml || ' ml',
+            v_lines, 'packaging', v_id);
+
+  insert into public.packaging_runs
+    (id, run_no, run_date, perfume_id, size_id, qty, spoiled_qty, bottled_cost,
+     box_material_id, box_sticker_material_id, wrap_material_id,
+     pouch_material_id, pouch_sticker_material_id,
+     materials_cost, spoiled_cost, finished_cost, notes, journal_entry_id)
+  values
+    (v_id, v_no, v_date, v_pf.id, v_sz.id, p_qty, v_spoiled, v_bottled,
+     p_box, p_box_sticker, p_wrap,
+     p_pouch, p_pouch_sticker,
+     v_mats, v_spoil, v_finished, nullif(trim(coalesce(p_notes, '')), ''), v_je);
+
+  perform public.stock_in('finished', null, null, v_sz.id, v_date, p_qty, v_finished, 'packaging', v_id);
+  return v_id;
+end;
+$$;
+
+-- ---------- 3. Installment plans and interest accruals --------------
+create table if not exists public.purchase_installment_plans (
+  id               uuid primary key default gen_random_uuid(),
+  purchase_id      uuid not null unique references public.purchases(id),
+  installments     int  not null check (installments between 2 and 60),
+  first_due        date not null,
+  interest_total   numeric(14,2) not null default 0 check (interest_total >= 0),
+  interest_rate_pct numeric(8,4),            -- informational: % per month, flat
+  accrued_interest numeric(14,2) not null default 0 check (accrued_interest >= 0),
+  created_at       timestamptz not null default now()
+);
+
+create table if not exists public.purchase_installments (
+  id            uuid primary key default gen_random_uuid(),
+  plan_id       uuid not null references public.purchase_installment_plans(id),
+  purchase_id   uuid not null references public.purchases(id),
+  seq           int  not null,
+  due_date      date not null,
+  principal_due numeric(14,2) not null check (principal_due >= 0),
+  interest_due  numeric(14,2) not null default 0 check (interest_due >= 0),
+  unique (plan_id, seq)
+);
+create index if not exists purchase_installments_purchase_idx on public.purchase_installments (purchase_id);
+
+create table if not exists public.installment_payments (
+  id             uuid primary key default gen_random_uuid(),
+  payment_id     uuid not null references public.supplier_payments(id),
+  installment_id uuid not null references public.purchase_installments(id),
+  principal_amt  numeric(14,2) not null default 0 check (principal_amt >= 0),
+  interest_amt   numeric(14,2) not null default 0 check (interest_amt >= 0)
+);
+create index if not exists installment_payments_inst_idx on public.installment_payments (installment_id);
+
+create table if not exists public.interest_accruals (
+  id               uuid primary key default gen_random_uuid(),
+  plan_id          uuid not null references public.purchase_installment_plans(id),
+  accrual_date     date not null,
+  amount           numeric(14,2) not null check (amount > 0),
+  kind             text not null check (kind in ('monthly','catchup')),
+  journal_entry_id uuid references public.journal_entries(id),
+  voided           boolean not null default false,
+  created_at       timestamptz not null default now()
+);
+create index if not exists interest_accruals_plan_idx on public.interest_accruals (plan_id);
+
+-- ---------- 4. Record a purchase (now with installments) ------------
+drop function if exists public.record_purchase(date,uuid,text,text,date,text,jsonb);
+
+-- p_installments (2-60) turns a credit purchase into monthly installments.
+-- p_interest is the TOTAL interest on the plan in pesos; it is accrued as an expense over time.
+create or replace function public.record_purchase(
+  p_date date, p_supplier uuid, p_reference text, p_payment text,
+  p_due date, p_notes text, p_lines jsonb,
+  p_installments int default null, p_first_due date default null,
+  p_interest numeric default 0, p_interest_rate numeric default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_line jsonb;
+  v_n int := 0;
+  v_type text;
+  v_mat public.materials;
+  v_qty numeric;
+  v_cost numeric;
+  v_amt numeric(14,2);
+  v_code text;
+  v_desc text;
+  v_total numeric(14,2) := 0;
+  v_terms int := 0;
+  v_sup text;
+  v_due date;
+  v_dr jsonb;
+  v_cr_code text;
+  v_label text;
+  v_je uuid;
+  v_ninst int := coalesce(p_installments, 0);
+  v_first date;
+  v_int numeric(14,2) := round(coalesce(p_interest, 0), 2);
+  v_plan uuid;
+  v_pp numeric;
+  v_ii numeric;
+  k int;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_payment not in ('cash','bank','credit') then raise exception 'Choose how this purchase is paid.'; end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 1 then
+    raise exception 'Add at least one line.';
+  end if;
+
+  if p_supplier is not null then
+    select name, payment_terms_days into v_sup, v_terms from public.suppliers where id = p_supplier;
+    if not found then raise exception 'Supplier not found.'; end if;
+  end if;
+  if p_payment = 'credit' and p_supplier is null then
+    raise exception 'A purchase on credit needs a supplier.';
+  end if;
+  v_due := case when p_payment = 'credit' then coalesce(p_due, v_date + coalesce(v_terms, 0)) end;
+
+  if v_ninst <> 0 then
+    if p_payment <> 'credit' then raise exception 'Installments are only for purchases on credit.'; end if;
+    if v_ninst < 2 or v_ninst > 60 then raise exception 'Choose between 2 and 60 installments.'; end if;
+    v_first := coalesce(p_first_due, (v_date + interval '1 month')::date);
+    if v_first < v_date then raise exception 'The first due date cannot be before the purchase date.'; end if;
+    v_due := v_first;
+  end if;
+  if v_int < 0 then raise exception 'Interest cannot be negative.'; end if;
+  if v_int > 0 and v_ninst = 0 then raise exception 'Interest can only be set on an installment plan.'; end if;
+
+  v_no := nextval('public.purchase_no_seq');
+  v_label := 'PUR-' || lpad(v_no::text, 4, '0');
+
+  insert into public.purchases (id, purchase_no, purchase_date, supplier_id, reference, payment_type, due_date, notes, total)
+  values (v_id, v_no, v_date, p_supplier, nullif(trim(p_reference), ''), p_payment, v_due, nullif(trim(p_notes), ''), 0);
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    v_n := v_n + 1;
+    v_type := v_line->>'line_type';
+    v_qty := coalesce((v_line->>'qty')::numeric, 0);
+    v_cost := coalesce((v_line->>'unit_cost')::numeric, 0);
+    if v_qty <= 0 then raise exception 'Line %: quantity must be more than zero.', v_n; end if;
+    if v_cost < 0 then raise exception 'Line %: cost cannot be negative.', v_n; end if;
+    v_amt := round(v_qty * v_cost, 2);
+    v_mat := null;
+
+    if v_type = 'material' then
+      select * into v_mat from public.materials
+       where id = nullif(v_line->>'material_id', '')::uuid and is_active;
+      if not found then raise exception 'Line %: choose a material.', v_n; end if;
+      v_code := case v_mat.category when 'oil' then '1200' when 'solvent' then '1210' else '1220' end;
+      v_desc := v_mat.name;
+    elsif v_type = 'asset' then
+      v_code := v_line->>'account_code';
+      if v_code is null or v_code not in ('1400','1500') then
+        raise exception 'Line %: an asset goes to Prepaid Expenses or Equipment.', v_n;
+      end if;
+      v_desc := nullif(trim(coalesce(v_line->>'description', '')), '');
+      if v_desc is null then raise exception 'Line %: describe the item.', v_n; end if;
+    elsif v_type = 'expense' then
+      v_code := v_line->>'account_code';
+      perform 1 from public.accounts
+       where code = v_code and type = 'expense' and is_active and not is_system and code not in ('6060','6080');
+      if not found then raise exception 'Line %: choose an expense account.', v_n; end if;
+      v_desc := nullif(trim(coalesce(v_line->>'description', '')), '');
+      if v_desc is null then raise exception 'Line %: describe the expense.', v_n; end if;
+    else
+      raise exception 'Line %: unknown line type.', v_n;
+    end if;
+
+    insert into public.purchase_lines (purchase_id, line_no, line_type, material_id, description, account_code, qty, unit_cost, amount)
+    values (v_id, v_n, v_type, v_mat.id, v_desc, v_code, v_qty, v_cost, v_amt);
+
+    if v_type = 'material' then
+      perform public.stock_in('material', v_mat.id, null, null, v_date, v_qty, v_amt, 'purchase', v_id);
+    end if;
+    v_total := v_total + v_amt;
+  end loop;
+
+  if v_total <= 0 then raise exception 'The purchase total cannot be zero.'; end if;
+
+  select jsonb_agg(jsonb_build_object('account_code', x.code, 'debit', x.amt, 'memo', 'Purchase ' || v_label) order by x.code)
+    into v_dr
+  from (
+    select account_code as code, sum(amount) as amt
+    from public.purchase_lines where purchase_id = v_id
+    group by account_code having sum(amount) > 0
+  ) x;
+
+  v_cr_code := case p_payment when 'cash' then '1010' when 'bank' then '1020' else '2000' end;
+
+  v_je := public.post_module_entry(
+    v_date, v_label,
+    'Purchase ' || v_label || coalesce(' from ' || v_sup, ''),
+    v_dr || jsonb_build_array(jsonb_build_object(
+      'account_code', v_cr_code, 'credit', v_total,
+      'memo', 'Purchase ' || v_label, 'supplier_id', p_supplier)),
+    'procurement', v_id);
+
+  update public.purchases set total = v_total, journal_entry_id = v_je where id = v_id;
+
+  -- Installment plan: principal and interest are split evenly; the last one absorbs rounding.
+  -- Interest is NOT booked now. It accrues as time passes (see accrue_installment_interest).
+  if v_ninst >= 2 then
+    insert into public.purchase_installment_plans (purchase_id, installments, first_due, interest_total, interest_rate_pct)
+    values (v_id, v_ninst, v_first, v_int, p_interest_rate)
+    returning id into v_plan;
+    v_pp := floor(v_total * 100 / v_ninst) / 100;
+    v_ii := floor(v_int * 100 / v_ninst) / 100;
+    for k in 1..v_ninst loop
+      insert into public.purchase_installments (plan_id, purchase_id, seq, due_date, principal_due, interest_due)
+      values (v_plan, v_id, k, (v_first + make_interval(months => k - 1))::date,
+              case when k = v_ninst then v_total - v_pp * (v_ninst - 1) else v_pp end,
+              case when k = v_ninst then v_int - v_ii * (v_ninst - 1) else v_ii end);
+    end loop;
+  end if;
+  return v_id;
+end;
+$$;
+
+
+-- ---------- 5. Void a purchase (also takes back accrued interest) ----
+create or replace function public.void_purchase(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v_pur public.purchases;
+  v_rev uuid;
+  r record;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can void a purchase.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+  select * into v_pur from public.purchases where id = p_id for update;
+  if not found then raise exception 'Purchase not found.'; end if;
+  if v_pur.status <> 'Posted' then raise exception 'This purchase is already voided.'; end if;
+
+  if exists (
+    select 1 from public.payment_allocations a
+    join public.supplier_payments sp on sp.id = a.payment_id and sp.status = 'Posted'
+    where a.purchase_id = p_id
+  ) then
+    raise exception 'A payment was already made on this purchase. Void the payment first.';
+  end if;
+  if exists (
+    select 1 from public.stock_layers
+    where source = 'purchase' and source_id = p_id and qty_remaining <> qty_in
+  ) then
+    raise exception 'Some of these materials were already used in production, so the purchase cannot be voided.';
+  end if;
+
+  insert into public.stock_movements (layer_id, move_date, move_type, qty, cost, ref_type, ref_id)
+  select id, current_date, 'void', -qty_remaining, -cost_remaining, 'purchase_void', p_id
+  from public.stock_layers
+  where source = 'purchase' and source_id = p_id and qty_remaining > 0;
+
+  update public.stock_layers set qty_remaining = 0, cost_remaining = 0
+  where source = 'purchase' and source_id = p_id;
+
+  -- Take back any interest already accrued on an installment plan
+  for r in
+    select ia.id, ia.journal_entry_id, ia.plan_id
+    from public.interest_accruals ia
+    join public.purchase_installment_plans pl on pl.id = ia.plan_id
+    where pl.purchase_id = p_id and not ia.voided and ia.journal_entry_id is not null
+  loop
+    perform public.reverse_module_entry(r.journal_entry_id, 'Purchase voided: ' || p_reason, 'interest_accrual_void', r.plan_id);
+    update public.interest_accruals set voided = true where id = r.id;
+  end loop;
+
+  v_rev := public.reverse_module_entry(v_pur.journal_entry_id, p_reason, 'procurement_void', p_id);
+  update public.purchases set status = 'Voided', void_entry_id = v_rev where id = p_id;
+end;
+$$;
+
+
+-- ---------- 6. Pay a supplier (installment-aware) --------------------
+-- Interest is paid first within each installment, then principal.
+-- p_allocations: [{purchase_id, amount}]
+create or replace function public.record_supplier_payment(
+  p_date date, p_supplier uuid, p_method text, p_reference text, p_notes text, p_allocations jsonb
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_a jsonb;
+  v_amt numeric(14,2);
+  v_total numeric(14,2) := 0;
+  v_prin numeric(14,2) := 0;
+  v_int numeric(14,2) := 0;
+  v_pur public.purchases;
+  v_plan public.purchase_installment_plans;
+  v_has_plan boolean;
+  v_paid numeric;
+  v_limit numeric;
+  v_left numeric;
+  v_pay_i numeric;
+  v_pay_p numeric;
+  v_due_i numeric;
+  v_due_p numeric;
+  r record;
+  v_plans uuid[] := '{}';
+  v_pl uuid;
+  v_int_paid numeric;
+  v_ip_code text;
+  v_sup text;
+  v_label text;
+  v_lines jsonb;
+  v_je uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can pay suppliers.'; end if;
+  if p_method not in ('cash','bank') then raise exception 'Choose cash or bank.'; end if;
+  if p_allocations is null or jsonb_typeof(p_allocations) <> 'array' or jsonb_array_length(p_allocations) < 1 then
+    raise exception 'Choose at least one purchase to pay.';
+  end if;
+  select name into v_sup from public.suppliers where id = p_supplier;
+  if not found then raise exception 'Supplier not found.'; end if;
+  select interest_payable_code into v_ip_code from public.business_settings where id;
+
+  v_no := nextval('public.payment_no_seq');
+  v_label := 'PAY-' || lpad(v_no::text, 4, '0');
+
+  insert into public.supplier_payments (id, pay_no, pay_date, supplier_id, amount, method, reference, notes)
+  values (v_id, v_no, v_date, p_supplier, 0, p_method, nullif(trim(p_reference), ''), nullif(trim(p_notes), ''));
+
+  for v_a in select * from jsonb_array_elements(p_allocations) loop
+    v_amt := round(coalesce((v_a->>'amount')::numeric, 0), 2);
+    if v_amt <= 0 then continue; end if;
+
+    select * into v_pur from public.purchases where id = (v_a->>'purchase_id')::uuid for update;
+    if not found or v_pur.supplier_id is distinct from p_supplier
+       or v_pur.payment_type <> 'credit' or v_pur.status <> 'Posted' then
+      raise exception 'One of the purchases cannot be paid here.';
+    end if;
+
+    select * into v_plan from public.purchase_installment_plans where purchase_id = v_pur.id;
+    v_has_plan := found;
+    v_limit := v_pur.total + case when v_has_plan then v_plan.interest_total else 0 end;
+
+    insert into public.payment_allocations (payment_id, purchase_id, amount) values (v_id, v_pur.id, v_amt);
+
+    select coalesce(sum(a.amount), 0) into v_paid
+    from public.payment_allocations a
+    join public.supplier_payments sp on sp.id = a.payment_id and sp.status = 'Posted'
+    where a.purchase_id = v_pur.id;
+    if v_paid > v_limit then
+      raise exception 'Payment for PUR-% is more than its balance.', lpad(v_pur.purchase_no::text, 4, '0');
+    end if;
+
+    if v_has_plan then
+      v_left := v_amt;
+      for r in
+        select i.id, i.interest_due, i.principal_due,
+               coalesce(x.paid_i, 0) as paid_i, coalesce(x.paid_p, 0) as paid_p
+        from public.purchase_installments i
+        left join lateral (
+          select sum(ip.interest_amt) as paid_i, sum(ip.principal_amt) as paid_p
+          from public.installment_payments ip
+          join public.supplier_payments sp on sp.id = ip.payment_id and sp.status = 'Posted'
+          where ip.installment_id = i.id
+        ) x on true
+        where i.plan_id = v_plan.id
+        order by i.seq
+      loop
+        exit when v_left <= 0;
+        v_due_i := greatest(r.interest_due - r.paid_i, 0);
+        v_due_p := greatest(r.principal_due - r.paid_p, 0);
+        continue when v_due_i <= 0 and v_due_p <= 0;
+        v_pay_i := least(v_left, v_due_i);
+        v_left := v_left - v_pay_i;
+        v_pay_p := least(v_left, v_due_p);
+        v_left := v_left - v_pay_p;
+        insert into public.installment_payments (payment_id, installment_id, principal_amt, interest_amt)
+        values (v_id, r.id, v_pay_p, v_pay_i);
+        v_prin := v_prin + v_pay_p;
+        v_int := v_int + v_pay_i;
+      end loop;
+      if v_left > 0 then
+        raise exception 'Payment for PUR-% is more than its balance.', lpad(v_pur.purchase_no::text, 4, '0');
+      end if;
+      if not (v_plan.id = any (v_plans)) then v_plans := v_plans || v_plan.id; end if;
+    else
+      v_prin := v_prin + v_amt;
+    end if;
+    v_total := v_total + v_amt;
+  end loop;
+
+  if v_total <= 0 then raise exception 'Enter an amount to pay.'; end if;
+
+  -- Interest being paid must already be on the books: bring the accrual up to date first.
+  foreach v_pl in array v_plans loop
+    perform public.accrue_plan_months(v_pl, (date_trunc('month', v_date::timestamp) - interval '1 day')::date);
+    select coalesce(sum(ip.interest_amt), 0) into v_int_paid
+    from public.installment_payments ip
+    join public.supplier_payments sp on sp.id = ip.payment_id and sp.status = 'Posted'
+    join public.purchase_installments i on i.id = ip.installment_id
+    where i.plan_id = v_pl;
+    perform public.accrue_plan_interest(v_pl, v_date, v_int_paid, v_date, 'catchup');
+  end loop;
+
+  v_lines := '[]'::jsonb;
+  if v_prin > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '2000', 'debit', v_prin, 'memo', 'Payment ' || v_label, 'supplier_id', p_supplier));
+  end if;
+  if v_int > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', v_ip_code, 'debit', v_int, 'memo', 'Interest paid ' || v_label, 'supplier_id', p_supplier));
+  end if;
+  v_lines := v_lines || jsonb_build_array(jsonb_build_object(
+    'account_code', case p_method when 'cash' then '1010' else '1020' end,
+    'credit', v_total, 'memo', 'Payment ' || v_label));
+
+  v_je := public.post_module_entry(
+    v_date, v_label, 'Payment to ' || v_sup || ' (' || v_label || ')',
+    v_lines, 'supplier_payment', v_id);
+
+  update public.supplier_payments set amount = v_total, journal_entry_id = v_je where id = v_id;
+  return v_id;
+end;
+$$;
+
+-- ---------- 7. Interest accrual (accrual basis) ----------------------
+-- Interest on an installment plan is spread evenly over the days from the purchase date
+-- to the last due date and recognised as an expense as time passes:
+--   Dr Interest Expense / Cr Interest Payable.
+-- Month-end entries are posted by accrue_installment_interest(); the app calls it on load.
+
+create or replace function public.accrue_plan_interest(
+  p_plan uuid, p_through date, p_min numeric, p_edate date, p_kind text
+) returns numeric
+language plpgsql security definer set search_path = public as $$
+declare
+  pl public.purchase_installment_plans;
+  v_pur public.purchases;
+  v_last date;
+  v_days int;
+  v_target numeric(14,2);
+  v_amt numeric(14,2);
+  v_exp text;
+  v_pay text;
+  v_label text;
+  v_je uuid;
+begin
+  select * into pl from public.purchase_installment_plans where id = p_plan for update;
+  if not found then return 0; end if;
+  select * into v_pur from public.purchases where id = pl.purchase_id;
+  if v_pur.status <> 'Posted' or pl.interest_total <= 0 then return 0; end if;
+
+  select max(due_date) into v_last from public.purchase_installments where plan_id = pl.id;
+  v_days := greatest(v_last - v_pur.purchase_date, 1);
+  v_target := case when p_through >= v_last then pl.interest_total
+                   else round(pl.interest_total * greatest(p_through - v_pur.purchase_date, 0)::numeric / v_days, 2) end;
+  v_target := least(pl.interest_total, greatest(v_target, coalesce(p_min, 0)));
+  v_amt := v_target - pl.accrued_interest;
+  if v_amt <= 0 then return 0; end if;
+
+  select interest_expense_code, interest_payable_code into v_exp, v_pay from public.business_settings where id;
+  v_label := 'PUR-' || lpad(v_pur.purchase_no::text, 4, '0');
+
+  v_je := public.post_module_entry(
+    p_edate, 'INT-' || v_label, 'Interest accrued on ' || v_label,
+    jsonb_build_array(
+      jsonb_build_object('account_code', v_exp, 'debit', v_amt, 'memo', 'Interest ' || v_label),
+      jsonb_build_object('account_code', v_pay, 'credit', v_amt, 'memo', 'Interest ' || v_label, 'supplier_id', v_pur.supplier_id)),
+    'interest_accrual', pl.id);
+
+  insert into public.interest_accruals (plan_id, accrual_date, amount, kind, journal_entry_id)
+  values (pl.id, p_edate, v_amt, p_kind, v_je);
+  update public.purchase_installment_plans set accrued_interest = v_target where id = pl.id;
+  return v_amt;
+end;
+$$;
+
+-- Internal: post every missing month-end accrual for one plan, up to p_cutoff
+create or replace function public.accrue_plan_months(p_plan uuid, p_cutoff date)
+returns numeric
+language plpgsql security definer set search_path = public as $$
+declare
+  v_pur public.purchases;
+  v_last date;
+  v_from date;
+  v_m date;
+  g record;
+  v_total numeric := 0;
+begin
+  select p.* into v_pur
+  from public.purchases p join public.purchase_installment_plans pl on pl.purchase_id = p.id
+  where pl.id = p_plan;
+  if not found or v_pur.status <> 'Posted' then return 0; end if;
+
+  select max(due_date) into v_last from public.purchase_installments where plan_id = p_plan;
+  select coalesce(max(accrual_date), v_pur.purchase_date) into v_from
+    from public.interest_accruals where plan_id = p_plan and kind = 'monthly' and not voided;
+
+  for g in
+    select d from generate_series(date_trunc('month', (v_from + 1)::timestamp), p_cutoff::timestamp, interval '1 month') d
+  loop
+    v_m := (date_trunc('month', g.d) + interval '1 month' - interval '1 day')::date;
+    continue when v_m <= v_from or v_m > p_cutoff;
+    v_total := v_total + public.accrue_plan_interest(p_plan, v_m, 0, least(v_m, v_last), 'monthly');
+  end loop;
+  return v_total;
+end;
+$$;
+
+-- Called by the app (any signed-in user). Safe to call as often as you like.
+create or replace function public.accrue_installment_interest(p_as_of date default current_date)
+returns numeric
+language plpgsql security definer set search_path = public as $$
+declare
+  r record;
+  v_cutoff date := (date_trunc('month', coalesce(p_as_of, current_date)::timestamp) - interval '1 day')::date;
+  v_last date;
+  v_total numeric := 0;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  for r in
+    select pl.id
+    from public.purchase_installment_plans pl
+    join public.purchases p on p.id = pl.purchase_id and p.status = 'Posted'
+    where pl.interest_total > 0 and pl.accrued_interest < pl.interest_total
+  loop
+    v_total := v_total + public.accrue_plan_months(r.id, v_cutoff);
+    select max(due_date) into v_last from public.purchase_installments where plan_id = r.id;
+    if v_last <= coalesce(p_as_of, current_date) then
+      v_total := v_total + public.accrue_plan_interest(r.id, v_last, 0, v_last, 'monthly');
+    end if;
+  end loop;
+  return v_total;
+end;
+$$;
+
+-- ---------- 8. Views --------------------------------------------------
+create or replace view public.installments_status
+with (security_invoker = true) as
+select i.id as installment_id, i.plan_id, i.purchase_id, i.seq, i.due_date,
+       i.principal_due, i.interest_due,
+       coalesce(x.paid_p, 0) as paid_principal,
+       coalesce(x.paid_i, 0) as paid_interest,
+       i.principal_due + i.interest_due - coalesce(x.paid_p, 0) - coalesce(x.paid_i, 0) as balance
+from public.purchase_installments i
+join public.purchases p on p.id = i.purchase_id and p.status = 'Posted'
+left join lateral (
+  select sum(ip.principal_amt) as paid_p, sum(ip.interest_amt) as paid_i
+  from public.installment_payments ip
+  join public.supplier_payments sp on sp.id = ip.payment_id and sp.status = 'Posted'
+  where ip.installment_id = i.id
+) x on true;
+
+drop view if exists public.payables_open;
+create view public.payables_open
+with (security_invoker = true) as
+select p.id as purchase_id, p.purchase_no, p.purchase_date,
+       coalesce(nx.due_date, p.due_date) as due_date,
+       p.supplier_id, s.name as supplier_name, p.reference,
+       p.total + coalesce(pl.interest_total, 0) as total,
+       coalesce(x.paid, 0) as paid,
+       p.total + coalesce(pl.interest_total, 0) - coalesce(x.paid, 0) as balance,
+       greatest(current_date - coalesce(nx.due_date, p.due_date), 0) as days_overdue,
+       (pl.id is not null) as is_installment,
+       pl.installments,
+       coalesce(pl.interest_total, 0) as interest_total,
+       coalesce(nx.balance, p.total - coalesce(x.paid, 0)) as next_due_balance
+from public.purchases p
+join public.suppliers s on s.id = p.supplier_id
+left join public.purchase_installment_plans pl on pl.purchase_id = p.id
+left join lateral (
+  select sum(a.amount) as paid
+  from public.payment_allocations a
+  join public.supplier_payments sp on sp.id = a.payment_id and sp.status = 'Posted'
+  where a.purchase_id = p.id
+) x on true
+left join lateral (
+  select st.due_date, st.balance
+  from public.installments_status st
+  where st.purchase_id = p.id and st.balance > 0
+  order by st.seq
+  limit 1
+) nx on true
+where p.payment_type = 'credit' and p.status = 'Posted'
+  and p.total + coalesce(pl.interest_total, 0) - coalesce(x.paid, 0) > 0;
+
+-- ---------- 9. Security ----------------------------------------------
+alter table public.purchase_installment_plans enable row level security;
+alter table public.purchase_installments      enable row level security;
+alter table public.installment_payments       enable row level security;
+alter table public.interest_accruals          enable row level security;
+
+drop policy if exists installment_plans_read on public.purchase_installment_plans;
+create policy installment_plans_read on public.purchase_installment_plans for select using (public.is_active_user());
+drop policy if exists installments_read on public.purchase_installments;
+create policy installments_read on public.purchase_installments for select using (public.is_active_user());
+drop policy if exists installment_payments_read on public.installment_payments;
+create policy installment_payments_read on public.installment_payments for select using (public.is_active_user());
+drop policy if exists interest_accruals_read on public.interest_accruals;
+create policy interest_accruals_read on public.interest_accruals for select using (public.is_active_user());
+
+revoke insert, update, delete on
+  public.purchase_installment_plans, public.purchase_installments,
+  public.installment_payments, public.interest_accruals
+  from anon, authenticated;
+
+revoke all on public.payables_open, public.installments_status from public, anon;
+grant select on public.payables_open, public.installments_status to authenticated;
+
+revoke all on function public.accrue_plan_interest(uuid,date,numeric,date,text) from public, anon, authenticated;
+revoke all on function public.accrue_plan_months(uuid,date) from public, anon, authenticated;
+revoke all on function public.accrue_installment_interest(date) from public, anon;
+grant execute on function public.accrue_installment_interest(date) to authenticated;
+
+revoke all on function public.record_purchase(date,uuid,text,text,date,text,jsonb,int,date,numeric,numeric) from public, anon;
+grant execute on function public.record_purchase(date,uuid,text,text,date,text,jsonb,int,date,numeric,numeric) to authenticated;
+revoke all on function public.record_packaging(date,uuid,int,int,text,uuid,uuid,uuid,uuid,uuid) from public, anon;
+grant execute on function public.record_packaging(date,uuid,int,int,text,uuid,uuid,uuid,uuid,uuid) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- 10. Checks (run one at a time) ----------------------------
+-- select interest_expense_code, interest_payable_code from public.business_settings;
+-- select * from public.accounts where code in (select interest_expense_code from public.business_settings
+--                                              union select interest_payable_code from public.business_settings);
+-- select * from public.accrue_installment_interest();   -- posts any missing month-end interest
+
+-- ---------- 11. TEST DATA RESET additions (only while still testing) --
+-- Add these to the truncate list from file 05:
+--   public.interest_accruals, public.installment_payments, public.purchase_installments,
+--   public.purchase_installment_plans
+-- (they must come BEFORE public.supplier_payments and public.purchases in the same truncate statement).

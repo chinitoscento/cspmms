@@ -1,0 +1,130 @@
+-- =====================================================================
+-- Chinito Scento - box sticker, pouch sticker and wrap become optional.
+-- Safe to re-run. Run in the Supabase SQL Editor AFTER file 06.
+--
+-- Only record_packaging changes. Same parameter list as in file 06, so
+-- the app call, the permissions and the void function are unaffected.
+--   * Box set:   the box is required. Box sticker and wrap are optional.
+--   * Pouch set: the pouch is required. Pouch sticker and wrap are optional.
+--   * An optional item that is left empty is simply not used, not charged,
+--     and not recorded on the run.
+-- =====================================================================
+
+create or replace function public.record_packaging(
+  p_date date, p_size uuid, p_qty int, p_spoiled int, p_notes text,
+  p_box uuid default null, p_box_sticker uuid default null, p_wrap uuid default null,
+  p_pouch uuid default null, p_pouch_sticker uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_spoiled int := coalesce(p_spoiled, 0);
+  v_sz public.perfume_sizes;
+  v_pf public.perfumes;
+  v_bottled numeric(14,2);
+  v_t numeric; v_s numeric;
+  v_mats numeric(14,2) := 0;
+  v_spoil numeric(14,2) := 0;
+  v_finished numeric(14,2);
+  v_lines jsonb := '[]'::jsonb;
+  v_je uuid;
+  v_label text;
+  v_pouch_set boolean := (p_pouch is not null or p_pouch_sticker is not null);
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many pieces were packaged.'; end if;
+  if v_spoiled < 0 then raise exception 'Spoiled units cannot be negative.'; end if;
+
+  -- Only the box (or the pouch) is required. The sticker and the wrap are optional.
+  if v_pouch_set then
+    if p_pouch is null then raise exception 'Choose the pouch.'; end if;
+    if p_box is not null or p_box_sticker is not null then raise exception 'Use either a box set or a pouch set, not both.'; end if;
+  else
+    if p_box is null then raise exception 'Choose the box.'; end if;
+  end if;
+
+  select * into v_sz from public.perfume_sizes where id = p_size and is_active;
+  if not found then raise exception 'Choose a perfume size.'; end if;
+  select * into v_pf from public.perfumes where id = v_sz.perfume_id and status <> 'Discontinued';
+  if not found then raise exception 'This perfume is discontinued.'; end if;
+
+  v_no := nextval('public.packaging_no_seq');
+  v_label := 'PK-' || lpad(v_no::text, 4, '0');
+
+  v_bottled := public.stock_out('bottled', v_sz.id, p_qty, v_date, 'packaging', v_id);
+
+  if v_pouch_set then
+    select o_total, o_spoiled into v_t, v_s
+      from public.consume_material(p_pouch, 'pouch', p_qty, v_spoiled, v_date, 'packaging', v_id);
+    v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+    if p_pouch_sticker is not null then
+      select o_total, o_spoiled into v_t, v_s
+        from public.consume_material(p_pouch_sticker, 'pouch_sticker', p_qty, v_spoiled, v_date, 'packaging', v_id);
+      v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+    end if;
+  else
+    select o_total, o_spoiled into v_t, v_s
+      from public.consume_material(p_box, 'box', p_qty, v_spoiled, v_date, 'packaging', v_id);
+    v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+    if p_box_sticker is not null then
+      select o_total, o_spoiled into v_t, v_s
+        from public.consume_material(p_box_sticker, 'box_sticker', p_qty, v_spoiled, v_date, 'packaging', v_id);
+      v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+    end if;
+  end if;
+  if p_wrap is not null then
+    select o_total, o_spoiled into v_t, v_s
+      from public.consume_material(p_wrap, 'wrap', p_qty, v_spoiled, v_date, 'packaging', v_id);
+    v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+  end if;
+
+  v_finished := v_bottled + (v_mats - v_spoil);
+  if v_finished + v_spoil <= 0 then
+    raise exception 'The materials used have no recorded cost, so nothing can be posted.';
+  end if;
+
+  if v_finished > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1330', 'debit', v_finished, 'memo', v_label || ' ' || v_pf.name || ' ' || v_sz.size_ml || ' ml'));
+  end if;
+  if v_spoil > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '5110', 'debit', v_spoil, 'memo', 'Spoiled packaging materials'));
+  end if;
+  if v_bottled > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1320', 'credit', v_bottled, 'memo', 'Bottled perfume used'));
+  end if;
+  if v_mats > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1220', 'credit', v_mats, 'memo', 'Packaging materials used'));
+  end if;
+
+  v_je := public.post_module_entry(v_date, v_label,
+            'Packaging ' || v_label || ' - ' || p_qty || ' x ' || v_pf.name || ' ' || v_sz.size_ml || ' ml',
+            v_lines, 'packaging', v_id);
+
+  insert into public.packaging_runs
+    (id, run_no, run_date, perfume_id, size_id, qty, spoiled_qty, bottled_cost,
+     box_material_id, box_sticker_material_id, wrap_material_id,
+     pouch_material_id, pouch_sticker_material_id,
+     materials_cost, spoiled_cost, finished_cost, notes, journal_entry_id)
+  values
+    (v_id, v_no, v_date, v_pf.id, v_sz.id, p_qty, v_spoiled, v_bottled,
+     p_box, p_box_sticker, p_wrap,
+     p_pouch, p_pouch_sticker,
+     v_mats, v_spoil, v_finished, nullif(trim(coalesce(p_notes, '')), ''), v_je);
+
+  perform public.stock_in('finished', null, null, v_sz.id, v_date, p_qty, v_finished, 'packaging', v_id);
+  return v_id;
+end;
+$$;
+
+-- Permissions (same as file 06; create or replace keeps them, this is only a safety net)
+revoke all on function public.record_packaging(date,uuid,int,int,text,uuid,uuid,uuid,uuid,uuid) from public, anon;
+grant execute on function public.record_packaging(date,uuid,int,int,text,uuid,uuid,uuid,uuid,uuid) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- Check (run after posting one packaging run with only a box):
+-- select run_no, box_material_id, box_sticker_material_id, wrap_material_id, materials_cost
+--   from public.packaging_runs order by run_no desc limit 1;
+-- Expect the sticker and wrap columns to be empty and materials_cost to equal the box cost only.

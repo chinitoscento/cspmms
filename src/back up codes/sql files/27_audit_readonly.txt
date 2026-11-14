@@ -1,0 +1,585 @@
+-- =====================================================================
+-- Chinito Scento - OWNER-ONLY, READ-ONLY audit functions.
+-- Run in the Supabase SQL Editor AFTER files 04 to 26. Safe to re-run.
+--
+-- What this file does
+--   * It creates functions that only READ. Nothing in your books, stock or documents is
+--     changed, edited or deleted. (Every function is marked STABLE, so PostgreSQL itself
+--     refuses any write inside them.)
+--   * Every function checks public.is_owner() first. A staff login gets an error, not data.
+--   * No table is created or altered. No existing function is replaced.
+--
+-- Functions used by the Audit page
+--   audit_exceptions()        the exceptions list
+--   audit_stock_value()       stock value vs ledger accounts 1200/1210/1220/1300/1310/1320/1330
+--   audit_stock_items()       items that have a stock history (for the movement log picker)
+--   audit_movement_log(...)   every stock in / out / void with its document and a running balance
+--   audit_invoice_list()      invoices to pick from
+--   audit_invoice_trace(id)   one invoice: sale, returns, payments, journal entries, stock moves
+--   audit_entry_lines(id)     the lines of one journal entry
+--   audit_count_sheet()       what the system says is on the shelf (the page compares your count)
+-- =====================================================================
+
+-- ---------- 0. Small internal helpers (not callable from the app) ------
+
+create or replace function public.audit_who(p_user uuid)
+returns text
+language sql stable security definer set search_path = public as $$
+  select coalesce(nullif(trim(coalesce(p.first_name, '') || ' ' || coalesce(p.last_name, '')), ''), p.username, 'unknown')
+  from public.profiles p where p.id = p_user;
+$$;
+
+-- The document label for a stock movement / layer source. Null when the document is not found.
+create or replace function public.audit_doc_label(p_ref_type text, p_ref_id uuid)
+returns text
+language sql stable security definer set search_path = public as $$
+  select case regexp_replace(coalesce(p_ref_type, ''), '_void$', '')
+    when 'purchase'     then (select 'PUR-' || lpad(x.purchase_no::text, 4, '0') from public.purchases x where x.id = p_ref_id)
+    when 'maceration'   then (select 'MB-'  || lpad(x.batch_no::text, 4, '0')    from public.maceration_batches x where x.id = p_ref_id)
+    when 'bottling'     then (select 'BT-'  || lpad(x.run_no::text, 4, '0')      from public.bottling_runs x where x.id = p_ref_id)
+    when 'packaging'    then (select 'PK-'  || lpad(x.run_no::text, 4, '0')      from public.packaging_runs x where x.id = p_ref_id)
+    when 'writeoff'     then (select 'WO-'  || lpad(x.writeoff_no::text, 8, '0') from public.stock_writeoffs x where x.id = p_ref_id)
+    when 'sale'         then (select coalesce('INV-' || lpad(x.invoice_no::text, 4, '0'), 'SL-' || lpad(x.sale_no::text, 8, '0')) from public.sales x where x.id = p_ref_id)
+    when 'sales_return' then (select 'RT-'  || lpad(x.return_no::text, 4, '0')   from public.sales_returns x where x.id = p_ref_id)
+    else null
+  end || case when p_ref_type like '%\_void' then ' (void)' else '' end;
+$$;
+
+create or replace function public.audit_doc_exists(p_ref_type text, p_ref_id uuid)
+returns boolean
+language sql stable security definer set search_path = public as $$
+  select case regexp_replace(coalesce(p_ref_type, ''), '_void$', '')
+    when 'purchase'     then exists (select 1 from public.purchases x where x.id = p_ref_id)
+    when 'maceration'   then exists (select 1 from public.maceration_batches x where x.id = p_ref_id)
+    when 'bottling'     then exists (select 1 from public.bottling_runs x where x.id = p_ref_id)
+    when 'packaging'    then exists (select 1 from public.packaging_runs x where x.id = p_ref_id)
+    when 'writeoff'     then exists (select 1 from public.stock_writeoffs x where x.id = p_ref_id)
+    when 'sale'         then exists (select 1 from public.sales x where x.id = p_ref_id)
+    when 'sales_return' then exists (select 1 from public.sales_returns x where x.id = p_ref_id)
+    else false
+  end;
+$$;
+
+-- Readable name of a stock item from a stock layer's keys
+create or replace function public.audit_layer_item(p_kind text, p_material uuid, p_perfume uuid, p_size uuid)
+returns text
+language sql stable security definer set search_path = public as $$
+  select case
+    when p_kind = 'material' then (select m.name from public.materials m where m.id = p_material)
+    when p_kind = 'juice'    then (select pf.name || ' (matured juice)' from public.perfumes pf where pf.id = p_perfume)
+    else (select pf.name || ' ' || trim_scale(ps.size_ml)::text || ' ml' ||
+                 case when p_kind = 'bottled' then ' (bottled)' else '' end
+            from public.perfume_sizes ps join public.perfumes pf on pf.id = ps.perfume_id
+           where ps.id = p_size)
+  end;
+$$;
+
+revoke all on function public.audit_who(uuid) from public, anon, authenticated;
+revoke all on function public.audit_doc_label(text, uuid) from public, anon, authenticated;
+revoke all on function public.audit_doc_exists(text, uuid) from public, anon, authenticated;
+revoke all on function public.audit_layer_item(text, uuid, uuid, uuid) from public, anon, authenticated;
+
+-- ---------- 1. Stock value vs the ledger -----------------------------------
+-- 1200 oils, 1210 solvent, 1220 all other materials, 1310 juice, 1320 bottled, 1330 finished goods.
+-- 1300 (maceration in progress) is added as an extra line: it should equal the cost of batches still macerating.
+create or replace function public.audit_stock_value()
+returns table (account_code text, account_name text, stock_value numeric, ledger_balance numeric, difference numeric)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can open the audit.'; end if;
+
+  return query
+  with val as (
+    select case
+             when l.stock_kind = 'material' then
+               case m.category when 'oil' then '1200' when 'solvent' then '1210' else '1220' end
+             when l.stock_kind = 'juice'   then '1310'
+             when l.stock_kind = 'bottled' then '1320'
+             else '1330'
+           end as code,
+           sum(l.cost_remaining) as v
+      from public.stock_layers l
+      left join public.materials m on m.id = l.material_id
+     group by 1
+    union all
+    select '1300', coalesce(sum(b.total_cost), 0)
+      from public.maceration_batches b where b.status = 'Macerating'
+  ),
+  v2 as (select code, sum(v) as v from val group by code)
+  select a.code::text, a.name::text,
+         coalesce(v2.v, 0)::numeric,
+         coalesce((select sum(l.debit - l.credit) from public.journal_lines l where l.account_id = a.id), 0)::numeric,
+         (coalesce(v2.v, 0) - coalesce((select sum(l.debit - l.credit) from public.journal_lines l where l.account_id = a.id), 0))::numeric
+    from public.accounts a
+    left join v2 on v2.code = a.code
+   where a.code in ('1200','1210','1220','1300','1310','1320','1330')
+   order by a.code;
+end;
+$$;
+
+-- ---------- 2. Exceptions list ------------------------------------------------
+create or replace function public.audit_exceptions()
+returns table (
+  check_code text, check_name text, severity text, doc_ref text, doc_date date,
+  detail text, amount numeric, source_type text, source_id uuid
+)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can open the audit.'; end if;
+
+  return query
+  select * from (
+
+    -- 1a. Approved return with no journal entry (when money or cost should have been booked)
+    select 'RET_NO_JOURNAL'::text as check_code, 'Approved return has no journal entry'::text as check_name, 'high'::text as severity,
+           ('RT-' || lpad(r.return_no::text, 4, '0'))::text as doc_ref, r.return_date as doc_date,
+           ('Approved ' || to_char(r.decided_at at time zone 'Asia/Manila', 'YYYY-MM-DD') ||
+            ' but no journal entry is linked. Refund PHP ' || to_char(r.refund_amount, 'FM999,999,990.00'))::text as detail,
+           r.refund_amount::numeric as amount, 'sales_return'::text as source_type, r.id as source_id
+      from public.sales_returns r
+     where r.status = 'Approved' and r.journal_entry_id is null
+       and (r.refund_amount > 0
+            or round(r.unit_cost * r.qty, 2) > 0
+            or exists (select 1 from public.stock_movements m
+                        where m.ref_type = 'sales_return' and m.ref_id = r.id and m.cost <> 0))
+
+    union all
+    -- 1b. Approved return where the piece coming back was not put into stock
+    select 'RET_NO_STOCK_IN', 'Approved return has no stock movement', 'high',
+           'RT-' || lpad(r.return_no::text, 4, '0'), r.return_date,
+           'The piece that came back was not put back into stock.',
+           round(r.unit_cost * r.qty, 2)::numeric, 'sales_return', r.id
+      from public.sales_returns r
+     where r.status = 'Approved'
+       and (r.resolution = 'exchange' or (r.resolution = 'refund' and r.reason = 'returned'))
+       and not exists (select 1 from public.stock_movements m
+                        where m.ref_type = 'sales_return' and m.ref_id = r.id and m.move_type = 'in')
+
+    union all
+    -- 1c. Approved exchange / replacement where the piece given out did not leave stock
+    select 'RET_NO_STOCK_OUT', 'Approved return has no stock movement', 'high',
+           'RT-' || lpad(r.return_no::text, 4, '0'), r.return_date,
+           'The replacement piece given to the customer did not leave stock.',
+           null::numeric, 'sales_return', r.id
+      from public.sales_returns r
+     where r.status = 'Approved' and r.resolution in ('exchange', 'replace')
+       and not exists (select 1 from public.stock_movements m
+                        where m.ref_type = 'sales_return' and m.ref_id = r.id and m.move_type = 'out')
+
+    union all
+    -- 2. Stock movement with no document behind it
+    select 'MOVE_NO_DOC', 'Stock movement has no document', 'high',
+           coalesce(g.ref_type, '(none)') || ' ' || coalesce(left(g.ref_id::text, 8), '(none)'), g.d,
+           case when regexp_replace(coalesce(g.ref_type, ''), '_void$', '') not in
+                     ('purchase','maceration','bottling','packaging','writeoff','sale','sales_return')
+                then 'Unknown source "' || coalesce(g.ref_type, '(blank)') || '": ' || g.n || ' movement(s) that no document explains.'
+                else 'The ' || g.ref_type || ' document was not found: ' || g.n || ' movement(s) point to nothing.'
+           end,
+           g.amt::numeric, 'stock_movement', g.ref_id
+      from (select m.ref_type, m.ref_id, min(m.move_date) as d, count(*) as n, sum(abs(m.cost)) as amt
+              from public.stock_movements m group by m.ref_type, m.ref_id) g
+     where not public.audit_doc_exists(g.ref_type, g.ref_id)
+
+    union all
+    -- 3. Document with no stock movement
+    select 'DOC_NO_MOVE', 'Document has no stock movement', 'high',
+           x.lbl, x.d,
+           trim(case when x.need_in  and not coalesce(mv.has_in, false)  then 'Stock coming in was not logged. ' else '' end ||
+                case when x.need_out and not coalesce(mv.has_out, false) then 'Stock going out was not logged.' else '' end),
+           null::numeric, x.k, x.id
+      from (
+        select 'purchase'::text as k, p.id, 'PUR-' || lpad(p.purchase_no::text, 4, '0') as lbl, p.purchase_date as d,
+               exists (select 1 from public.purchase_lines pl where pl.purchase_id = p.id and pl.line_type = 'material') as need_in,
+               false as need_out
+          from public.purchases p
+        union all
+        select 'maceration', b.id, 'MB-' || lpad(b.batch_no::text, 4, '0'), b.start_date,
+               coalesce(b.actual_yield_ml, 0) > 0,
+               exists (select 1 from public.maceration_inputs i where i.batch_id = b.id)
+          from public.maceration_batches b
+        union all
+        select 'bottling', r.id, 'BT-' || lpad(r.run_no::text, 4, '0'), r.run_date, true, true
+          from public.bottling_runs r
+        union all
+        select 'packaging', r.id, 'PK-' || lpad(r.run_no::text, 4, '0'), r.run_date, true, true
+          from public.packaging_runs r
+        union all
+        select 'writeoff', w.id, 'WO-' || lpad(w.writeoff_no::text, 8, '0'), w.writeoff_date, false, true
+          from public.stock_writeoffs w
+        union all
+        select 'sale', s.id, coalesce('INV-' || lpad(s.invoice_no::text, 4, '0'), 'SL-' || lpad(s.sale_no::text, 8, '0')),
+               coalesce(s.invoice_date, s.sale_date), false,
+               exists (select 1 from public.sale_lines sl where sl.sale_id = s.id)
+          from public.sales s where s.status in ('Posted', 'Voided')
+      ) x
+      left join (select m.ref_type, m.ref_id,
+                        bool_or(m.move_type = 'in') as has_in, bool_or(m.move_type = 'out') as has_out
+                   from public.stock_movements m group by m.ref_type, m.ref_id) mv
+        on mv.ref_type = x.k and mv.ref_id = x.id
+     where (x.need_in  and not coalesce(mv.has_in, false))
+        or (x.need_out and not coalesce(mv.has_out, false))
+
+    union all
+    -- 4. Journal entry that does not balance (or has fewer than two lines)
+    select 'JE_UNBALANCED', 'Journal entry does not balance', 'high',
+           'JE #' || e.entry_no, e.entry_date,
+           'Debits ' || to_char(coalesce(l.dr, 0), 'FM999,999,990.00') || ' vs credits ' || to_char(coalesce(l.cr, 0), 'FM999,999,990.00') ||
+             ' (' || coalesce(l.n, 0) || ' line(s)). ' || coalesce(e.reference, ''),
+           abs(coalesce(l.dr, 0) - coalesce(l.cr, 0))::numeric, 'journal_entry', e.id
+      from public.journal_entries e
+      left join (select jl.entry_id, sum(jl.debit) as dr, sum(jl.credit) as cr, count(*) as n
+                   from public.journal_lines jl group by jl.entry_id) l on l.entry_id = e.id
+     where coalesce(l.n, 0) < 2 or round(coalesce(l.dr, 0), 2) <> round(coalesce(l.cr, 0), 2)
+
+    union all
+    -- 5a. Credit invoice balances vs Accounts Receivable, customer by customer
+    select 'AR_MISMATCH', 'Invoice balances do not match Accounts Receivable', 'high',
+           coalesce(c.name, 'Customer'), null::date,
+           'Open invoices say PHP ' || to_char(coalesce(i.bal, 0), 'FM999,999,990.00') ||
+             ' but the ledger (account 1100) says PHP ' || to_char(coalesce(a.balance, 0), 'FM999,999,990.00'),
+           (coalesce(i.bal, 0) - coalesce(a.balance, 0))::numeric, 'customer', coalesce(i.customer_id, a.customer_id)
+      from (select b.customer_id, sum(b.balance) as bal from public.credit_invoice_balances b group by b.customer_id) i
+      full join public.customer_ar a on a.customer_id = i.customer_id
+      left join public.customers c on c.id = coalesce(i.customer_id, a.customer_id)
+     where abs(coalesce(i.bal, 0) - coalesce(a.balance, 0)) > 0.005
+
+    union all
+    -- 5b. Whole account 1100 vs the sum of customer balances (a line posted with no customer)
+    select 'AR_UNTAGGED', 'Invoice balances do not match Accounts Receivable', 'high',
+           'Account 1100', null::date,
+           'The ledger shows PHP ' || to_char(t.tot, 'FM999,999,990.00') || ' but customer balances add up to PHP ' ||
+             to_char(t.cust, 'FM999,999,990.00') || '. Some receivable lines are not tagged to a customer.',
+           (t.tot - t.cust)::numeric, 'account', null::uuid
+      from (select (select coalesce(sum(l.debit - l.credit), 0) from public.journal_lines l
+                      join public.accounts a on a.id = l.account_id where a.code = '1100') as tot,
+                   (select coalesce(sum(c.balance), 0) from public.customer_ar c) as cust) t
+     where abs(t.tot - t.cust) > 0.005
+
+    union all
+    -- 6. Stock value vs ledger accounts
+    select 'STOCK_VS_LEDGER', 'Stock value does not match the ledger', 'high',
+           v.account_code || ' ' || v.account_name, null::date,
+           'Stock layers are worth PHP ' || to_char(v.stock_value, 'FM999,999,990.00') ||
+             ' but the ledger says PHP ' || to_char(v.ledger_balance, 'FM999,999,990.00'),
+           v.difference, 'account', null::uuid
+      from public.audit_stock_value() v
+     where abs(v.difference) > 0.005
+
+    union all
+    -- 7. Layer quantity / cost vs the movement log
+    select 'LAYER_VS_LOG', 'Stock layer does not match the movement log', 'high',
+           coalesce(public.audit_doc_label(g.source, g.source_id), g.source),
+           g.received_date,
+           public.audit_layer_item(g.stock_kind, g.material_id, g.perfume_id, g.size_id) ||
+             ': layer says ' || trim_scale(g.qty_remaining)::text || ' left, the log adds up to ' || trim_scale(g.q)::text ||
+             ' (cost ' || to_char(g.cost_remaining, 'FM999,999,990.00') || ' vs ' || to_char(g.c, 'FM999,999,990.00') || ')',
+           (g.cost_remaining - g.c)::numeric, 'stock_layer', g.id
+      from (select l.id, l.stock_kind, l.material_id, l.perfume_id, l.size_id, l.source, l.source_id, l.received_date,
+                   l.qty_remaining, l.cost_remaining,
+                   coalesce(sum(m.qty), 0) as q, coalesce(sum(m.cost), 0) as c
+              from public.stock_layers l
+              left join public.stock_movements m on m.layer_id = l.id
+             group by l.id) g
+     where abs(g.qty_remaining - g.q) > 0.0005 or abs(g.cost_remaining - g.c) > 0.005
+
+    union all
+    -- 8a. Credit sale waiting for approval for more than 3 days
+    select 'PENDING_OLD', 'Request waiting more than 3 days', 'medium',
+           'SL-' || lpad(s.sale_no::text, 8, '0'), (s.created_at at time zone 'Asia/Manila')::date,
+           'Credit sale entered ' || to_char(s.created_at at time zone 'Asia/Manila', 'YYYY-MM-DD') ||
+             ', still waiting for your approval (' || (current_date - (s.created_at at time zone 'Asia/Manila')::date) || ' days).',
+           s.total::numeric, 'sale', s.id
+      from public.sales s
+     where s.status = 'Pending' and s.created_at < now() - interval '3 days'
+
+    union all
+    -- 8b. Return / exchange request waiting for more than 3 days (one line per RT number)
+    select 'PENDING_OLD', 'Request waiting more than 3 days', 'medium',
+           'RT-' || lpad(r.return_no::text, 4, '0'), (min(r.created_at) at time zone 'Asia/Manila')::date,
+           'Return request entered ' || to_char(min(r.created_at) at time zone 'Asia/Manila', 'YYYY-MM-DD') ||
+             ', still waiting (' || count(*) || ' item(s)).',
+           sum(r.refund_amount)::numeric, 'sales_return', (array_agg(r.id order by r.created_at))[1]
+      from public.sales_returns r
+     where r.status = 'Pending'
+     group by r.return_no
+    having min(r.created_at) < now() - interval '3 days'
+
+  ) x
+  order by case x.severity when 'high' then 1 when 'medium' then 2 else 3 end,
+           x.check_code, x.doc_date nulls last, x.doc_ref;
+end;
+$$;
+
+-- ---------- 3. Movement log with a running balance per item -------------------
+-- p_kind: 'material' | 'juice' | 'bottled' | 'finished' (null = all). p_item: the item id (null = all).
+-- The running balance is per item and counts from the very first movement, even when a date range is set.
+create or replace function public.audit_movement_log(
+  p_kind text default null, p_item uuid default null,
+  p_from date default null, p_to date default null, p_limit int default 1500
+) returns table (
+  move_date date, created_at timestamptz, stock_kind text, item_id uuid, item_name text,
+  move_type text, ref_type text, doc_ref text, qty numeric, cost numeric,
+  running_qty numeric, running_cost numeric, by_name text, doc_found boolean
+)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can open the audit.'; end if;
+
+  return query
+  with base as (
+    select m.id, m.move_date, m.created_at, m.move_type, m.ref_type, m.ref_id, m.qty, m.cost, m.created_by,
+           l.stock_kind, coalesce(l.material_id, l.perfume_id, l.size_id) as item_id,
+           l.material_id, l.perfume_id, l.size_id
+      from public.stock_movements m
+      join public.stock_layers l on l.id = m.layer_id
+     where (p_kind is null or l.stock_kind = p_kind)
+       and (p_item is null or coalesce(l.material_id, l.perfume_id, l.size_id) = p_item)
+  ),
+  run as (
+    select b.*,
+           sum(b.qty)  over w as rq,
+           sum(b.cost) over w as rc
+      from base b
+    window w as (partition by b.stock_kind, b.item_id
+                 order by b.move_date, b.created_at, b.id
+                 rows between unbounded preceding and current row)
+  )
+  select r.move_date, r.created_at, r.stock_kind, r.item_id,
+         public.audit_layer_item(r.stock_kind, r.material_id, r.perfume_id, r.size_id),
+         r.move_type, r.ref_type,
+         coalesce(public.audit_doc_label(r.ref_type, r.ref_id), '(no document)'),
+         r.qty::numeric, r.cost::numeric, r.rq::numeric, r.rc::numeric,
+         public.audit_who(r.created_by),
+         public.audit_doc_exists(r.ref_type, r.ref_id)
+    from run r
+   where (p_from is null or r.move_date >= p_from)
+     and (p_to is null or r.move_date <= p_to)
+   order by r.move_date desc, r.created_at desc, r.id desc
+   limit greatest(coalesce(p_limit, 1500), 1);
+end;
+$$;
+
+create or replace function public.audit_stock_items()
+returns table (stock_kind text, item_id uuid, item_name text, on_hand numeric)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can open the audit.'; end if;
+
+  return query
+  select x.stock_kind, x.item_id, x.item_name, x.on_hand
+    from (select l.stock_kind, coalesce(l.material_id, l.perfume_id, l.size_id) as item_id,
+                 public.audit_layer_item(l.stock_kind, l.material_id, l.perfume_id, l.size_id) as item_name,
+                 sum(l.qty_remaining)::numeric as on_hand
+            from public.stock_layers l
+           group by l.stock_kind, l.material_id, l.perfume_id, l.size_id) x
+   order by x.stock_kind, x.item_name;
+end;
+$$;
+
+-- ---------- 4. Invoice trace ------------------------------------------------------
+create or replace function public.audit_invoice_list()
+returns table (sale_id uuid, sale_no bigint, invoice_no bigint, invoice_date date, customer_name text,
+               payment_type text, total numeric, status text)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can open the audit.'; end if;
+
+  return query
+  select s.id, s.sale_no, s.invoice_no, s.invoice_date, coalesce(c.name, 'Walk-in')::text,
+         s.payment_type, s.total::numeric, s.status
+    from public.sales s
+    left join public.customers c on c.id = s.customer_id
+   where s.invoice_no is not null
+   order by s.invoice_no desc
+   limit 500;
+end;
+$$;
+
+create or replace function public.audit_invoice_trace(p_sale uuid)
+returns table (
+  sort_at timestamptz, step_type text, doc_ref text, description text, amount numeric,
+  status text, by_name text, event_date date, entry_id uuid, entry_no bigint
+)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can open the audit.'; end if;
+
+  return query
+  with s as (select * from public.sales where id = p_sale),
+  rets as (select r.* from public.sales_returns r where r.sale_id = p_sale),
+  pays as (
+    select p.*, a.amount as alloc
+      from public.customer_payment_allocations a
+      join public.customer_payments p on p.id = a.payment_id
+     where a.sale_id = p_sale
+  ),
+  entry_ids as (
+    select journal_entry_id as id from s where journal_entry_id is not null
+    union select void_entry_id from s where void_entry_id is not null
+    union select journal_entry_id from rets where journal_entry_id is not null
+    union select journal_entry_id from pays where journal_entry_id is not null
+    union select void_entry_id from pays where void_entry_id is not null
+  ),
+  all_entries as (
+    select e.* from public.journal_entries e
+     where e.id in (select id from entry_ids)
+        or e.reverses_id in (select id from entry_ids)
+  )
+  select * from (
+    select s.created_at, 'sale'::text, ('SL-' || lpad(s.sale_no::text, 8, '0'))::text,
+           ('Sale entered (' || s.payment_type || ')')::text, s.total::numeric, 'Entered'::text,
+           public.audit_who(s.created_by), s.sale_date, null::uuid, null::bigint
+      from s
+
+    union all
+    select s.decided_at, 'decision', 'SL-' || lpad(s.sale_no::text, 8, '0'),
+           case when s.status = 'Rejected' then 'Credit sale rejected: ' || coalesce(s.reject_reason, '')
+                else 'Credit sale approved' end,
+           s.total::numeric, case when s.status = 'Rejected' then 'Rejected' else 'Approved' end,
+           public.audit_who(s.decided_by), (s.decided_at at time zone 'Asia/Manila')::date, null::uuid, null::bigint
+      from s where s.decided_at is not null
+
+    union all
+    select e.created_at, 'journal', coalesce(e.reference, 'JE'),
+           e.description,
+           (select coalesce(sum(l.debit), 0) from public.journal_lines l where l.entry_id = e.id)::numeric,
+           case when e.reverses_id is not null then 'Reversal'
+                when exists (select 1 from public.journal_entries x where x.reverses_id = e.id) then 'Reversed'
+                else 'Posted' end,
+           public.audit_who(e.created_by), e.entry_date, e.id, e.entry_no
+      from all_entries e
+
+    union all
+    select r.created_at, 'return', 'RT-' || lpad(r.return_no::text, 4, '0'),
+           'Return requested: ' || r.qty || ' x ' ||
+             coalesce(public.audit_layer_item('finished', null, null, r.size_id), 'item') ||
+             ' (' || r.reason || ', ' || r.resolution || ')',
+           r.refund_amount::numeric, 'Requested', public.audit_who(r.created_by), r.return_date, null::uuid, null::bigint
+      from rets r
+
+    union all
+    select r.decided_at, 'return', 'RT-' || lpad(r.return_no::text, 4, '0'),
+           case when r.status = 'Rejected' then 'Return rejected: ' || coalesce(r.reject_reason, '')
+                else 'Return approved: ' || r.qty || ' x ' || coalesce(public.audit_layer_item('finished', null, null, r.size_id), 'item') end,
+           r.refund_amount::numeric, r.status, public.audit_who(r.decided_by),
+           (r.decided_at at time zone 'Asia/Manila')::date, null::uuid, null::bigint
+      from rets r where r.decided_at is not null
+
+    union all
+    select p.created_at, 'payment', 'PR-' || lpad(p.payment_no::text, 4, '0'),
+           'Payment received by ' || case p.method when 'bank' then 'bank transfer' else 'cash' end ||
+             coalesce(' (ref ' || p.reference || ')', '') || ', applied to this invoice',
+           p.alloc::numeric, p.status, public.audit_who(p.created_by), p.payment_date, null::uuid, null::bigint
+      from pays p
+
+    union all
+    select m.created_at, 'stock', coalesce(public.audit_doc_label(m.ref_type, m.ref_id), m.ref_type),
+           case m.move_type when 'in' then 'Stock in: ' when 'out' then 'Stock out: ' else 'Stock put back (void): ' end ||
+             trim_scale(abs(m.qty))::text || ' x ' ||
+             public.audit_layer_item(l.stock_kind, l.material_id, l.perfume_id, l.size_id),
+           abs(m.cost)::numeric, m.move_type, public.audit_who(m.created_by), m.move_date, null::uuid, null::bigint
+      from public.stock_movements m
+      join public.stock_layers l on l.id = m.layer_id
+     where (m.ref_type in ('sale', 'sale_void') and m.ref_id = p_sale)
+        or (m.ref_type in ('sales_return') and m.ref_id in (select id from rets))
+  ) t
+  order by 1, 2;
+end;
+$$;
+
+create or replace function public.audit_entry_lines(p_entry uuid)
+returns table (line_no int, account_code text, account_name text, debit numeric, credit numeric, memo text)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can open the audit.'; end if;
+
+  return query
+  select l.line_no, a.code::text, a.name::text, l.debit::numeric, l.credit::numeric, l.memo::text
+    from public.journal_lines l
+    join public.accounts a on a.id = l.account_id
+   where l.entry_id = p_entry
+   order by l.line_no;
+end;
+$$;
+
+-- ---------- 5. Stock count sheet (the page compares what you type; nothing is saved) ----------
+create or replace function public.audit_count_sheet()
+returns table (stock_kind text, item_id uuid, item_name text, group_name text, unit text,
+               system_qty numeric, system_value numeric)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can open the audit.'; end if;
+
+  return query
+  with sums as (
+    select l.stock_kind, coalesce(l.material_id, l.perfume_id, l.size_id) as k,
+           sum(l.qty_remaining) as q, sum(l.cost_remaining) as v
+      from public.stock_layers l group by 1, 2
+  )
+  select * from (
+    select 'material'::text as stock_kind, m.id as item_id, m.name::text as item_name, m.category::text as group_name,
+           m.unit::text as unit, coalesce(s.q, 0)::numeric as system_qty, coalesce(s.v, 0)::numeric as system_value
+      from public.materials m
+      left join sums s on s.stock_kind = 'material' and s.k = m.id
+     where m.is_active or coalesce(s.q, 0) > 0
+
+    union all
+    select 'finished', ps.id, (pf.name || ' ' || trim_scale(ps.size_ml)::text || ' ml')::text,
+           coalesce(pf.collection, 'Perfume')::text, 'pcs',
+           coalesce(s.q, 0)::numeric, coalesce(s.v, 0)::numeric
+      from public.perfume_sizes ps
+      join public.perfumes pf on pf.id = ps.perfume_id
+      left join sums s on s.stock_kind = 'finished' and s.k = ps.id
+     where (ps.is_active and pf.status <> 'Discontinued') or coalesce(s.q, 0) > 0
+
+    union all
+    select 'bottled', ps.id, (pf.name || ' ' || trim_scale(ps.size_ml)::text || ' ml (bottled, not packaged)')::text,
+           coalesce(pf.collection, 'Perfume')::text, 'pcs', s.q::numeric, s.v::numeric
+      from sums s
+      join public.perfume_sizes ps on ps.id = s.k
+      join public.perfumes pf on pf.id = ps.perfume_id
+     where s.stock_kind = 'bottled' and s.q > 0
+
+    union all
+    select 'juice', pf.id, (pf.name || ' (matured juice)')::text,
+           coalesce(pf.collection, 'Perfume')::text, 'ml', s.q::numeric, s.v::numeric
+      from sums s
+      join public.perfumes pf on pf.id = s.k
+     where s.stock_kind = 'juice' and s.q > 0
+  ) x
+  order by x.stock_kind, x.item_name;
+end;
+$$;
+
+-- ---------- 6. Permissions -------------------------------------------------------------
+revoke all on function public.audit_stock_value() from public, anon;
+revoke all on function public.audit_exceptions() from public, anon;
+revoke all on function public.audit_movement_log(text, uuid, date, date, int) from public, anon;
+revoke all on function public.audit_stock_items() from public, anon;
+revoke all on function public.audit_invoice_list() from public, anon;
+revoke all on function public.audit_invoice_trace(uuid) from public, anon;
+revoke all on function public.audit_entry_lines(uuid) from public, anon;
+revoke all on function public.audit_count_sheet() from public, anon;
+
+grant execute on function public.audit_stock_value() to authenticated;
+grant execute on function public.audit_exceptions() to authenticated;
+grant execute on function public.audit_movement_log(text, uuid, date, date, int) to authenticated;
+grant execute on function public.audit_stock_items() to authenticated;
+grant execute on function public.audit_invoice_list() to authenticated;
+grant execute on function public.audit_invoice_trace(uuid) to authenticated;
+grant execute on function public.audit_entry_lines(uuid) to authenticated;
+grant execute on function public.audit_count_sheet() to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- 7. Checks (run from the app while signed in as the owner; the SQL Editor has no signed-in user) ----------
+-- A staff login must get the error "Only the owner can open the audit."
+-- After running this file, open the Audit page. The exceptions list should load without an error.

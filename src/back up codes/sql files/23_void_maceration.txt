@@ -1,0 +1,114 @@
+-- =====================================================================
+-- Chinito Scento - void for maceration batches.
+-- Run after 07_void_production.sql. Safe to re-run. Run in the Supabase SQL Editor.
+--
+-- How it works (same idea as void_bottling and void_purchase):
+--   * owner only, reason required
+--   * the oils and solvent the batch took go back into the same FIFO layers, at their original cost
+--   * if the batch was already completed, the matured juice it created is removed
+--     (only if none of it is in use: if it was bottled, void the bottling run first)
+--   * every journal entry of the batch that is not yet reversed (start, completion, and any
+--     ADJ correction entries) is reversed
+--   * the batch is kept and marked Voided (nothing is deleted)
+-- =====================================================================
+
+-- ---------- 1. Allow the Voided status, add the void columns ----------
+do $$
+declare
+  c record;
+begin
+  for c in
+    select conname from pg_constraint
+     where conrelid = 'public.maceration_batches'::regclass and contype = 'c'
+       and pg_get_constraintdef(oid) ilike '%Macerating%'
+  loop
+    execute format('alter table public.maceration_batches drop constraint %I', c.conname);
+  end loop;
+end $$;
+
+alter table public.maceration_batches
+  add constraint maceration_batches_status_check check (status in ('Macerating','Matured','Voided'));
+
+alter table public.maceration_batches
+  add column if not exists void_entry_id uuid references public.journal_entries(id),
+  add column if not exists void_reason text,
+  add column if not exists voided_at timestamptz,
+  add column if not exists voided_by uuid references auth.users(id);
+
+-- ---------- 2. Void a batch (owner only) -------------------------------
+create or replace function public.void_maceration(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  b public.maceration_batches;
+  l public.stock_layers;
+  e record;
+  v_rev uuid;
+  v_first uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can void a maceration batch.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+
+  select * into b from public.maceration_batches where id = p_id for update;
+  if not found then raise exception 'Maceration batch not found.'; end if;
+  if b.status = 'Voided' then raise exception 'This batch is already voided.'; end if;
+
+  -- a completed batch: its juice must be untouched
+  if b.status = 'Matured' then
+    select * into l from public.stock_layers
+     where stock_kind = 'juice' and source = 'maceration' and source_id = p_id for update;
+    if not found then
+      raise exception 'The juice stock record for this batch was not found, so it cannot be voided safely.';
+    end if;
+    if l.qty_remaining <> l.qty_in or l.cost_remaining <> l.cost_in then
+      raise exception 'Some of this batch''s juice was already bottled. Void the bottling run first.';
+    end if;
+  end if;
+
+  -- put the oils and solvent back
+  if public.restore_stock_for('maceration', p_id, 'maceration_void') = 0 then
+    raise exception 'The oils and solvent used by this batch could not be found, so it cannot be voided safely.';
+  end if;
+
+  -- remove the juice this batch created
+  if b.status = 'Matured' then
+    insert into public.stock_movements (layer_id, move_date, move_type, qty, cost, ref_type, ref_id)
+    select id, current_date, 'void', -qty_remaining, -cost_remaining, 'maceration_void', p_id
+      from public.stock_layers
+     where stock_kind = 'juice' and source = 'maceration' and source_id = p_id and qty_remaining > 0;
+
+    update public.stock_layers set qty_remaining = 0, cost_remaining = 0
+     where stock_kind = 'juice' and source = 'maceration' and source_id = p_id;
+  end if;
+
+  -- reverse every journal entry of this batch that is not already reversed
+  for e in
+    select je.id
+      from public.journal_entries je
+     where je.source = 'maceration' and je.source_id = p_id and je.reverses_id is null
+       and not exists (select 1 from public.journal_entries x where x.reverses_id = je.id)
+     order by je.entry_no
+  loop
+    v_rev := public.reverse_module_entry(e.id, p_reason, 'maceration', p_id);
+    v_first := coalesce(v_first, v_rev);
+  end loop;
+
+  update public.maceration_batches
+     set status = 'Voided', void_entry_id = v_first, void_reason = trim(p_reason),
+         voided_at = now(), voided_by = auth.uid()
+   where id = p_id;
+end;
+$$;
+
+-- ---------- 3. Permissions ---------------------------------------------
+revoke all on function public.void_maceration(uuid, text) from public, anon;
+grant execute on function public.void_maceration(uuid, text) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- 4. Checks (run one at a time) ------------------------------
+-- The status rule should now list Voided:
+-- select conname, pg_get_constraintdef(oid) from pg_constraint
+--  where conrelid = 'public.maceration_batches'::regclass and contype = 'c';
+-- After voiding a batch, its oils and solvent should be back:
+-- select * from public.inventory_status where kind = 'material' order by item_name;

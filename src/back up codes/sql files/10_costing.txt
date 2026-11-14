@@ -1,0 +1,163 @@
+-- =====================================================================
+-- Chinito Scento - Costing: what it costs to produce one piece.
+-- Run after 09_sales.sql. Safe to re-run. Owner only (staff get no rows).
+--
+-- Three read-only functions, nothing is posted and no stock moves:
+--   costing_products()   per perfume size: HIGHEST, lowest, latest and average
+--                        cost of one finished piece, from the packaging runs
+--                        (voided runs are left out), with the selling price.
+--   costing_materials()  per raw material: highest, latest and average price paid,
+--                        from posted purchases (voided purchases are left out).
+--   costing_juice()      per perfume: highest, latest and average cost of one ml
+--                        of matured juice, from completed maceration batches.
+--
+-- Cost of one finished piece = juice + bottle + bottle sticker + box + box sticker + wrap,
+-- exactly as booked in Finished Goods. Spoiled units are booked separately as
+-- Production Loss, so they are not inside this figure.
+-- =====================================================================
+
+create or replace function public.costing_products()
+returns table (
+  size_id uuid, perfume_name text, size_ml numeric, price numeric,
+  runs int,
+  high_unit_cost numeric, high_bottled_unit numeric, high_pack_unit numeric,
+  high_run_no bigint, high_run_date date,
+  low_unit_cost numeric,
+  last_unit_cost numeric, last_run_date date,
+  avg_unit_cost numeric
+)
+language sql stable security definer set search_path = public as $$
+  with r as (
+    select pr.size_id, pr.run_no, pr.run_date, pr.qty, pr.finished_cost,
+           round(pr.finished_cost / pr.qty, 2) as unit_cost,
+           round(pr.bottled_cost / pr.qty, 2) as bottled_unit,
+           round((pr.finished_cost - pr.bottled_cost) / pr.qty, 2) as pack_unit
+    from public.packaging_runs pr
+    where pr.status = 'Posted' and pr.qty > 0
+  ),
+  hi as (
+    select distinct on (size_id) * from r
+    order by size_id, unit_cost desc, run_date desc, run_no desc
+  ),
+  la as (
+    select distinct on (size_id) * from r
+    order by size_id, run_date desc, run_no desc
+  ),
+  ag as (
+    select size_id, count(*)::int as n, min(unit_cost) as lo,
+           round(sum(finished_cost) / sum(qty), 2) as avg_cost
+    from r group by size_id
+  )
+  select ps.id, pf.name::text, ps.size_ml::numeric, ps.price::numeric,
+         coalesce(ag.n, 0),
+         hi.unit_cost, hi.bottled_unit, hi.pack_unit, hi.run_no, hi.run_date,
+         ag.lo,
+         la.unit_cost, la.run_date,
+         ag.avg_cost
+  from public.perfume_sizes ps
+  join public.perfumes pf on pf.id = ps.perfume_id
+  left join ag on ag.size_id = ps.id
+  left join hi on hi.size_id = ps.id
+  left join la on la.size_id = ps.id
+  where ps.is_active and pf.status <> 'Discontinued' and public.is_owner()
+  order by pf.name, ps.size_ml;
+$$;
+
+create or replace function public.costing_materials()
+returns table (
+  material_id uuid, code text, name text, category text, unit text,
+  purchases int,
+  high_cost numeric, high_date date, high_supplier text,
+  last_cost numeric, last_date date,
+  avg_cost numeric
+)
+language sql stable security definer set search_path = public as $$
+  with l as (
+    select pl.material_id, pl.unit_cost, pl.qty, pl.amount,
+           p.purchase_date, p.created_at, s.name as supplier
+    from public.purchase_lines pl
+    join public.purchases p on p.id = pl.purchase_id and p.status = 'Posted'
+    left join public.suppliers s on s.id = p.supplier_id
+    where pl.line_type = 'material' and pl.material_id is not null and pl.qty > 0
+  ),
+  hi as (
+    select distinct on (material_id) * from l
+    order by material_id, unit_cost desc, purchase_date desc, created_at desc
+  ),
+  la as (
+    select distinct on (material_id) * from l
+    order by material_id, purchase_date desc, created_at desc
+  ),
+  ag as (
+    select material_id, count(*)::int as n, round(sum(amount) / sum(qty), 4) as avg_cost
+    from l group by material_id
+  )
+  select m.id, m.code, m.name, m.category, m.unit,
+         coalesce(ag.n, 0),
+         hi.unit_cost::numeric, hi.purchase_date, hi.supplier::text,
+         la.unit_cost::numeric, la.purchase_date,
+         ag.avg_cost
+  from public.materials m
+  left join ag on ag.material_id = m.id
+  left join hi on hi.material_id = m.id
+  left join la on la.material_id = m.id
+  where m.is_active and public.is_owner()
+  order by m.category, m.name;
+$$;
+
+create or replace function public.costing_juice()
+returns table (
+  perfume_id uuid, name text,
+  batches int,
+  high_per_ml numeric, high_batch_no bigint, high_date date,
+  last_per_ml numeric, last_date date,
+  avg_per_ml numeric
+)
+language sql stable security definer set search_path = public as $$
+  with b as (
+    select mb.perfume_id, mb.batch_no, mb.matured_date, mb.actual_yield_ml, mb.juice_cost,
+           round(mb.juice_cost / mb.actual_yield_ml, 4) as per_ml
+    from public.maceration_batches mb
+    where mb.status = 'Matured' and mb.actual_yield_ml > 0 and mb.juice_cost is not null
+  ),
+  hi as (
+    select distinct on (perfume_id) * from b
+    order by perfume_id, per_ml desc, matured_date desc, batch_no desc
+  ),
+  la as (
+    select distinct on (perfume_id) * from b
+    order by perfume_id, matured_date desc, batch_no desc
+  ),
+  ag as (
+    select perfume_id, count(*)::int as n,
+           round(sum(juice_cost) / sum(actual_yield_ml), 4) as avg_per_ml
+    from b group by perfume_id
+  )
+  select pf.id, pf.name::text,
+         coalesce(ag.n, 0),
+         hi.per_ml, hi.batch_no, hi.matured_date,
+         la.per_ml, la.matured_date,
+         ag.avg_per_ml
+  from public.perfumes pf
+  left join ag on ag.perfume_id = pf.id
+  left join hi on hi.perfume_id = pf.id
+  left join la on la.perfume_id = pf.id
+  where pf.status <> 'Discontinued' and public.is_owner()
+  order by pf.name;
+$$;
+
+revoke all on function public.costing_products()  from public, anon;
+revoke all on function public.costing_materials() from public, anon;
+revoke all on function public.costing_juice()     from public, anon;
+grant execute on function public.costing_products()  to authenticated;
+grant execute on function public.costing_materials() to authenticated;
+grant execute on function public.costing_juice()     to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- Checks (run one at a time, signed in as owner in the app, or in the SQL editor) ----------
+-- select * from public.costing_products();
+-- select * from public.costing_materials();
+-- select * from public.costing_juice();
+-- Note: in the SQL editor you are not signed in as the owner, so these may return no rows there.
+-- Use the Costing page in the app to see the figures.

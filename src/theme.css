@@ -1,0 +1,71 @@
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+
+/* Chinito Scento design tokens. Import this AFTER index.css in main.jsx */
+:root {
+  --cs-bg: #0e0d0c;
+  --cs-side: #0b0a09;
+  --cs-surface: #161412;
+  --cs-raised: #1c1916;
+  --cs-line: #2a2622;
+  --cs-text: #ece6d8;
+  --cs-muted: #a8a090;
+  --cs-gold: #d9b24c;
+  --cs-gold-hi: #e6c35f;
+  --cs-gold-ink: #1a1405;
+  color-scheme: dark;
+}
+
+body { background: var(--cs-bg); color: var(--cs-text); font-family: 'Inter', system-ui, sans-serif; }
+.font-serif { font-family: 'Cormorant Garamond', Georgia, serif; }
+::selection { background: rgba(217, 178, 76, 0.3); }
+
+/* Cards */
+.cs-card {
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-line);
+  border-radius: 16px;
+  transition: border-color .25s ease, box-shadow .25s ease, transform .25s ease;
+}
+.cs-card-hover:hover {
+  border-color: #4a4028;
+  transform: translateY(-2px);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, .35);
+}
+
+/* Buttons */
+.cs-btn {
+  display: inline-flex; align-items: center; gap: .5rem;
+  border-radius: 10px; font-weight: 500; font-size: .875rem; cursor: pointer;
+  transition: background-color .2s ease, border-color .2s ease, color .2s ease, box-shadow .2s ease, transform .2s ease;
+}
+.cs-btn:disabled { opacity: .5; cursor: not-allowed; transform: none; box-shadow: none; }
+.cs-btn-gold { background: var(--cs-gold); color: var(--cs-gold-ink); border: 1px solid transparent; font-weight: 600; }
+.cs-btn-gold:hover:not(:disabled) { background: var(--cs-gold-hi); box-shadow: 0 8px 28px rgba(217, 178, 76, .25); transform: translateY(-1px); }
+.cs-btn-ghost { background: transparent; color: var(--cs-text); border: 1px solid #3a352e; }
+.cs-btn-ghost:hover:not(:disabled) { border-color: var(--cs-gold); color: #e3bf5a; }
+
+/* Form fields */
+.cs-label { display: block; font-size: .6875rem; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; color: var(--cs-muted); margin-bottom: .375rem; }
+.cs-input {
+  width: 100%; background: #1a1816; border: 1px solid var(--cs-line); border-radius: 10px;
+  color: var(--cs-text); font-size: .875rem;
+  transition: border-color .2s ease, box-shadow .2s ease;
+}
+.cs-input::placeholder { color: #7a7364; }
+.cs-input:focus { outline: none; border-color: var(--cs-gold); box-shadow: 0 0 0 3px rgba(217, 178, 76, .15); }
+
+/* Motion: only on page switch and when dialogs open */
+.cs-fade { animation: cs-fade .35s ease both; }
+.cs-pop { animation: cs-pop .2s ease both; }
+@keyframes cs-fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes cs-pop { from { opacity: 0; transform: scale(.97); } to { opacity: 1; transform: none; } }
+
+/* Keyboard focus */
+:focus-visible { outline: 2px solid #e3bf5a; outline-offset: 2px; }
+
+/* Calmer scrollbars */
+* { scrollbar-width: thin; scrollbar-color: #2a2622 transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

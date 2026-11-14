@@ -1,0 +1,123 @@
+-- ============================================================
+-- CSPMMS security upgrade. Run once in: Supabase > SQL Editor
+-- WARNING: this drops the old plain-text "profiles" table.
+-- Existing users are removed and must be re-created in the app.
+-- ============================================================
+
+create extension if not exists citext with schema extensions;
+
+drop table if exists public.profiles cascade;
+
+create table public.profiles (
+  id                    uuid primary key references auth.users(id) on delete cascade,
+  -- citext = case-insensitive, so "Romel" and "romel" count as the SAME username
+  username              extensions.citext unique not null
+                        check (username::text ~ '^[A-Za-z0-9._]{3,30}$'),
+  first_name            text not null check (char_length(trim(first_name)) between 1 and 60),
+  last_name             text not null check (char_length(trim(last_name))  between 1 and 60),
+  birthdate             date not null check (birthdate >= date '1900-01-01'),
+  email                 extensions.citext unique not null
+                        check (email::text ~* '^[^@\s]+@[^@\s]+\.[^@\s]+$'),
+  contact_number        text not null check (contact_number ~ '^[0-9+()\-\s]{7,20}$'),
+  role                  text not null default 'user'   check (role   in ('owner', 'user')),
+  status                text not null default 'Active' check (status in ('Pending', 'Active', 'Revoked')),
+  must_change_password  boolean not null default true,
+  date_joined           date not null default current_date,
+  created_at            timestamptz not null default now()
+);
+
+alter table public.profiles enable row level security;
+
+-- ---------- helper functions ----------
+create or replace function public.is_owner()
+returns boolean language sql security definer stable
+set search_path = public as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'owner' and status = 'Active'
+  );
+$$;
+
+-- Use this in the RLS policies of future tables (journal entries, fragrances...)
+create or replace function public.is_active_user()
+returns boolean language sql security definer stable
+set search_path = public as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and status = 'Active'
+  );
+$$;
+
+-- ---------- policies: read only. No insert/update/delete from the browser ----------
+create policy "Users read their own profile"
+  on public.profiles for select to authenticated
+  using (id = auth.uid());
+
+create policy "Owner reads all profiles"
+  on public.profiles for select to authenticated
+  using ((select public.is_owner()));
+
+-- ---------- safe actions the app may call ----------
+-- Lets the login screen turn a username into the email Supabase Auth needs.
+create or replace function public.login_email_for(p_username text)
+returns text language sql security definer stable
+set search_path = public, extensions as $$
+  select email::text from public.profiles
+  where username = p_username::extensions.citext
+  limit 1;
+$$;
+
+-- Owner approves / revokes someone. Revoking also blocks their sign-in and token refresh.
+create or replace function public.set_user_status(p_user uuid, p_status text)
+returns void language plpgsql security definer
+set search_path = public as $$
+begin
+  if not public.is_owner() then
+    raise exception 'Only the owner can change account status.';
+  end if;
+  if p_status not in ('Active', 'Revoked') then
+    raise exception 'Invalid status.';
+  end if;
+  if p_user = auth.uid() then
+    raise exception 'You cannot change your own status.';
+  end if;
+
+  update public.profiles set status = p_status
+  where id = p_user and role <> 'owner';
+
+  update auth.users
+  set banned_until = case when p_status = 'Revoked' then 'infinity'::timestamptz else null end
+  where id = p_user;
+end;
+$$;
+
+-- Called after the user sets their own new password.
+create or replace function public.complete_password_change()
+returns void language sql security definer
+set search_path = public as $$
+  update public.profiles set must_change_password = false where id = auth.uid();
+$$;
+
+revoke all on function public.is_owner()                    from public;
+revoke all on function public.is_active_user()              from public;
+revoke all on function public.login_email_for(text)         from public;
+revoke all on function public.set_user_status(uuid, text)   from public;
+revoke all on function public.complete_password_change()    from public;
+
+grant execute on function public.is_owner()                  to authenticated;
+grant execute on function public.is_active_user()            to authenticated;
+grant execute on function public.login_email_for(text)       to anon, authenticated;
+grant execute on function public.set_user_status(uuid, text) to authenticated;
+grant execute on function public.complete_password_change()  to authenticated;
+
+-- ============================================================
+-- STEP 2 (run separately, AFTER creating your owner login):
+-- Supabase > Authentication > Users > Add user > Create new user
+--   (tick "Auto Confirm User", set your email and a strong password)
+-- Then edit the values below and run this block:
+-- ============================================================
+-- insert into public.profiles
+--   (id, username, first_name, last_name, birthdate, email, contact_number, role, must_change_password)
+-- select id, 'edson', 'EDSON II', 'TAN', '1988-02-27', tanedson16@gmail.com, '09176570115', 'owner', false
+-- from auth.users
+-- where email = 'tanedson16@gmail.com';

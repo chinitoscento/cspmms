@@ -1,0 +1,235 @@
+import React, { useState, useEffect } from 'react';
+import {
+  BookOpen,
+  Package,
+  FlaskConical,
+  Menu,
+  X,
+  Clock,
+  LogOut,
+  LayoutDashboard,
+  Shield,
+  Search,
+  Users,
+  Truck,
+  Scale,
+  Boxes,
+  ShoppingCart,
+  Layers,
+  Droplets,
+  PackageCheck,
+  PackageX,
+} from 'lucide-react';
+import logoImage from '../logo.png';
+import CommandPalette from './CommandPalette';
+
+const NAV_ITEMS = [
+  { id: 'dashboard', name: 'Executive Dashboard', icon: LayoutDashboard },
+  { id: 'customers', name: 'Customers', icon: Users },
+  { id: 'suppliers', name: 'Suppliers', icon: Truck },
+  { id: 'inventory', name: 'Signature Collection', icon: Package },
+  { id: 'materials', name: 'Raw Materials', icon: Layers },
+  { id: 'stock', name: 'Stock & Alerts', icon: Boxes },
+  { id: 'writeoffs', name: 'Stock Write-offs', icon: PackageX },
+  { id: 'procurement', name: 'Procurement', icon: ShoppingCart },
+  { id: 'ledger', name: 'Journal Ledger', icon: BookOpen },
+  { id: 'maceration', name: 'Maceration Lab', icon: FlaskConical },
+  { id: 'bottling', name: 'Bottling', icon: Droplets },
+  { id: 'packaging', name: 'Packaging', icon: PackageCheck },
+  { id: 'reports', name: 'Accounting Reports', icon: Scale },
+  { id: 'users', name: 'User Management', icon: Shield },
+];
+
+function getGreeting(hour) {
+  if (hour < 12) return 'Good morning';
+  if (hour < 18) return 'Good afternoon';
+  return 'Good evening';
+}
+
+export default function Layout({ children, activeTab, setActiveTab, onSignOut, user }) {
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [now, setNow] = useState(new Date());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Ctrl+K / Cmd+K opens the quick-jump palette
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setPaletteOpen((open) => !open);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  
+  const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
+     const name = user?.first_name || user?.username || 'there';
+
+  const dateLine = now.toLocaleDateString('en-US', {
+    weekday: 'long',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+  const timeLine = now.toLocaleTimeString('en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+
+  const OWNER_ONLY = ['users', 'reports'];
+  const navItems = NAV_ITEMS.filter((item) => !OWNER_ONLY.includes(item.id) || user?.role === 'owner');
+  
+  const paletteItems = [
+    ...navItems.map((item) => ({
+      id: item.id,
+      name: item.name,
+      icon: item.icon,
+      hint: 'Go to page',
+      run: () => setActiveTab(item.id),
+    })),
+    { id: 'signout', name: 'Sign out', icon: LogOut, hint: 'End session', run: onSignOut },
+  ];
+
+  
+
+  return (
+    <div className="min-h-screen flex bg-[#0e0d0c] text-[#ece6d8]">
+      {/* Mobile sidebar overlay */}
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/70 backdrop-blur-md lg:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
+      {/* Sidebar */}
+      <aside
+        className={`
+          fixed inset-y-0 left-0 z-50 w-64 bg-[#0b0a09] border-r border-[#24201c] p-5 flex flex-col justify-between
+          transform transition-transform duration-300 ease-in-out lg:translate-x-0 lg:static
+          ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
+        `}
+      >
+        <div>
+          <div className="flex items-center justify-between pb-6 border-b border-[#24201c]">
+            <div className="flex items-center gap-3">
+              <img
+                src={logoImage}
+                alt="Chinito Scento logo"
+                className="w-11 h-11 object-contain"
+              />
+              <div>
+                <h1 className="font-serif tracking-[0.14em] text-lg text-[#e3bf5a] font-semibold leading-tight">
+                  CHINITO SCENTO
+                </h1>
+                <p className="text-[9px] uppercase tracking-[0.2em] text-[#a8a090]">CSPMMS Enterprise</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setSidebarOpen(false)}
+              className="lg:hidden text-[#a8a090] hover:text-white cursor-pointer"
+              aria-label="Close menu"
+            >
+              <X className="w-6 h-6" />
+            </button>
+          </div>
+
+          <nav className="mt-8 space-y-1.5" aria-label="Main">
+            {navItems.map((item) => {
+              const Icon = item.icon;
+              const isActive = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => {
+                    setActiveTab(item.id);
+                    setSidebarOpen(false);
+                  }}
+                  aria-current={isActive ? 'page' : undefined}
+                  className={`w-full flex items-center gap-3 px-3.5 py-3 rounded-xl text-sm font-medium border text-left cursor-pointer transition-all duration-200 ${
+                    isActive
+                      ? 'bg-[#1f1b12] text-[#e3bf5a] border-[#3a3014]'
+                      : 'text-[#a8a090] border-transparent hover:bg-[#1a1816] hover:text-[#ece6d8] hover:translate-x-0.5'
+                  }`}
+                >
+                  <Icon className="w-4 h-4" aria-hidden="true" />
+                  <span>{item.name}</span>
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+
+        <div className="pt-6 border-t border-[#24201c]">
+          <div className="p-3.5 rounded-xl border border-[#24201c] flex items-center gap-3">
+            <div className="w-2 h-2 rounded-full bg-[#3ecf8e] animate-pulse" aria-hidden="true" />
+            <div>
+              <p className="text-xs font-medium text-[#ece6d8]">Ledger Engine Active</p>
+              <p className="text-[9px] text-[#a8a090] tracking-wider">EVENT-SOURCED V2.0</p>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      {/* Main column */}
+      <div className="flex-1 flex flex-col min-w-0">
+        <header className="h-20 bg-[#0e0d0c]/85 backdrop-blur-xl border-b border-[#24201c] px-6 lg:px-10 flex items-center justify-between sticky top-0 z-30">
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="lg:hidden p-2 rounded-lg bg-[#161412] text-[#ece6d8] hover:text-[#e3bf5a] border border-[#2a2622] cursor-pointer"
+              aria-label="Open menu"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+            <div>
+              <h2 className="font-serif text-2xl font-semibold leading-tight">
+                {getGreeting(now.getHours())}, {name}
+              </h2>
+              <p className="text-xs text-[#a8a090]">{dateLine}</p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2.5">
+            <button
+              onClick={() => setPaletteOpen(true)}
+              className="cs-btn cs-btn-ghost px-3.5 py-2 text-xs text-[#a8a090]"
+              aria-label="Search or jump to"
+            >
+              <Search className="w-3.5 h-3.5" aria-hidden="true" />
+              <span className="hidden md:inline">Search or jump to</span>
+              <kbd className="hidden md:inline rounded-md border border-[#3a352e] px-1.5 py-px text-[10px] font-sans">
+                {isMac ? '⌘ K' : 'Ctrl K'}
+              </kbd>
+            </button>
+
+            <div className="hidden md:flex items-center gap-2 px-3.5 py-2 rounded-[10px] bg-[#161412] border border-[#2a2622] text-xs text-[#ece6d8] tabular-nums">
+              <Clock className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+              <span>{timeLine}</span>
+            </div>
+
+            <button onClick={onSignOut} className="cs-btn cs-btn-ghost px-3.5 py-2 text-xs" title="Sign out">
+              <LogOut className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+              <span className="hidden sm:inline">Sign Out</span>
+            </button>
+          </div>
+        </header>
+
+        {/* key makes each page fade in when you switch tabs */}
+        <main key={activeTab} className="cs-fade flex-1 p-6 lg:p-10 max-w-6xl w-full mx-auto">
+          {children}
+        </main>
+      </div>
+
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={paletteItems} />
+    </div>
+  );
+}

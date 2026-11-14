@@ -1,0 +1,414 @@
+-- =====================================================================
+-- Chinito Scento - ONE return slip (RT number) per return request.
+-- Run in the Supabase SQL Editor AFTER files 24 and 25. Safe to re-run.
+-- BACKUP FIRST: this file changes how sales_returns rows are numbered and approved.
+--
+-- Before: a request with 6 items on one invoice created 6 RT numbers, 6 reviews, 6 journal entries.
+-- After:  all items of one request share ONE RT number. The owner reviews it once, and approving
+--         it posts ONE journal entry for the whole request. A customer who comes back later on
+--         the same invoice makes a new request, which gets a new RT number.
+--
+-- How it is stored: each item is still its own row in sales_returns (so analytics, the customer
+-- ledger and the stock history keep working). The rows of one request simply carry the same
+-- return_no. Because of that, the "unique" rule on return_no is dropped.
+--
+-- What this file does
+--   1. Drops the unique rule on sales_returns.return_no (rows of one request share the number).
+--   2. MERGES the requests that are still pending and were entered together (same batch_id):
+--      they keep the LOWEST RT number of the group. The other numbers are simply not used.
+--      Nothing is posted by this step; no stock moves and no journal entry changes.
+--   3. New requests take ONE number for all their items.
+--   4. Approve / reject act on the whole request in one go (all or nothing).
+--   5. The customer ledger shows one line per RT.
+--
+-- Not touched: returns that were already approved or rejected. They keep their numbers,
+-- journal entries and stock movements exactly as they are.
+-- =====================================================================
+
+-- ---------- 1. Rows of one request share a number -----------------------
+do $$
+declare
+  c record;
+begin
+  for c in
+    select conname from pg_constraint
+     where conrelid = 'public.sales_returns'::regclass and contype = 'u'
+       and pg_get_constraintdef(oid) ilike '%(return_no)%'
+  loop
+    execute format('alter table public.sales_returns drop constraint %I', c.conname);
+  end loop;
+end $$;
+
+create index if not exists sales_returns_no_idx on public.sales_returns (return_no);
+
+-- ---------- 2. Merge the pending items that were entered together --------
+do $$
+declare
+  v_n int;
+begin
+  with g as (
+    select batch_id, min(return_no) as keep_no
+    from public.sales_returns
+    where status = 'Pending' and batch_id is not null
+    group by batch_id
+    having count(distinct return_no) > 1
+  )
+  update public.sales_returns r
+     set return_no = g.keep_no
+    from g
+   where r.batch_id = g.batch_id and r.status = 'Pending' and r.return_no <> g.keep_no;
+  get diagnostics v_n = row_count;
+  raise notice 'Merged % pending return item(s) into their request.', v_n;
+end $$;
+
+-- ---------- 3. Request: one internal function for one item ---------------
+-- Same checks and values as request_sales_return in file 25. The difference: the RT number
+-- and batch are given by the caller, so every item of one request shares them.
+create or replace function public.request_sales_return_line(
+  p_no bigint, p_batch uuid,
+  p_date date, p_sale uuid, p_size uuid, p_qty int, p_reason text, p_resolution text,
+  p_repl_size uuid, p_notes text
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  s public.sales;
+  v_sold int;
+  v_used int;
+  v_price numeric(14,2);
+  v_paid numeric;
+  v_unit_cost numeric(14,4);
+  v_repl uuid;
+  v_rp public.perfume_sizes;
+  v_refund numeric(14,2) := 0;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_reason is null or p_reason not in ('wrong_item','damaged','returned') then
+    raise exception 'Choose why the item is coming back.';
+  end if;
+  if not ((p_reason = 'wrong_item' and p_resolution = 'exchange')
+       or (p_reason = 'damaged' and p_resolution in ('refund','replace'))
+       or (p_reason = 'returned' and p_resolution = 'refund')) then
+    raise exception 'That outcome does not fit the reason.';
+  end if;
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many pieces are coming back.'; end if;
+
+  select * into s from public.sales where id = p_sale;
+  if not found or s.status <> 'Posted' then raise exception 'Choose a sale that has been invoiced.'; end if;
+
+  select coalesce(sum(qty), 0), max(coalesce(list_price, unit_price)),
+         case when sum(qty) > 0 then sum(amount) / sum(qty) else 0 end,
+         case when sum(qty) > 0 then sum(cost) / sum(qty) else 0 end
+    into v_sold, v_price, v_paid, v_unit_cost
+  from public.sale_lines where sale_id = p_sale and size_id = p_size;
+  if v_sold = 0 then raise exception 'That item is not on this sale.'; end if;
+
+  select coalesce(sum(qty), 0) into v_used
+  from public.sales_returns
+  where sale_id = p_sale and size_id = p_size and status in ('Pending','Approved');
+  if p_qty > v_sold - v_used then
+    raise exception 'Only % piece(s) of this item can still be returned on this sale.', v_sold - v_used;
+  end if;
+
+  if p_resolution in ('exchange','replace') then
+    v_repl := coalesce(p_repl_size, p_size);
+    select ps.* into v_rp
+      from public.perfume_sizes ps join public.perfumes pf on pf.id = ps.perfume_id
+     where ps.id = v_repl and ps.is_active and pf.status <> 'Discontinued';
+    if not found then raise exception 'Choose a valid replacement item.'; end if;
+    if v_rp.price <> v_price then
+      raise exception 'The replacement must have the same collection price (%) as the item that was sold.', v_price;
+    end if;
+  else
+    v_repl := null;
+    v_refund := round(p_qty * v_paid, 2);
+  end if;
+
+  insert into public.sales_returns
+    (id, return_no, batch_id, return_date, sale_id, reason, resolution, size_id, qty, repl_size_id,
+     unit_price, unit_cost, refund_amount, notes)
+  values
+    (v_id, coalesce(p_no, nextval('public.sales_return_no_seq')), p_batch,
+     coalesce(p_date, (now() at time zone 'Asia/Manila')::date), p_sale, p_reason, p_resolution, p_size, p_qty, v_repl,
+     round(v_paid, 2), v_unit_cost, v_refund, nullif(trim(coalesce(p_notes, '')), ''));
+  return v_id;
+end;
+$$;
+
+-- A single item on its own is just a request of one item (same signature as before).
+create or replace function public.request_sales_return(
+  p_date date, p_sale uuid, p_size uuid, p_qty int, p_reason text, p_resolution text,
+  p_repl_size uuid, p_notes text
+) returns uuid
+language sql security definer set search_path = public as $$
+  select public.request_sales_return_line(null, null, p_date, p_sale, p_size, p_qty, p_reason, p_resolution, p_repl_size, p_notes);
+$$;
+
+-- Several items from one invoice in one request: ONE RT number for all of them.
+create or replace function public.request_sales_return_batch(
+  p_date date, p_sale uuid, p_notes text, p_lines jsonb
+) returns int
+language plpgsql security definer set search_path = public as $$
+declare
+  v_batch uuid := gen_random_uuid();
+  v_no    bigint;
+  v_line  jsonb;
+  v_id    uuid;
+  v_n     int := 0;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 1 then
+    raise exception 'Add at least one item to return.';
+  end if;
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    -- the first item takes the next RT number (only after its checks pass); the rest reuse it
+    v_id := public.request_sales_return_line(
+      v_no, v_batch, p_date, p_sale,
+      nullif(v_line->>'size_id', '')::uuid,
+      coalesce((v_line->>'qty')::int, 0),
+      v_line->>'reason',
+      v_line->>'resolution',
+      nullif(v_line->>'repl_size_id', '')::uuid,
+      p_notes
+    );
+    if v_no is null then
+      select return_no into v_no from public.sales_returns where id = v_id;
+    end if;
+    v_n := v_n + 1;
+  end loop;
+
+  return v_n;
+end;
+$$;
+
+-- ---------- 4. Approve a whole request (owner only) ---------------------
+-- Same accounting rules per item as file 25. The items are handled in order, one journal entry
+-- is posted for the request, and on a credit invoice the refunds take down what the customer
+-- still owes one after another (so the balance is never reduced twice).
+create or replace function public.approve_sales_return(p_id uuid, p_refund_method text default null)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  r0 public.sales_returns;
+  r public.sales_returns;
+  s public.sales;
+  v_label text;
+  v_ret_cost numeric(14,2);
+  v_out_cost numeric(14,2);
+  v_lines jsonb := '[]'::jsonb;
+  v_je uuid;
+  v_bal numeric(14,2) := 0;
+  v_ar numeric(14,2);
+  v_paid numeric(14,2);
+  v_method text;
+  v_ids uuid[] := '{}';
+begin
+  if not public.is_owner() then raise exception 'Only the owner can approve returns.'; end if;
+  select * into r0 from public.sales_returns where id = p_id;
+  if not found then raise exception 'Return not found.'; end if;
+  if r0.status <> 'Pending' then raise exception 'This return was already decided.'; end if;
+
+  select * into s from public.sales where id = r0.sale_id for update;
+  perform 1 from public.sales_returns
+   where return_no = r0.return_no and sale_id = r0.sale_id and status = 'Pending'
+   order by created_at, id for update;
+
+  v_label := 'RT-' || lpad(r0.return_no::text, 4, '0');
+  if s.payment_type = 'credit' then
+    v_bal := greatest(coalesce(public.sale_open_balance(s.id), 0), 0);
+  end if;
+
+  for r in
+    select * from public.sales_returns
+     where return_no = r0.return_no and sale_id = r0.sale_id and status = 'Pending'
+     order by created_at, id
+  loop
+    v_ret_cost := round(r.unit_cost * r.qty, 2);
+    v_out_cost := 0; v_ar := 0; v_paid := 0; v_method := null;
+
+    -- the replacement goes out first, so it can never be the piece that just came back
+    if r.resolution in ('exchange','replace') then
+      v_out_cost := public.stock_out('finished', r.repl_size_id, r.qty, r.return_date, 'sales_return', r.id);
+    end if;
+
+    if r.resolution = 'exchange' then
+      perform public.stock_in('finished', null, null, r.size_id, r.return_date, r.qty, v_ret_cost, 'sales_return', r.id);
+      if v_ret_cost > 0 then
+        v_lines := v_lines || jsonb_build_array(
+          jsonb_build_object('account_code', '1330', 'debit',  v_ret_cost, 'memo', v_label || ' piece returned'),
+          jsonb_build_object('account_code', '5000', 'credit', v_ret_cost, 'memo', v_label || ' piece returned'));
+      end if;
+      if v_out_cost > 0 then
+        v_lines := v_lines || jsonb_build_array(
+          jsonb_build_object('account_code', '5000', 'debit',  v_out_cost, 'memo', v_label || ' replacement given'),
+          jsonb_build_object('account_code', '1330', 'credit', v_out_cost, 'memo', v_label || ' replacement given'));
+      end if;
+
+    elsif r.resolution = 'replace' then
+      if v_ret_cost > 0 then
+        v_lines := v_lines || jsonb_build_array(
+          jsonb_build_object('account_code', '5130', 'debit',  v_ret_cost, 'memo', v_label || ' damaged piece written off'),
+          jsonb_build_object('account_code', '5000', 'credit', v_ret_cost, 'memo', v_label || ' damaged piece written off'));
+      end if;
+      if v_out_cost > 0 then
+        v_lines := v_lines || jsonb_build_array(
+          jsonb_build_object('account_code', '5000', 'debit',  v_out_cost, 'memo', v_label || ' replacement given'),
+          jsonb_build_object('account_code', '1330', 'credit', v_out_cost, 'memo', v_label || ' replacement given'));
+      end if;
+
+    else -- refund
+      if s.payment_type = 'credit' then
+        v_ar := least(r.refund_amount, v_bal);
+        v_bal := v_bal - v_ar;
+        v_paid := r.refund_amount - v_ar;
+        if v_paid > 0 then
+          if p_refund_method is null or p_refund_method not in ('cash','bank') then
+            raise exception 'The customer already paid part of this refund. Choose whether it is paid back in cash or by bank transfer.';
+          end if;
+          v_method := p_refund_method;
+        end if;
+      else
+        v_paid := r.refund_amount;
+        v_method := case s.payment_type when 'cash' then 'cash' else 'bank' end;
+      end if;
+
+      v_lines := v_lines || jsonb_build_array(
+        jsonb_build_object('account_code', '4100', 'debit', r.refund_amount,
+                           'memo', v_label || case when r.reason = 'returned' then ' returned item' else ' damaged return' end));
+      if v_ar > 0 then
+        v_lines := v_lines || jsonb_build_array(
+          jsonb_build_object('account_code', '1100', 'credit', v_ar, 'memo', v_label || ' reduces balance',
+                             'customer_id', s.customer_id));
+      end if;
+      if v_paid > 0 then
+        v_lines := v_lines || jsonb_build_array(
+          jsonb_build_object('account_code', case v_method when 'cash' then '1010' else '1020' end,
+                             'credit', v_paid, 'memo', v_label || ' refund paid back'));
+      end if;
+      if r.reason = 'returned' then
+        perform public.stock_in('finished', null, null, r.size_id, r.return_date, r.qty, v_ret_cost, 'sales_return', r.id);
+        if v_ret_cost > 0 then
+          v_lines := v_lines || jsonb_build_array(
+            jsonb_build_object('account_code', '1330', 'debit',  v_ret_cost, 'memo', v_label || ' piece returned to stock'),
+            jsonb_build_object('account_code', '5000', 'credit', v_ret_cost, 'memo', v_label || ' piece returned to stock'));
+        end if;
+      elsif v_ret_cost > 0 then
+        v_lines := v_lines || jsonb_build_array(
+          jsonb_build_object('account_code', '5130', 'debit',  v_ret_cost, 'memo', v_label || ' damaged piece written off'),
+          jsonb_build_object('account_code', '5000', 'credit', v_ret_cost, 'memo', v_label || ' damaged piece written off'));
+      end if;
+    end if;
+
+    update public.sales_returns
+       set status = 'Approved', decided_by = auth.uid(), decided_at = now(),
+           refund_ar = v_ar, refund_paid = v_paid, refund_method = v_method
+     where id = r.id;
+    v_ids := v_ids || r.id;
+  end loop;
+
+  if jsonb_array_length(v_lines) > 0 then
+    v_je := public.post_module_entry(r0.return_date, v_label,
+              'Return / exchange ' || v_label || ' on INV-' || lpad(s.invoice_no::text, 4, '0') ||
+                case when cardinality(v_ids) > 1 then ' (' || cardinality(v_ids) || ' items)' else '' end,
+              v_lines, 'sales_return', r0.id);
+    update public.sales_returns set journal_entry_id = v_je where id = any (v_ids);
+  end if;
+end;
+$$;
+
+-- ---------- 5. Reject a whole request (owner only) ------------------------
+create or replace function public.reject_sales_return(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  r public.sales_returns;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can reject returns.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+  select * into r from public.sales_returns where id = p_id;
+  if not found then raise exception 'Return not found.'; end if;
+  if r.status <> 'Pending' then raise exception 'This return was already decided.'; end if;
+
+  perform 1 from public.sales_returns
+   where return_no = r.return_no and sale_id = r.sale_id and status = 'Pending' for update;
+
+  update public.sales_returns
+     set status = 'Rejected', reject_reason = trim(p_reason), decided_by = auth.uid(), decided_at = now()
+   where return_no = r.return_no and sale_id = r.sale_id and status = 'Pending';
+end;
+$$;
+
+-- ---------- 6. Customer ledger: one line per RT ----------------------------
+create or replace view public.customer_ledger
+with (security_invoker = true) as
+select t.*,
+       sum(t.debit - t.credit) over (
+         partition by t.customer_id
+         order by t.entry_date, t.ord, t.created_at, t.doc_no
+         rows between unbounded preceding and current row
+       ) as balance
+from (
+  select s.customer_id, s.invoice_date as entry_date, 1 as ord,
+         'INV-' || lpad(s.invoice_no::text, 4, '0') as doc_no,
+         'invoice'::text as kind,
+         ('Invoice ' || 'INV-' || lpad(s.invoice_no::text, 4, '0') ||
+            case when s.due_date is not null then ' (due ' || to_char(s.due_date, 'YYYY-MM-DD') || ')' else '' end) as description,
+         s.total as debit, 0::numeric as credit, s.id as sale_id, s.created_at
+  from public.sales s
+  where s.payment_type = 'credit' and s.status = 'Posted'
+
+  union all
+
+  select s.customer_id, r.return_date, 2,
+         'RT-' || lpad(r.return_no::text, 4, '0'),
+         'return',
+         (case when bool_and(r.reason = 'damaged') then 'Damaged return RT-' else 'Return RT-' end ||
+            lpad(r.return_no::text, 4, '0') || ' on INV-' || lpad(s.invoice_no::text, 4, '0') ||
+            case when sum(r.refund_paid) > 0
+                 then ' (PHP ' || to_char(sum(r.refund_paid), 'FM999,999,990.00') || ' of the refund was already paid, returned by ' ||
+                      case max(r.refund_method) when 'bank' then 'bank transfer' else 'cash' end || ')'
+                 else '' end),
+         0::numeric, sum(r.refund_ar), s.id, min(r.created_at)
+  from public.sales_returns r
+  join public.sales s on s.id = r.sale_id
+  where s.payment_type = 'credit' and r.status = 'Approved' and r.resolution = 'refund'
+    and (r.refund_ar > 0 or r.refund_paid > 0)
+  group by s.customer_id, s.id, s.invoice_no, r.return_no, r.return_date
+
+  union all
+
+  select p.customer_id, p.payment_date, 3,
+         'PR-' || lpad(p.payment_no::text, 4, '0'),
+         'payment',
+         ('Payment received by ' || case p.method when 'bank' then 'bank transfer' else 'cash' end ||
+            coalesce(' (ref ' || p.reference || ')', '') ||
+            case when p.excess_refunded > 0
+                 then ', excess of PHP ' || to_char(p.excess_refunded, 'FM999,999,990.00') || ' returned by bank transfer'
+                 else '' end),
+         0::numeric, p.applied, null::uuid, p.created_at
+  from public.customer_payments p
+  where p.status = 'Posted'
+) t;
+
+-- ---------- 7. Permissions --------------------------------------------------
+revoke all on function public.request_sales_return_line(bigint,uuid,date,uuid,uuid,int,text,text,uuid,text) from public, anon, authenticated;
+revoke all on function public.request_sales_return(date,uuid,uuid,int,text,text,uuid,text) from public, anon;
+revoke all on function public.request_sales_return_batch(date,uuid,text,jsonb) from public, anon;
+revoke all on function public.approve_sales_return(uuid,text) from public, anon;
+revoke all on function public.reject_sales_return(uuid,text) from public, anon;
+grant execute on function public.request_sales_return(date,uuid,uuid,int,text,text,uuid,text) to authenticated;
+grant execute on function public.request_sales_return_batch(date,uuid,text,jsonb) to authenticated;
+grant execute on function public.approve_sales_return(uuid,text) to authenticated;
+grant execute on function public.reject_sales_return(uuid,text) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- Checks (run one at a time) ----------------------------------------
+-- 1) The pending request on INV-34 should now be ONE number with all its items (expect a single return_no):
+-- select return_no, count(*) as items, sum(qty) as pieces, min(status) as status
+--   from public.sales_returns where status = 'Pending' group by return_no order by return_no;
+-- 2) Nothing was posted by this file. The journal total must be the same before and after running it:
+-- select count(*), sum(debit), sum(credit) from public.journal_lines;
+-- 3) After approving the request in the app, there should be ONE journal entry for it:
+-- select e.entry_no, e.reference, e.description from public.journal_entries e where e.source = 'sales_return' order by e.entry_no desc limit 3;

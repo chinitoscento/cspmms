@@ -1,0 +1,354 @@
+-- =====================================================================
+-- Chinito Scento - Phase 1: ledger foundation + customers, suppliers, perfumes
+-- Run once in Supabase SQL Editor AFTER 01_security_setup.sql.
+-- Requires: public.profiles, public.is_owner(), public.is_active_user()
+-- Sole proprietorship, non-VAT. Tax method is a setting (3% or 8%).
+-- =====================================================================
+
+-- ---------- 1. Business settings (single row) ------------------------
+create table if not exists public.business_settings (
+  id                  boolean primary key default true check (id),   -- forces one row
+  business_name       text not null default 'Chinito Scento',
+  vat_status          text not null default 'non_vat' check (vat_status in ('non_vat','vat')),
+  tax_method          text not null default 'percentage_3'
+                        check (tax_method in ('percentage_3','income_8')),
+  percentage_tax_rate numeric(5,4) not null default 0.03,
+  vat_threshold       numeric(14,2) not null default 3000000,
+  updated_at          timestamptz not null default now()
+);
+insert into public.business_settings (id) values (true) on conflict do nothing;
+
+-- ---------- 2. Chart of accounts -------------------------------------
+create table if not exists public.accounts (
+  id            uuid primary key default gen_random_uuid(),
+  code          text not null unique,
+  name          text not null,
+  type          text not null check (type in ('asset','liability','equity','revenue','expense')),
+  normal_side   text not null check (normal_side in ('debit','credit')),
+  cash_class    text check (cash_class in ('cash','operating','investing','financing')),
+  is_active     boolean not null default true,
+  is_system     boolean not null default false,
+  created_at    timestamptz not null default now()
+);
+
+insert into public.accounts (code, name, type, normal_side, cash_class, is_system) values
+ ('1010','Cash on Hand','asset','debit','cash',true),
+ ('1020','Cash in Bank','asset','debit','cash',true),
+ ('1100','Accounts Receivable','asset','debit','operating',true),
+ ('1200','Raw Materials - Oils','asset','debit','operating',true),
+ ('1210','Raw Materials - Solvent','asset','debit','operating',true),
+ ('1220','Packaging Materials','asset','debit','operating',true),
+ ('1300','Maceration Work in Process','asset','debit','operating',true),
+ ('1310','Matured Juice','asset','debit','operating',true),
+ ('1320','Bottled Perfume','asset','debit','operating',true),
+ ('1330','Finished Goods','asset','debit','operating',true),
+ ('1400','Prepaid Expenses','asset','debit','operating',false),
+ ('1500','Equipment','asset','debit','investing',false),
+ ('1510','Accumulated Depreciation','asset','credit','investing',false),
+ ('2000','Accounts Payable','liability','credit','operating',true),
+ ('2100','Accrued Expenses','liability','credit','operating',false),
+ ('2200','Percentage Tax Payable','liability','credit','operating',true),
+ ('2210','Income Tax Payable','liability','credit','operating',false),
+ ('2300','Loans Payable','liability','credit','financing',false),
+ ('3000','Owner''s Capital','equity','credit','financing',true),
+ ('3100','Owner''s Drawings','equity','debit','financing',true),
+ ('4000','Sales','revenue','credit','operating',true),
+ ('4100','Sales Returns and Allowances','revenue','debit','operating',true),
+ ('5000','Cost of Goods Sold','expense','debit','operating',true),
+ ('5100','Maceration Loss','expense','debit','operating',true),
+ ('6000','Rent Expense','expense','debit','operating',false),
+ ('6010','Utilities Expense','expense','debit','operating',false),
+ ('6020','Salaries and Wages','expense','debit','operating',false),
+ ('6030','Marketing and Advertising','expense','debit','operating',false),
+ ('6040','Delivery and Freight Out','expense','debit','operating',false),
+ ('6050','Supplies Expense','expense','debit','operating',false),
+ ('6060','Depreciation Expense','expense','debit','operating',false),
+ ('6070','Percentage Tax Expense','expense','debit','operating',true),
+ ('6080','Income Tax Expense','expense','debit','operating',false),
+ ('6090','Miscellaneous Expense','expense','debit','operating',false)
+on conflict (code) do nothing;
+
+-- ---------- 3. Customers and suppliers -------------------------------
+create table if not exists public.customers (
+  id            uuid primary key default gen_random_uuid(),
+  name          text not null,
+  contact_person text,
+  email         text,
+  phone         text,
+  address       text,
+  credit_allowed boolean not null default false,
+  credit_limit  numeric(14,2) not null default 0 check (credit_limit >= 0),
+  credit_days   int not null default 0 check (credit_days >= 0),
+  notes         text,
+  status        text not null default 'Active' check (status in ('Active','Inactive')),
+  created_by    uuid references auth.users(id) default auth.uid(),
+  created_at    timestamptz not null default now()
+);
+create unique index if not exists customers_name_uq on public.customers (lower(name));
+
+create table if not exists public.suppliers (
+  id            uuid primary key default gen_random_uuid(),
+  name          text not null,
+  contact_person text,
+  email         text,
+  phone         text,
+  address       text,
+  tin           text,
+  payment_terms_days int not null default 0 check (payment_terms_days >= 0),
+  supplies      text,                 -- what they sell (oils, bottles, boxes...)
+  notes         text,
+  status        text not null default 'Active' check (status in ('Active','Inactive')),
+  created_by    uuid references auth.users(id) default auth.uid(),
+  created_at    timestamptz not null default now()
+);
+create unique index if not exists suppliers_name_uq on public.suppliers (lower(name));
+
+-- ---------- 4. Perfume collection ------------------------------------
+create table if not exists public.perfumes (
+  id            uuid primary key default gen_random_uuid(),
+  sku           text not null unique,
+  name          text not null,
+  collection    text,                 -- e.g. "Signature"
+  description   text,
+  bottle_size_ml numeric(8,2) check (bottle_size_ml > 0),
+  selling_price numeric(14,2) not null default 0 check (selling_price >= 0),
+  status        text not null default 'Active' check (status in ('Active','Discontinued')),
+  created_by    uuid references auth.users(id) default auth.uid(),
+  created_at    timestamptz not null default now()
+);
+create unique index if not exists perfumes_name_uq on public.perfumes (lower(name));
+
+-- ---------- 5. Journal (immutable) -----------------------------------
+create sequence if not exists public.journal_no_seq;
+
+create table if not exists public.journal_entries (
+  id            uuid primary key default gen_random_uuid(),
+  entry_no      bigint not null unique default nextval('public.journal_no_seq'),
+  entry_date    date not null default current_date,
+  reference     text,
+  description   text not null,
+  source        text not null default 'manual',     -- manual, procurement, sales, ...
+  source_id     uuid,
+  reverses_id   uuid unique references public.journal_entries(id),
+  created_by    uuid references auth.users(id) default auth.uid(),
+  created_at    timestamptz not null default now()
+);
+create index if not exists je_date_idx on public.journal_entries (entry_date);
+
+create table if not exists public.journal_lines (
+  id            uuid primary key default gen_random_uuid(),
+  entry_id      uuid not null references public.journal_entries(id),
+  line_no       int not null,
+  account_id    uuid not null references public.accounts(id),
+  debit         numeric(14,2) not null default 0 check (debit >= 0),
+  credit        numeric(14,2) not null default 0 check (credit >= 0),
+  memo          text,
+  customer_id   uuid references public.customers(id),
+  supplier_id   uuid references public.suppliers(id),
+  check ((debit > 0 and credit = 0) or (credit > 0 and debit = 0)),
+  unique (entry_id, line_no)
+);
+create index if not exists jl_entry_idx on public.journal_lines (entry_id);
+create index if not exists jl_account_idx on public.journal_lines (account_id);
+
+-- Block UPDATE and DELETE on the journal, for everyone (mistakes -> reversing entry)
+create or replace function public.block_journal_changes()
+returns trigger language plpgsql as $$
+begin
+  raise exception 'Posted journal entries cannot be edited or deleted. Post a reversing entry instead.';
+end;
+$$;
+
+drop trigger if exists je_immutable on public.journal_entries;
+create trigger je_immutable before update or delete on public.journal_entries
+  for each row execute function public.block_journal_changes();
+
+drop trigger if exists jl_immutable on public.journal_lines;
+create trigger jl_immutable before update or delete on public.journal_lines
+  for each row execute function public.block_journal_changes();
+
+-- Inserts only through post_journal_entry() (balanced entries guaranteed)
+create or replace function public.post_journal_entry(
+  p_date date,
+  p_reference text,
+  p_description text,
+  p_lines jsonb,                       -- [{account_code, debit, credit, memo, customer_id, supplier_id}]
+  p_source text default 'manual',
+  p_source_id uuid default null,
+  p_reverses uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+  v_line jsonb;
+  v_n int := 0;
+  v_acc uuid;
+  v_dr numeric(14,2) := 0;
+  v_cr numeric(14,2) := 0;
+begin
+  if not public.is_active_user() then
+    raise exception 'Not allowed.';
+  end if;
+  if coalesce(trim(p_description),'') = '' then
+    raise exception 'Description is required.';
+  end if;
+  if jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 2 then
+    raise exception 'An entry needs at least two lines.';
+  end if;
+
+  -- Only the owner may post manual entries and reversals; other sources come from module functions later
+  if p_source = 'manual' and not public.is_owner() then
+    raise exception 'Only the owner can post manual journal entries.';
+  end if;
+  if p_reverses is not null and not public.is_owner() then
+    raise exception 'Only the owner can reverse entries.';
+  end if;
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    v_dr := v_dr + coalesce((v_line->>'debit')::numeric, 0);
+    v_cr := v_cr + coalesce((v_line->>'credit')::numeric, 0);
+  end loop;
+  if round(v_dr,2) <> round(v_cr,2) then
+    raise exception 'Debits (%) must equal credits (%).', v_dr, v_cr;
+  end if;
+  if v_dr = 0 then
+    raise exception 'Entry total cannot be zero.';
+  end if;
+
+  insert into public.journal_entries (entry_date, reference, description, source, source_id, reverses_id)
+  values (coalesce(p_date, current_date), p_reference, p_description, p_source, p_source_id, p_reverses)
+  returning id into v_id;
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    v_n := v_n + 1;
+    select id into v_acc from public.accounts
+      where code = v_line->>'account_code' and is_active;
+    if v_acc is null then
+      raise exception 'Unknown or inactive account %', v_line->>'account_code';
+    end if;
+    insert into public.journal_lines (entry_id, line_no, account_id, debit, credit, memo, customer_id, supplier_id)
+    values (
+      v_id, v_n, v_acc,
+      coalesce((v_line->>'debit')::numeric, 0),
+      coalesce((v_line->>'credit')::numeric, 0),
+      v_line->>'memo',
+      nullif(v_line->>'customer_id','')::uuid,
+      nullif(v_line->>'supplier_id','')::uuid
+    );
+  end loop;
+
+  return v_id;
+end;
+$$;
+
+-- Reverse an entry (swaps debit and credit)
+create or replace function public.reverse_journal_entry(p_entry uuid, p_reason text)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_old public.journal_entries;
+  v_lines jsonb;
+begin
+  if not public.is_owner() then
+    raise exception 'Only the owner can reverse entries.';
+  end if;
+  select * into v_old from public.journal_entries where id = p_entry;
+  if not found then raise exception 'Entry not found.'; end if;
+  if v_old.reverses_id is not null then raise exception 'A reversal cannot be reversed.'; end if;
+  if exists (select 1 from public.journal_entries where reverses_id = p_entry) then
+    raise exception 'This entry is already reversed.';
+  end if;
+
+  select jsonb_agg(jsonb_build_object(
+           'account_code', a.code,
+           'debit', l.credit, 'credit', l.debit,
+           'memo', l.memo, 'customer_id', l.customer_id, 'supplier_id', l.supplier_id)
+         order by l.line_no)
+    into v_lines
+  from public.journal_lines l join public.accounts a on a.id = l.account_id
+  where l.entry_id = p_entry;
+
+  return public.post_journal_entry(
+    current_date,
+    'REV-' || v_old.entry_no,
+    'Reversal of #' || v_old.entry_no || ': ' || coalesce(p_reason,''),
+    v_lines, 'reversal', p_entry, p_entry);
+end;
+$$;
+
+-- Ledger view (one row per line, easy for reports)
+create or replace view public.ledger_lines
+with (security_invoker = true) as
+select l.id, e.id as entry_id, e.entry_no, e.entry_date, e.reference, e.description, e.source,
+       a.code as account_code, a.name as account_name, a.type as account_type,
+       l.debit, l.credit, l.memo, l.customer_id, l.supplier_id
+from public.journal_lines l
+join public.journal_entries e on e.id = l.entry_id
+join public.accounts a on a.id = l.account_id;
+
+-- Trial balance by account (optionally to a date)
+create or replace function public.trial_balance(p_to date default current_date)
+returns table (code text, name text, type text, debit numeric, credit numeric)
+language sql stable security invoker set search_path = public as $$
+  select a.code, a.name, a.type,
+         case when sum(l.debit) - sum(l.credit) > 0 then sum(l.debit) - sum(l.credit) else 0 end,
+         case when sum(l.credit) - sum(l.debit) > 0 then sum(l.credit) - sum(l.debit) else 0 end
+  from public.accounts a
+  join public.journal_lines l on l.account_id = a.id
+  join public.journal_entries e on e.id = l.entry_id and e.entry_date <= p_to
+  group by a.code, a.name, a.type
+  order by a.code;
+$$;
+
+-- ---------- 6. Row Level Security ------------------------------------
+alter table public.business_settings enable row level security;
+alter table public.accounts          enable row level security;
+alter table public.customers         enable row level security;
+alter table public.suppliers         enable row level security;
+alter table public.perfumes          enable row level security;
+alter table public.journal_entries   enable row level security;
+alter table public.journal_lines     enable row level security;
+
+-- Settings: active users read, owner updates
+create policy settings_read  on public.business_settings for select using (public.is_active_user());
+create policy settings_write on public.business_settings for update using (public.is_owner()) with check (public.is_owner());
+
+-- Accounts: active users read, owner manages
+create policy accounts_read   on public.accounts for select using (public.is_active_user());
+create policy accounts_insert on public.accounts for insert with check (public.is_owner());
+create policy accounts_update on public.accounts for update using (public.is_owner() and not is_system) with check (public.is_owner());
+
+-- Customers, suppliers, perfumes: active users read/add/edit; only owner deletes
+create policy customers_read   on public.customers for select using (public.is_active_user());
+create policy customers_insert on public.customers for insert with check (public.is_active_user());
+create policy customers_update on public.customers for update using (public.is_active_user()) with check (public.is_active_user());
+create policy customers_delete on public.customers for delete using (public.is_owner());
+
+create policy suppliers_read   on public.suppliers for select using (public.is_active_user());
+create policy suppliers_insert on public.suppliers for insert with check (public.is_active_user());
+create policy suppliers_update on public.suppliers for update using (public.is_active_user()) with check (public.is_active_user());
+create policy suppliers_delete on public.suppliers for delete using (public.is_owner());
+
+create policy perfumes_read   on public.perfumes for select using (public.is_active_user());
+create policy perfumes_insert on public.perfumes for insert with check (public.is_active_user());
+create policy perfumes_update on public.perfumes for update using (public.is_active_user()) with check (public.is_active_user());
+create policy perfumes_delete on public.perfumes for delete using (public.is_owner());
+
+-- Journal: read only (inserts go through post_journal_entry, which is security definer)
+create policy je_read on public.journal_entries for select using (public.is_active_user());
+create policy jl_read on public.journal_lines   for select using (public.is_active_user());
+
+-- Lock direct writes to the journal and execute rights on the posting functions
+revoke insert, update, delete on public.journal_entries from anon, authenticated;
+revoke insert, update, delete on public.journal_lines   from anon, authenticated;
+revoke all on function public.post_journal_entry(date,text,text,jsonb,text,uuid,uuid) from public, anon;
+grant execute on function public.post_journal_entry(date,text,text,jsonb,text,uuid,uuid) to authenticated;
+revoke all on function public.reverse_journal_entry(uuid,text) from public, anon;
+grant execute on function public.reverse_journal_entry(uuid,text) to authenticated;
+
+-- ---------- 7. Quick checks (run after, one at a time) ---------------
+-- select count(*) from public.accounts;                          -- expect 34
+-- select * from public.business_settings;                        -- 1 row
+-- select public.post_journal_entry(current_date,'OB-1','Owner capital test',
+--   '[{"account_code":"1020","debit":1000},{"account_code":"3000","credit":1000}]'::jsonb);
+--   (run as owner from the app; in the SQL editor auth.uid() is empty, so is_active_user() will refuse)

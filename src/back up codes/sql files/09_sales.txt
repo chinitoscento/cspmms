@@ -1,0 +1,589 @@
+-- =====================================================================
+-- Chinito Scento - Sales: cash / bank / credit sales, owner approval for
+-- credit, invoices, and returns / exchanges.
+-- Run after 08_stock_writeoffs.sql. Safe to re-run.
+--
+-- CASH or BANK sale (any active user)
+--   posts at once: stock leaves Finished Goods (FIFO cost), invoice is issued.
+--     Dr 1010 Cash | 1020 Bank        total
+--       Cr 4000 Sales                 total
+--     Dr 5000 Cost of Goods Sold      cost
+--       Cr 1330 Finished Goods        cost
+--
+-- CREDIT sale
+--   staff submit it as PENDING. Nothing moves: no stock, no books, no invoice.
+--   The owner approves (stock + books + invoice + due date) or rejects.
+--     Dr 1100 Accounts Receivable     total   (tagged to the customer)
+--       Cr 4000 Sales                 total   ... plus the same cost lines
+--
+-- RETURNS (staff request, owner approves; nothing moves until approval)
+--   Wrong item / swap (exchange): the returned piece goes back to Finished
+--     Goods at its original cost, the replacement leaves at its current cost.
+--     Cash, AR and Sales are NOT touched. The original invoice stays.
+--   Damaged + refund: Finished Goods not touched. Sales Returns (4100) is
+--     debited and cash / bank / AR is credited. The piece's cost moves from
+--     Cost of Goods Sold to Damaged Returns Loss (5130).
+--   Damaged + replacement: the damaged piece's cost moves from Cost of Goods Sold
+--     to Damaged Returns Loss, and the replacement leaves Finished Goods into
+--     Cost of Goods Sold. Cash, AR and Sales are NOT touched.
+--   A replacement must have the same collection price as the item sold.
+--   A refund is the price the customer actually paid (discounts included).
+-- =====================================================================
+
+-- ---------- 0. Guards ---------------------------------------------------
+-- If journal_entries limits the allowed "source" values, 'sale' and 'sales_return' must be on the list.
+do $$
+declare
+  c record;
+begin
+  for c in
+    select conname, pg_get_constraintdef(oid) as def
+    from pg_constraint
+    where conrelid = 'public.journal_entries'::regclass and contype = 'c'
+      and pg_get_constraintdef(oid) ilike '%source%'
+  loop
+    if c.def not ilike '%''sale''%' or c.def not ilike '%sales_return%' then
+      raise exception 'journal_entries has a rule on its source column (%: %). Send me this text so I can extend it to allow sale and sales_return, then re-run.', c.conname, c.def;
+    end if;
+  end loop;
+end $$;
+
+do $$
+begin
+  if exists (select 1 from public.accounts where code = '5130' and name <> 'Damaged Returns Loss') then
+    raise exception 'Account code 5130 is already used for something else. Pick another code and change it in this file.';
+  end if;
+end $$;
+
+insert into public.accounts (code, name, type, normal_side, cash_class, is_system) values
+  ('5130', 'Damaged Returns Loss', 'expense', 'debit', 'operating', true)
+on conflict (code) do nothing;
+
+-- ---------- 1. Tables ---------------------------------------------------
+create sequence if not exists public.sale_no_seq;
+create sequence if not exists public.invoice_no_seq;
+create sequence if not exists public.sales_return_no_seq;
+
+create table if not exists public.sales (
+  id               uuid primary key default gen_random_uuid(),
+  sale_no          bigint not null unique default nextval('public.sale_no_seq'),
+  sale_date        date not null,
+  customer_id      uuid references public.customers(id),
+  payment_type     text not null check (payment_type in ('cash','bank','credit')),
+  status           text not null default 'Pending' check (status in ('Pending','Posted','Rejected','Voided')),
+  total            numeric(14,2) not null default 0 check (total >= 0),
+  cost_total       numeric(14,2) not null default 0 check (cost_total >= 0),
+  invoice_no       bigint unique,
+  invoice_date     date,
+  due_date         date,
+  notes            text,
+  journal_entry_id uuid references public.journal_entries(id),
+  void_entry_id    uuid references public.journal_entries(id),
+  void_reason      text,
+  reject_reason    text,
+  decided_by       uuid references auth.users(id),
+  decided_at       timestamptz,
+  created_by       uuid references auth.users(id) default auth.uid(),
+  created_at       timestamptz not null default now(),
+  check (payment_type <> 'credit' or customer_id is not null)
+);
+create index if not exists sales_customer_idx on public.sales (customer_id);
+create index if not exists sales_status_idx on public.sales (status);
+
+create table if not exists public.sale_lines (
+  id         uuid primary key default gen_random_uuid(),
+  sale_id    uuid not null references public.sales(id),
+  line_no    int not null,
+  size_id    uuid not null references public.perfume_sizes(id),
+  qty        int not null check (qty > 0),
+  unit_price numeric(14,2) not null check (unit_price >= 0),
+  amount     numeric(14,2) not null check (amount >= 0),
+  cost       numeric(14,2) not null default 0 check (cost >= 0),
+  unique (sale_id, line_no)
+);
+
+-- Staff may change the price on a sale line (discounts, special arrangements).
+-- list_price keeps the collection price at the time of sale, so discounts can be reported.
+alter table public.sale_lines add column if not exists list_price numeric(14,2);
+update public.sale_lines set list_price = unit_price where list_price is null;
+
+create table if not exists public.sales_returns (
+  id               uuid primary key default gen_random_uuid(),
+  return_no        bigint not null unique default nextval('public.sales_return_no_seq'),
+  return_date      date not null,
+  sale_id          uuid not null references public.sales(id),
+  reason           text not null check (reason in ('wrong_item','damaged')),
+  resolution       text not null check (resolution in ('exchange','refund','replace')),
+  size_id          uuid not null references public.perfume_sizes(id),   -- the piece coming back
+  qty              int not null check (qty > 0),
+  repl_size_id     uuid references public.perfume_sizes(id),            -- the piece going out (exchange / replace)
+  unit_price       numeric(14,2) not null,
+  unit_cost        numeric(14,4) not null default 0,
+  refund_amount    numeric(14,2) not null default 0,
+  notes            text,
+  status           text not null default 'Pending' check (status in ('Pending','Approved','Rejected')),
+  journal_entry_id uuid references public.journal_entries(id),
+  reject_reason    text,
+  decided_by       uuid references auth.users(id),
+  decided_at       timestamptz,
+  created_by       uuid references auth.users(id) default auth.uid(),
+  created_at       timestamptz not null default now(),
+  check (
+    (reason = 'wrong_item' and resolution = 'exchange') or
+    (reason = 'damaged' and resolution in ('refund','replace'))
+  )
+);
+create index if not exists sales_returns_sale_idx on public.sales_returns (sale_id);
+
+-- What each customer owes (Accounts Receivable, account 1100)
+create or replace view public.customer_ar
+with (security_invoker = true) as
+select l.customer_id, sum(l.debit - l.credit) as balance
+from public.journal_lines l
+join public.accounts a on a.id = l.account_id
+where a.code = '1100' and l.customer_id is not null
+group by l.customer_id;
+
+-- ---------- 2. Internal: take stock, post books, issue the invoice -----
+create or replace function public.post_sale_internal(p_id uuid, p_date date)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  s public.sales;
+  l record;
+  v_have numeric;
+  v_cost numeric(14,2);
+  v_cost_total numeric(14,2) := 0;
+  v_inv bigint;
+  v_label text;
+  v_debit text;
+  v_days int := 0;
+  v_due date;
+  v_cust text;
+  v_lines jsonb;
+  v_je uuid;
+begin
+  select * into s from public.sales where id = p_id for update;
+  if not found then raise exception 'Sale not found.'; end if;
+  if s.status <> 'Pending' then raise exception 'This sale is not waiting to be posted.'; end if;
+
+  for l in
+    select sl.id, sl.size_id, sl.qty, ps.size_ml, pf.name as pname
+    from public.sale_lines sl
+    join public.perfume_sizes ps on ps.id = sl.size_id
+    join public.perfumes pf on pf.id = ps.perfume_id
+    where sl.sale_id = p_id
+    order by sl.line_no
+  loop
+    select coalesce(sum(qty_remaining), 0) into v_have
+    from public.stock_layers
+    where stock_kind = 'finished' and size_id = l.size_id and qty_remaining > 0;
+    if v_have < l.qty then
+      raise exception 'Not enough finished stock of % % ml: % needed, % available.', l.pname, trim_scale(l.size_ml), l.qty, v_have;
+    end if;
+    v_cost := public.stock_out('finished', l.size_id, l.qty, p_date, 'sale', p_id);
+    update public.sale_lines set cost = v_cost where id = l.id;
+    v_cost_total := v_cost_total + v_cost;
+  end loop;
+
+  v_inv := nextval('public.invoice_no_seq');
+  v_label := 'INV-' || lpad(v_inv::text, 4, '0');
+  if s.customer_id is not null then
+    select name into v_cust from public.customers where id = s.customer_id;
+  end if;
+  v_debit := case s.payment_type when 'cash' then '1010' when 'bank' then '1020' else '1100' end;
+  if s.payment_type = 'credit' then
+    select credit_days into v_days from public.customer_credit where customer_id = s.customer_id;
+    v_due := p_date + coalesce(v_days, 0);
+  end if;
+
+  v_lines := jsonb_build_array(
+    jsonb_build_object('account_code', v_debit, 'debit', s.total, 'memo', v_label,
+                       'customer_id', case when s.payment_type = 'credit' then s.customer_id else null end),
+    jsonb_build_object('account_code', '4000', 'credit', s.total, 'memo', v_label)
+  );
+  if v_cost_total > 0 then
+    v_lines := v_lines || jsonb_build_array(
+      jsonb_build_object('account_code', '5000', 'debit', v_cost_total, 'memo', 'Cost of ' || v_label),
+      jsonb_build_object('account_code', '1330', 'credit', v_cost_total, 'memo', 'Finished goods sold ' || v_label)
+    );
+  end if;
+
+  v_je := public.post_module_entry(p_date, v_label,
+            'Invoice ' || v_label || ' - ' || coalesce(v_cust, 'walk-in customer'),
+            v_lines, 'sale', p_id);
+
+  update public.sales
+     set status = 'Posted', invoice_no = v_inv, invoice_date = p_date, due_date = v_due,
+         cost_total = v_cost_total, journal_entry_id = v_je
+   where id = p_id;
+end;
+$$;
+
+-- ---------- 3. Record a sale -------------------------------------------
+-- p_lines: [{size_id, qty, unit_price}]. unit_price is optional and defaults to the collection price;
+-- staff can set a different price per line (discount or special arrangement).
+create or replace function public.record_sale(
+  p_date date, p_customer uuid, p_payment text, p_notes text, p_lines jsonb
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, (now() at time zone 'Asia/Manila')::date);
+  v_line jsonb;
+  v_n int := 0;
+  v_qty int;
+  v_sz public.perfume_sizes;
+  v_pname text;
+  v_price numeric(14,2);
+  v_total numeric(14,2) := 0;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_payment is null or p_payment not in ('cash','bank','credit') then
+    raise exception 'Choose how the customer pays.';
+  end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 1 then
+    raise exception 'Add at least one item.';
+  end if;
+
+  if p_customer is not null then
+    perform 1 from public.customers where id = p_customer and status = 'Active';
+    if not found then raise exception 'Customer not found or inactive.'; end if;
+  end if;
+  if p_payment = 'credit' then
+    if p_customer is null then raise exception 'A credit sale needs a customer.'; end if;
+    perform 1 from public.customer_credit where customer_id = p_customer and credit_allowed;
+    if not found then
+      raise exception 'This customer is not allowed credit. Choose cash or bank, or ask the owner to allow credit.';
+    end if;
+  end if;
+
+  v_no := nextval('public.sale_no_seq');
+  insert into public.sales (id, sale_no, sale_date, customer_id, payment_type, status, notes)
+  values (v_id, v_no, v_date, p_customer, p_payment, 'Pending', nullif(trim(coalesce(p_notes, '')), ''));
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    v_n := v_n + 1;
+    v_qty := coalesce((v_line->>'qty')::int, 0);
+    if v_qty <= 0 then raise exception 'Line %: quantity must be more than zero.', v_n; end if;
+
+    select ps.* into v_sz
+      from public.perfume_sizes ps join public.perfumes pf on pf.id = ps.perfume_id
+     where ps.id = nullif(v_line->>'size_id', '')::uuid and ps.is_active and pf.status <> 'Discontinued';
+    if not found then raise exception 'Line %: choose a perfume and size.', v_n; end if;
+    select name into v_pname from public.perfumes where id = v_sz.perfume_id;
+    if v_sz.price <= 0 then
+      raise exception 'No selling price is set for % % ml. Set it in the Signature Collection first.', v_pname, trim_scale(v_sz.size_ml);
+    end if;
+
+    v_price := round(coalesce(nullif(v_line->>'unit_price', '')::numeric, v_sz.price), 2);
+    if v_price <= 0 then raise exception 'Line %: the price must be more than zero.', v_n; end if;
+
+    insert into public.sale_lines (sale_id, line_no, size_id, qty, unit_price, list_price, amount)
+    values (v_id, v_n, v_sz.id, v_qty, v_price, v_sz.price, round(v_qty * v_price, 2));
+    v_total := v_total + round(v_qty * v_price, 2);
+  end loop;
+
+  update public.sales set total = v_total where id = v_id;
+
+  -- cash and bank sales post immediately; credit waits for the owner
+  if p_payment <> 'credit' then
+    perform public.post_sale_internal(v_id, v_date);
+  end if;
+  return v_id;
+end;
+$$;
+
+-- ---------- 4. Credit approval (owner only) ----------------------------
+create or replace function public.approve_credit_sale(p_id uuid, p_date date default null)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  s public.sales;
+  cc public.customer_credit;
+  v_out numeric := 0;
+  v_date date := coalesce(p_date, (now() at time zone 'Asia/Manila')::date);
+begin
+  if not public.is_owner() then raise exception 'Only the owner can approve credit sales.'; end if;
+  select * into s from public.sales where id = p_id for update;
+  if not found then raise exception 'Sale not found.'; end if;
+  if s.status <> 'Pending' or s.payment_type <> 'credit' then
+    raise exception 'This is not a credit sale waiting for approval.';
+  end if;
+
+  select * into cc from public.customer_credit where customer_id = s.customer_id;
+  if not found or not cc.credit_allowed then
+    raise exception 'This customer is no longer allowed credit.';
+  end if;
+
+  select coalesce(sum(l.debit - l.credit), 0) into v_out
+  from public.journal_lines l join public.accounts a on a.id = l.account_id
+  where a.code = '1100' and l.customer_id = s.customer_id;
+
+  -- a limit of 0 means no limit has been set
+  if cc.credit_limit > 0 and v_out + s.total > cc.credit_limit then
+    raise exception 'Approving this would bring the customer to % against a credit limit of %.',
+      round(v_out + s.total, 2), cc.credit_limit;
+  end if;
+
+  perform public.post_sale_internal(p_id, v_date);
+  update public.sales set decided_by = auth.uid(), decided_at = now() where id = p_id;
+end;
+$$;
+
+create or replace function public.reject_credit_sale(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  s public.sales;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can reject credit sales.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+  select * into s from public.sales where id = p_id for update;
+  if not found then raise exception 'Sale not found.'; end if;
+  if s.status <> 'Pending' or s.payment_type <> 'credit' then
+    raise exception 'This is not a credit sale waiting for approval.';
+  end if;
+  update public.sales
+     set status = 'Rejected', reject_reason = trim(p_reason), decided_by = auth.uid(), decided_at = now()
+   where id = p_id;
+end;
+$$;
+
+-- ---------- 5. Void a posted sale (owner only) -------------------------
+-- Not allowed once a return was recorded against it. When customer payments are
+-- added later, this will also refuse sales that already have payments.
+create or replace function public.void_sale(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  s public.sales;
+  v_rev uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can void a sale.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+  select * into s from public.sales where id = p_id for update;
+  if not found then raise exception 'Sale not found.'; end if;
+  if s.status <> 'Posted' then raise exception 'Only an invoiced sale can be voided.'; end if;
+
+  if exists (select 1 from public.sales_returns where sale_id = p_id and status <> 'Rejected') then
+    raise exception 'A return or exchange was recorded on this sale, so it cannot be voided.';
+  end if;
+
+  if public.restore_stock_for('sale', p_id, 'sale_void') = 0 and s.cost_total > 0 then
+    raise exception 'The stock taken by this sale could not be found, so it cannot be voided safely.';
+  end if;
+
+  v_rev := public.reverse_module_entry(s.journal_entry_id, p_reason, 'sale', p_id);
+  update public.sales set status = 'Voided', void_entry_id = v_rev, void_reason = trim(p_reason) where id = p_id;
+end;
+$$;
+
+-- ---------- 6. Returns and exchanges -----------------------------------
+create or replace function public.request_sales_return(
+  p_date date, p_sale uuid, p_size uuid, p_qty int, p_reason text, p_resolution text,
+  p_repl_size uuid, p_notes text
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  s public.sales;
+  v_sold int;
+  v_used int;
+  v_price numeric(14,2);   -- collection (list) price of the item
+  v_paid numeric;          -- average price the customer actually paid per piece
+  v_unit_cost numeric(14,4);
+  v_repl uuid;
+  v_rp public.perfume_sizes;
+  v_refund numeric(14,2) := 0;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_reason is null or p_reason not in ('wrong_item','damaged') then
+    raise exception 'Choose why the item is coming back.';
+  end if;
+  if not ((p_reason = 'wrong_item' and p_resolution = 'exchange')
+       or (p_reason = 'damaged' and p_resolution in ('refund','replace'))) then
+    raise exception 'That outcome does not fit the reason.';
+  end if;
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many pieces are coming back.'; end if;
+
+  select * into s from public.sales where id = p_sale;
+  if not found or s.status <> 'Posted' then raise exception 'Choose a sale that has been invoiced.'; end if;
+
+  select coalesce(sum(qty), 0), max(coalesce(list_price, unit_price)),
+         case when sum(qty) > 0 then sum(amount) / sum(qty) else 0 end,
+         case when sum(qty) > 0 then sum(cost) / sum(qty) else 0 end
+    into v_sold, v_price, v_paid, v_unit_cost
+  from public.sale_lines where sale_id = p_sale and size_id = p_size;
+  if v_sold = 0 then raise exception 'That item is not on this sale.'; end if;
+
+  select coalesce(sum(qty), 0) into v_used
+  from public.sales_returns
+  where sale_id = p_sale and size_id = p_size and status in ('Pending','Approved');
+  if p_qty > v_sold - v_used then
+    raise exception 'Only % piece(s) of this item can still be returned on this sale.', v_sold - v_used;
+  end if;
+
+  if p_resolution in ('exchange','replace') then
+    v_repl := coalesce(p_repl_size, p_size);
+    select ps.* into v_rp
+      from public.perfume_sizes ps join public.perfumes pf on pf.id = ps.perfume_id
+     where ps.id = v_repl and ps.is_active and pf.status <> 'Discontinued';
+    if not found then raise exception 'Choose a valid replacement item.'; end if;
+    if v_rp.price <> v_price then
+      raise exception 'The replacement must have the same collection price (%) as the item that was sold.', v_price;
+    end if;
+  else
+    v_repl := null;
+    v_refund := round(p_qty * v_paid, 2);   -- what the customer really paid, discounts included
+  end if;
+
+  insert into public.sales_returns
+    (id, return_date, sale_id, reason, resolution, size_id, qty, repl_size_id, unit_price, unit_cost, refund_amount, notes)
+  values
+    (v_id, coalesce(p_date, (now() at time zone 'Asia/Manila')::date), p_sale, p_reason, p_resolution, p_size, p_qty, v_repl,
+     round(v_paid, 2), v_unit_cost, v_refund, nullif(trim(coalesce(p_notes, '')), ''));
+  return v_id;
+end;
+$$;
+
+create or replace function public.approve_sales_return(p_id uuid)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  r public.sales_returns;
+  s public.sales;
+  v_ret_cost numeric(14,2);
+  v_out_cost numeric(14,2) := 0;
+  v_acct text;
+  v_label text;
+  v_lines jsonb := '[]'::jsonb;
+  v_je uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can approve returns.'; end if;
+  select * into r from public.sales_returns where id = p_id for update;
+  if not found then raise exception 'Return not found.'; end if;
+  if r.status <> 'Pending' then raise exception 'This return was already decided.'; end if;
+  select * into s from public.sales where id = r.sale_id;
+
+  v_label := 'RT-' || lpad(r.return_no::text, 4, '0');
+  v_ret_cost := round(r.unit_cost * r.qty, 2);
+
+  -- the replacement goes out first, so it can never be the piece that just came back
+  if r.resolution in ('exchange','replace') then
+    v_out_cost := public.stock_out('finished', r.repl_size_id, r.qty, r.return_date, 'sales_return', r.id);
+  end if;
+
+  if r.resolution = 'exchange' then
+    -- returned piece goes back into Finished Goods at its original cost
+    perform public.stock_in('finished', null, null, r.size_id, r.return_date, r.qty, v_ret_cost, 'sales_return', r.id);
+    if v_ret_cost > 0 then
+      v_lines := v_lines || jsonb_build_array(
+        jsonb_build_object('account_code', '1330', 'debit',  v_ret_cost, 'memo', v_label || ' piece returned'),
+        jsonb_build_object('account_code', '5000', 'credit', v_ret_cost, 'memo', v_label || ' piece returned'));
+    end if;
+    if v_out_cost > 0 then
+      v_lines := v_lines || jsonb_build_array(
+        jsonb_build_object('account_code', '5000', 'debit',  v_out_cost, 'memo', v_label || ' replacement given'),
+        jsonb_build_object('account_code', '1330', 'credit', v_out_cost, 'memo', v_label || ' replacement given'));
+    end if;
+
+  elsif r.resolution = 'replace' then
+    -- damaged piece: its cost moves from Cost of Goods Sold to Damaged Returns Loss (same as a refund),
+    -- and the replacement leaves Finished Goods into Cost of Goods Sold (the customer still gets one good piece)
+    if v_ret_cost > 0 then
+      v_lines := v_lines || jsonb_build_array(
+        jsonb_build_object('account_code', '5130', 'debit',  v_ret_cost, 'memo', v_label || ' damaged piece written off'),
+        jsonb_build_object('account_code', '5000', 'credit', v_ret_cost, 'memo', v_label || ' damaged piece written off'));
+    end if;
+    if v_out_cost > 0 then
+      v_lines := v_lines || jsonb_build_array(
+        jsonb_build_object('account_code', '5000', 'debit',  v_out_cost, 'memo', v_label || ' replacement given'),
+        jsonb_build_object('account_code', '1330', 'credit', v_out_cost, 'memo', v_label || ' replacement given'));
+    end if;
+
+  else -- refund
+    v_acct := case s.payment_type when 'cash' then '1010' when 'bank' then '1020' else '1100' end;
+    v_lines := v_lines || jsonb_build_array(
+      jsonb_build_object('account_code', '4100', 'debit', r.refund_amount, 'memo', v_label || ' damaged return'),
+      jsonb_build_object('account_code', v_acct, 'credit', r.refund_amount, 'memo', v_label || ' refund',
+                         'customer_id', case when s.payment_type = 'credit' then s.customer_id else null end));
+    if v_ret_cost > 0 then
+      v_lines := v_lines || jsonb_build_array(
+        jsonb_build_object('account_code', '5130', 'debit',  v_ret_cost, 'memo', v_label || ' damaged piece written off'),
+        jsonb_build_object('account_code', '5000', 'credit', v_ret_cost, 'memo', v_label || ' damaged piece written off'));
+    end if;
+  end if;
+
+  if jsonb_array_length(v_lines) > 0 then
+    v_je := public.post_module_entry(r.return_date, v_label,
+              'Return / exchange ' || v_label || ' on INV-' || lpad(s.invoice_no::text, 4, '0'),
+              v_lines, 'sales_return', r.id);
+  end if;
+
+  update public.sales_returns
+     set status = 'Approved', journal_entry_id = v_je, decided_by = auth.uid(), decided_at = now()
+   where id = p_id;
+end;
+$$;
+
+create or replace function public.reject_sales_return(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  r public.sales_returns;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can reject returns.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+  select * into r from public.sales_returns where id = p_id for update;
+  if not found then raise exception 'Return not found.'; end if;
+  if r.status <> 'Pending' then raise exception 'This return was already decided.'; end if;
+  update public.sales_returns
+     set status = 'Rejected', reject_reason = trim(p_reason), decided_by = auth.uid(), decided_at = now()
+   where id = p_id;
+end;
+$$;
+
+-- ---------- 7. Security ------------------------------------------------
+alter table public.sales         enable row level security;
+alter table public.sale_lines    enable row level security;
+alter table public.sales_returns enable row level security;
+
+drop policy if exists sales_read on public.sales;
+create policy sales_read on public.sales for select using (public.is_active_user());
+drop policy if exists sale_lines_read on public.sale_lines;
+create policy sale_lines_read on public.sale_lines for select using (public.is_active_user());
+drop policy if exists sales_returns_read on public.sales_returns;
+create policy sales_returns_read on public.sales_returns for select using (public.is_active_user());
+
+revoke insert, update, delete on public.sales, public.sale_lines, public.sales_returns from anon, authenticated;
+
+revoke all on public.customer_ar from public, anon;
+grant select on public.customer_ar to authenticated;
+
+revoke all on function public.post_sale_internal(uuid,date) from public, anon, authenticated;
+
+revoke all on function public.record_sale(date,uuid,text,text,jsonb) from public, anon;
+revoke all on function public.approve_credit_sale(uuid,date) from public, anon;
+revoke all on function public.reject_credit_sale(uuid,text) from public, anon;
+revoke all on function public.void_sale(uuid,text) from public, anon;
+revoke all on function public.request_sales_return(date,uuid,uuid,int,text,text,uuid,text) from public, anon;
+revoke all on function public.approve_sales_return(uuid) from public, anon;
+revoke all on function public.reject_sales_return(uuid,text) from public, anon;
+
+grant execute on function public.record_sale(date,uuid,text,text,jsonb) to authenticated;
+grant execute on function public.approve_credit_sale(uuid,date) to authenticated;
+grant execute on function public.reject_credit_sale(uuid,text) to authenticated;
+grant execute on function public.void_sale(uuid,text) to authenticated;
+grant execute on function public.request_sales_return(date,uuid,uuid,int,text,text,uuid,text) to authenticated;
+grant execute on function public.approve_sales_return(uuid) to authenticated;
+grant execute on function public.reject_sales_return(uuid,text) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- 8. Checks (run one at a time) ------------------------------
+-- select code, name, type from public.accounts where code = '5130';
+-- select * from public.sales order by sale_no desc;
+-- select * from public.sales_returns order by return_no desc;
+-- select * from public.customer_ar;

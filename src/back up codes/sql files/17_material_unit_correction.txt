@@ -1,0 +1,66 @@
+-- =====================================================================
+-- Chinito Scento - allow the owner to CORRECT the unit of a raw material
+-- that already has stock history. Safe to re-run. Run in the Supabase SQL Editor.
+--
+-- Why this is safe: the unit is only a label. No purchase, stock layer or journal
+-- entry stores it; they store the number (for example 100). The category stays
+-- locked, because it decides which account the cost sits in.
+-- The number you already entered is kept as is: if you recorded 100 for 100 pieces,
+-- it will now read "100 pcs". If a quantity was entered in a different measure,
+-- correct the unit only if the numbers already mean the new unit.
+--
+-- Rules after this file:
+--   * Category: still fixed once the material has stock history.
+--   * Unit: the OWNER can change it. Oils and solvents are always ml and stay that way.
+--   * Every unit change is written to material_unit_changes (who, when, old, new).
+--   * A material with stock on hand still cannot be deactivated.
+-- =====================================================================
+
+create table if not exists public.material_unit_changes (
+  id          uuid primary key default gen_random_uuid(),
+  material_id uuid not null references public.materials(id),
+  old_unit    text not null,
+  new_unit    text not null,
+  changed_by  uuid references auth.users(id) default auth.uid(),
+  changed_at  timestamptz not null default now()
+);
+alter table public.material_unit_changes enable row level security;
+drop policy if exists material_unit_changes_read on public.material_unit_changes;
+create policy material_unit_changes_read on public.material_unit_changes for select using (public.is_owner());
+revoke insert, update, delete on public.material_unit_changes from anon, authenticated;
+
+create or replace function public.materials_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  v_hist boolean;
+begin
+  select exists (select 1 from public.stock_layers where material_id = old.id) into v_hist;
+
+  if new.category <> old.category and v_hist then
+    raise exception 'This material already has stock history, so its category cannot be changed. Add a new material instead.';
+  end if;
+
+  if new.unit <> old.unit and v_hist then
+    if old.category in ('oil','solvent') then
+      raise exception 'Oils and solvents are always counted in ml.';
+    end if;
+    if not public.is_owner() then
+      raise exception 'Only the owner can correct the unit of a material that already has stock history.';
+    end if;
+    insert into public.material_unit_changes (material_id, old_unit, new_unit)
+    values (old.id, old.unit, new.unit);
+  end if;
+
+  if old.is_active and not new.is_active
+     and exists (select 1 from public.stock_layers where material_id = old.id and qty_remaining > 0) then
+    raise exception 'This material still has stock on hand, so it cannot be deactivated yet.';
+  end if;
+  return new;
+end;
+$$;
+
+notify pgrst, 'reload schema';
+
+-- Check after correcting a unit in the app (owner session):
+-- select m.name, c.old_unit, c.new_unit, c.changed_at
+--   from public.material_unit_changes c join public.materials m on m.id = c.material_id order by c.changed_at desc;

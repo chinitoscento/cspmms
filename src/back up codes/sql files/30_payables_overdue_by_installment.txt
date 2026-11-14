@@ -1,0 +1,113 @@
+-- =====================================================================
+-- Chinito Scento - Payables: overdue is measured per INSTALLMENT, not per purchase.
+-- Run in the Supabase SQL Editor. Safe to re-run. Changes one view only; no table, no data and
+-- no function is touched.
+--
+-- THE PROBLEM
+--   payables_open showed one date per purchase (the oldest unpaid installment) and the page
+--   treated the WHOLE remaining balance as overdue as soon as that one date had passed.
+--   Example: a 9-installment purchase with 3 installments past their date showed its full balance as overdue.
+--
+-- WHAT THIS ADDS (new columns at the END of the view; every existing column is unchanged)
+--   overdue_amount        what is actually past due: the unpaid balance of installments whose date has passed
+--                         (a purchase without installments: its whole balance once its due date has passed)
+--   overdue_installments  how many installments are past due (0 when the purchase has no installments)
+--   not_yet_due           balance - overdue_amount
+--   next_upcoming_date    the next due date that has NOT passed yet
+--   next_upcoming_amount  what is due on that date
+--
+-- Existing columns keep their meaning: due_date is still the oldest unpaid installment's date,
+-- and days_overdue is how many days late that oldest installment is.
+--
+-- "Today" is now Philippine time (Asia/Manila) for every column here, including days_overdue.
+-- Before, it was the database's UTC date, which is a day behind from 8 am to midnight in Manila.
+--
+-- Payments still go to the oldest installment first (interest first within each). That is unchanged.
+-- =====================================================================
+
+create or replace view public.payables_open
+with (security_invoker = true) as
+select p.id as purchase_id,
+       p.purchase_no,
+       p.purchase_date,
+       coalesce(nx.due_date, p.due_date) as due_date,
+       p.supplier_id,
+       s.name as supplier_name,
+       p.reference,
+       p.total + coalesce(pl.interest_total, 0::numeric) as total,
+       coalesce(x.paid, 0::numeric) as paid,
+       b.bal as balance,
+       greatest(t.d - coalesce(nx.due_date, p.due_date), 0) as days_overdue,
+       pl.id is not null as is_installment,
+       pl.installments,
+       coalesce(pl.interest_total, 0::numeric) as interest_total,
+       coalesce(nx.balance, p.total - coalesce(x.paid, 0::numeric)) as next_due_balance,
+       p.creditor_id,
+       c.name as creditor_name,
+       -- new columns (must stay at the end)
+       o.amt as overdue_amount,
+       case when pl.id is not null then od.n else 0 end as overdue_installments,
+       b.bal - o.amt as not_yet_due,
+       case when pl.id is not null then up.due_date
+            when p.due_date >= t.d then p.due_date end as next_upcoming_date,
+       case when pl.id is not null then up.balance
+            when p.due_date >= t.d then b.bal end as next_upcoming_amount
+from public.purchases p
+cross join lateral (select (now() at time zone 'Asia/Manila')::date as d) t
+left join public.suppliers s on s.id = p.supplier_id
+left join public.creditors c on c.id = p.creditor_id
+left join public.purchase_installment_plans pl on pl.purchase_id = p.id
+left join lateral (
+  select sum(a.amount) as paid
+  from public.payment_allocations a
+  join public.supplier_payments sp on sp.id = a.payment_id and sp.status = 'Posted'
+  where a.purchase_id = p.id
+) x on true
+left join lateral (
+  select st.due_date, st.balance
+  from public.installments_status st
+  where st.purchase_id = p.id and st.balance > 0
+  order by st.seq
+  limit 1
+) nx on true
+cross join lateral (
+  select p.total + coalesce(pl.interest_total, 0::numeric) - coalesce(x.paid, 0::numeric) as bal
+) b
+left join lateral (
+  select coalesce(sum(st.balance) filter (where st.due_date < t.d), 0::numeric) as amt,
+         (count(*) filter (where st.due_date < t.d))::int as n
+  from public.installments_status st
+  where st.purchase_id = p.id and st.balance > 0
+) od on true
+left join lateral (
+  select st.due_date, st.balance
+  from public.installments_status st
+  where st.purchase_id = p.id and st.balance > 0 and st.due_date >= t.d
+  order by st.seq
+  limit 1
+) up on true
+cross join lateral (
+  select case when pl.id is not null then od.amt
+              when p.due_date < t.d then b.bal
+              else 0::numeric end as amt
+) o
+where p.payment_type = 'credit' and p.status = 'Posted' and b.bal > 0;
+
+revoke all on public.payables_open from public, anon;
+grant select on public.payables_open to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- Checks (run one at a time; the SQL Editor shows only the last result) ----------
+-- 1) The two parts must add up to the balance for every purchase (expect 0 rows):
+-- select purchase_no, balance, overdue_amount, not_yet_due
+--   from public.payables_open
+--  where abs(balance - (overdue_amount + not_yet_due)) > 0.005;
+-- 2) What the page will show for each open purchase:
+-- select purchase_no, balance, overdue_amount, overdue_installments, days_overdue,
+--        due_date as oldest_unpaid_due, next_upcoming_date, next_upcoming_amount, not_yet_due
+--   from public.payables_open order by purchase_no;
+-- 3) Compare one purchase with its own schedule (replace the number):
+-- select s.seq, s.due_date, s.balance
+--   from public.installments_status s join public.purchases p on p.id = s.purchase_id
+--  where p.purchase_no = 33 order by s.seq;

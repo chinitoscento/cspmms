@@ -1,0 +1,297 @@
+-- =====================================================================
+-- Sales analytics for Chinito Scento
+-- Run this whole file once in the Supabase SQL editor.
+-- It is safe to run again (everything is "create or replace" / "if not exists").
+--
+-- Basis used everywhere:
+--   * Only Posted sales count (Pending, Rejected and Voided are ignored).
+--   * A sale is dated by its invoice date (falls back to the sale date).
+--   * Refund returns that the owner approved are subtracted, on the date of the return.
+--     Exchanges and replacements are not sales, so they change nothing.
+-- =====================================================================
+
+-- 1. Men / Women / Unisex on each perfume --------------------------------
+alter table public.perfumes add column if not exists gender text not null default 'Unisex';
+alter table public.perfumes drop constraint if exists perfumes_gender_check;
+alter table public.perfumes add constraint perfumes_gender_check check (gender in ('Men', 'Women', 'Unisex'));
+
+
+-- 2. Period summary (one row) ---------------------------------------------
+create or replace function public.analytics_sales_summary(p_from date, p_to date)
+returns table(orders bigint, units bigint, customers bigint, gross numeric, refunds numeric, net numeric, avg_order numeric, cost numeric)
+language plpgsql stable security definer set search_path to 'public'
+as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can view sales analytics.'; end if;
+  return query
+  with s as (
+    select x.id, x.customer_id as cid, x.total, x.cost_total,
+           coalesce((select sum(l.qty) from public.sale_lines l where l.sale_id = x.id), 0) as q
+    from public.sales x
+    where x.status = 'Posted'
+      and coalesce(x.invoice_date, x.sale_date) between p_from and p_to
+  ), r as (
+    select coalesce(sum(rt.refund_amount), 0) as amt, coalesce(sum(rt.qty), 0) as q
+    from public.sales_returns rt
+    where rt.status = 'Approved' and rt.resolution = 'refund' and rt.return_date between p_from and p_to
+  )
+  select count(*)::bigint,
+         (coalesce(sum(s.q), 0) - (select r.q from r))::bigint,
+         count(distinct s.cid)::bigint,
+         coalesce(sum(s.total), 0)::numeric,
+         (select r.amt from r)::numeric,
+         (coalesce(sum(s.total), 0) - (select r.amt from r))::numeric,
+         (case when count(*) > 0 then round(coalesce(sum(s.total), 0) / count(*), 2) else 0 end)::numeric,
+         coalesce(sum(s.cost_total), 0)::numeric
+  from s;
+end;
+$$;
+
+
+-- 3. Sales per customer ----------------------------------------------------
+-- Every customer is listed (even with no purchase in the period) so you can spot the quiet ones.
+create or replace function public.analytics_sales_by_customer(p_from date, p_to date)
+returns table(customer_id uuid, customer_name text, orders bigint, units bigint, gross numeric, refunds numeric, net numeric, avg_order numeric, last_purchase date)
+language plpgsql stable security definer set search_path to 'public'
+as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can view sales analytics.'; end if;
+  return query
+  with per as (
+    select s.customer_id as cid, count(*) as n, sum(coalesce(q.q, 0)) as u, sum(s.total) as g
+    from public.sales s
+    left join (select l.sale_id, sum(l.qty) as q from public.sale_lines l group by l.sale_id) q on q.sale_id = s.id
+    where s.status = 'Posted' and coalesce(s.invoice_date, s.sale_date) between p_from and p_to
+    group by s.customer_id
+  ), rf as (
+    select s.customer_id as cid, sum(r.refund_amount) as amt, sum(r.qty) as q
+    from public.sales_returns r
+    join public.sales s on s.id = r.sale_id
+    where r.status = 'Approved' and r.resolution = 'refund' and r.return_date between p_from and p_to
+    group by s.customer_id
+  ), lastp as (
+    select s.customer_id as cid, max(coalesce(s.invoice_date, s.sale_date)) as d
+    from public.sales s where s.status = 'Posted' group by s.customer_id
+  )
+  select c.id, c.name::text,
+         coalesce(per.n, 0)::bigint,
+         (coalesce(per.u, 0) - coalesce(rf.q, 0))::bigint,
+         coalesce(per.g, 0)::numeric,
+         coalesce(rf.amt, 0)::numeric,
+         (coalesce(per.g, 0) - coalesce(rf.amt, 0))::numeric,
+         (case when coalesce(per.n, 0) > 0 then round(per.g / per.n, 2) else 0 end)::numeric,
+         lastp.d
+  from public.customers c
+  left join per on per.cid = c.id
+  left join rf on rf.cid = c.id
+  left join lastp on lastp.cid = c.id
+  union all
+  select null::uuid, 'Walk-in customers'::text,
+         per.n::bigint,
+         (per.u - coalesce(rf.q, 0))::bigint,
+         per.g::numeric,
+         coalesce(rf.amt, 0)::numeric,
+         (per.g - coalesce(rf.amt, 0))::numeric,
+         round(per.g / per.n, 2)::numeric,
+         lastp.d
+  from per
+  left join rf on rf.cid is null
+  left join lastp on lastp.cid is null
+  where per.cid is null;
+end;
+$$;
+
+
+-- 4. Sales per perfume and size --------------------------------------------
+create or replace function public.analytics_sales_by_perfume(p_from date, p_to date)
+returns table(perfume_id uuid, perfume_name text, gender text, size_id uuid, size_ml numeric, units bigint, revenue numeric)
+language plpgsql stable security definer set search_path to 'public'
+as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can view sales analytics.'; end if;
+  return query
+  with sold as (
+    select l.size_id as sid, sum(l.qty) as u, sum(l.amount) as rev
+    from public.sale_lines l
+    join public.sales s on s.id = l.sale_id
+    where s.status = 'Posted' and coalesce(s.invoice_date, s.sale_date) between p_from and p_to
+    group by l.size_id
+  ), ref as (
+    select r.size_id as sid, sum(r.qty) as u, sum(r.refund_amount) as rev
+    from public.sales_returns r
+    where r.status = 'Approved' and r.resolution = 'refund' and r.return_date between p_from and p_to
+    group by r.size_id
+  )
+  select pf.id, pf.name::text, pf.gender::text, ps.id, ps.size_ml::numeric,
+         (coalesce(so.u, 0) - coalesce(rf.u, 0))::bigint,
+         (coalesce(so.rev, 0) - coalesce(rf.rev, 0))::numeric
+  from public.perfume_sizes ps
+  join public.perfumes pf on pf.id = ps.perfume_id
+  left join sold so on so.sid = ps.id
+  left join ref rf on rf.sid = ps.id
+  where so.sid is not null or rf.sid is not null
+  order by 7 desc;
+end;
+$$;
+
+
+-- 5. Sales over time (day, week or month buckets) ----------------------------
+create or replace function public.analytics_sales_trend(p_from date, p_to date, p_bucket text)
+returns table(bucket date, orders bigint, units bigint, net numeric)
+language plpgsql stable security definer set search_path to 'public'
+as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can view sales analytics.'; end if;
+  if p_bucket is null or p_bucket not in ('day', 'week', 'month') then raise exception 'Bucket must be day, week or month.'; end if;
+  if p_from is null or p_to is null or p_from > p_to then raise exception 'Choose a valid period.'; end if;
+  return query
+  with b as (
+    select generate_series(date_trunc(p_bucket, p_from::timestamp), p_to::timestamp, ('1 ' || p_bucket)::interval)::date as bk
+  ), s as (
+    select date_trunc(p_bucket, coalesce(x.invoice_date, x.sale_date)::timestamp)::date as bk,
+           count(*) as n, sum(x.total) as amt,
+           sum(coalesce((select sum(l.qty) from public.sale_lines l where l.sale_id = x.id), 0)) as q
+    from public.sales x
+    where x.status = 'Posted' and coalesce(x.invoice_date, x.sale_date) between p_from and p_to
+    group by 1
+  ), r as (
+    select date_trunc(p_bucket, rt.return_date::timestamp)::date as bk, sum(rt.refund_amount) as amt, sum(rt.qty) as q
+    from public.sales_returns rt
+    where rt.status = 'Approved' and rt.resolution = 'refund' and rt.return_date between p_from and p_to
+    group by 1
+  )
+  select b.bk,
+         coalesce(s.n, 0)::bigint,
+         (coalesce(s.q, 0) - coalesce(r.q, 0))::bigint,
+         (coalesce(s.amt, 0) - coalesce(r.amt, 0))::numeric
+  from b
+  left join s on s.bk = b.bk
+  left join r on r.bk = b.bk
+  order by b.bk;
+end;
+$$;
+
+
+-- 6. Gross margin per perfume (owner only, before returns) -------------------
+create or replace function public.analytics_margin_by_perfume(p_from date, p_to date)
+returns table(perfume_id uuid, perfume_name text, gender text, units bigint, revenue numeric, cost numeric, profit numeric, margin_pct numeric)
+language plpgsql stable security definer set search_path to 'public'
+as $$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can view margins.'; end if;
+  return query
+  select pf.id, pf.name::text, pf.gender::text,
+         sum(l.qty)::bigint,
+         sum(l.amount)::numeric,
+         coalesce(sum(l.cost), 0)::numeric,
+         (sum(l.amount) - coalesce(sum(l.cost), 0))::numeric,
+         (case when sum(l.amount) > 0 then round((sum(l.amount) - coalesce(sum(l.cost), 0)) * 100 / sum(l.amount), 1) else 0 end)::numeric
+  from public.sale_lines l
+  join public.sales s on s.id = l.sale_id
+  join public.perfume_sizes ps on ps.id = l.size_id
+  join public.perfumes pf on pf.id = ps.perfume_id
+  where s.status = 'Posted' and coalesce(s.invoice_date, s.sale_date) between p_from and p_to
+  group by pf.id, pf.name, pf.gender
+  order by 7 desc;
+end;
+$$;
+
+
+-- 7. Fast movers and how long their stock will last ---------------------------
+-- p_days = how far back to measure the selling pace. p_top = how many perfumes per
+-- Men / Women / Unisex count as "fast moving" (by pieces sold). Open to any active user
+-- (it shows pieces and stock only, no money) so the dashboard prompt works for staff too.
+create or replace function public.analytics_stock_cover(p_days integer default 30, p_top integer default 3)
+returns table(perfume_id uuid, perfume_name text, gender text, size_id uuid, size_ml numeric,
+              perfume_units bigint, perfume_rank integer, units_sold bigint, per_day numeric,
+              on_hand numeric, bottled numeric, juice_ml numeric, macerating_ml numeric,
+              days_cover numeric, is_fast boolean)
+language plpgsql stable security definer set search_path to 'public'
+as $$
+#variable_conflict use_column
+declare
+  v_today date := (now() at time zone 'Asia/Manila')::date;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_days is null or p_days < 7 or p_days > 365 then raise exception 'Choose between 7 and 365 days.'; end if;
+  if p_top is null or p_top < 1 then p_top := 3; end if;
+  return query
+  with sold as (
+    select l.size_id as sid, sum(l.qty) as u
+    from public.sale_lines l
+    join public.sales s on s.id = l.sale_id
+    where s.status = 'Posted' and coalesce(s.invoice_date, s.sale_date) > v_today - p_days
+    group by l.size_id
+  ), ref as (
+    select r.size_id as sid, sum(r.qty) as u
+    from public.sales_returns r
+    where r.status = 'Approved' and r.resolution = 'refund' and r.return_date > v_today - p_days
+    group by r.size_id
+  ), base as (
+    select ps.id as sid, ps.perfume_id as pid, ps.size_ml as ml, pf.name::text as pname, pf.gender::text as g,
+           greatest(coalesce(so.u, 0) - coalesce(rf.u, 0), 0)::bigint as u
+    from public.perfume_sizes ps
+    join public.perfumes pf on pf.id = ps.perfume_id
+    left join sold so on so.sid = ps.id
+    left join ref rf on rf.sid = ps.id
+    where ps.is_active and pf.status <> 'Discontinued'
+  ), pt as (
+    select b.pid, sum(b.u)::bigint as u from base b group by b.pid
+  ), rk as (
+    select x.pid, (dense_rank() over (partition by x.g order by x.u desc))::integer as r
+    from (select p.pid, p.u, pf.gender::text as g from pt p join public.perfumes pf on pf.id = p.pid where p.u > 0) x
+  ), stk as (
+    select l.size_id as sid,
+           sum(l.qty_remaining) filter (where l.stock_kind = 'finished') as fin,
+           sum(l.qty_remaining) filter (where l.stock_kind = 'bottled') as bot
+    from public.stock_layers l
+    where l.size_id is not null
+    group by l.size_id
+  ), jc as (
+    select l.perfume_id as pid, sum(l.qty_remaining) as ml
+    from public.stock_layers l where l.stock_kind = 'juice' group by l.perfume_id
+  ), mc as (
+    select m.perfume_id as pid, sum(m.expected_ml) as ml
+    from public.maceration_batches m where m.status = 'Macerating' group by m.perfume_id
+  )
+  select b.pid, b.pname, b.g, b.sid, b.ml::numeric,
+         pt.u,
+         coalesce(rk.r, 0)::integer,
+         b.u,
+         round(b.u::numeric / p_days, 3),
+         coalesce(stk.fin, 0)::numeric,
+         coalesce(stk.bot, 0)::numeric,
+         coalesce(jc.ml, 0)::numeric,
+         coalesce(mc.ml, 0)::numeric,
+         (case when b.u > 0 then round(coalesce(stk.fin, 0) / (b.u::numeric / p_days), 1) end)::numeric,
+         (coalesce(rk.r, 0) between 1 and p_top)
+  from base b
+  join pt on pt.pid = b.pid
+  left join rk on rk.pid = b.pid
+  left join stk on stk.sid = b.sid
+  left join jc on jc.pid = b.pid
+  left join mc on mc.pid = b.pid
+  order by b.g, coalesce(rk.r, 999), b.pname, b.ml;
+end;
+$$;
+
+
+-- 8. Permissions: signed-in users only (each function also checks the role itself)
+revoke execute on function public.analytics_sales_summary(date, date) from public, anon;
+revoke execute on function public.analytics_sales_by_customer(date, date) from public, anon;
+revoke execute on function public.analytics_sales_by_perfume(date, date) from public, anon;
+revoke execute on function public.analytics_sales_trend(date, date, text) from public, anon;
+revoke execute on function public.analytics_margin_by_perfume(date, date) from public, anon;
+revoke execute on function public.analytics_stock_cover(integer, integer) from public, anon;
+
+grant execute on function public.analytics_sales_summary(date, date) to authenticated;
+grant execute on function public.analytics_sales_by_customer(date, date) to authenticated;
+grant execute on function public.analytics_sales_by_perfume(date, date) to authenticated;
+grant execute on function public.analytics_sales_trend(date, date, text) to authenticated;
+grant execute on function public.analytics_margin_by_perfume(date, date) to authenticated;
+grant execute on function public.analytics_stock_cover(integer, integer) to authenticated;

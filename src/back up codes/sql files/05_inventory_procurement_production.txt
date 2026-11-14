@@ -1,0 +1,1244 @@
+-- =====================================================================
+-- Chinito Scento - Phase 2: inventory (FIFO), procurement, supplier payments,
+-- maceration, bottling, packaging.
+-- Safe to re-run (policies and trigger are dropped and recreated). Run in the Supabase SQL Editor, after 04_reports_and_history.sql.
+-- Requires: profiles, is_owner(), is_active_user(), accounts, journal tables,
+--           suppliers, perfumes, perfume_sizes, business_settings.
+-- Sole proprietor, non-VAT, pesos. Costing method: FIFO (oldest layer used first).
+-- =====================================================================
+
+-- ---------- 0. Settings and accounts ---------------------------------
+alter table public.business_settings
+  add column if not exists maceration_days int not null default 60 check (maceration_days > 0),
+  add column if not exists normal_loss_pct numeric(5,4) not null default 0.03
+    check (normal_loss_pct >= 0 and normal_loss_pct < 1);
+
+insert into public.accounts (code, name, type, normal_side, cash_class, is_system) values
+  ('5110', 'Production Loss (Spoilage)', 'expense', 'debit', 'operating', true)
+on conflict (code) do nothing;
+
+-- ---------- 1. Journal guards ----------------------------------------
+-- Only system modules may post module entries (staff cannot fake a source),
+-- and module entries can only be voided from their own module.
+create or replace function public.post_journal_entry(
+  p_date date,
+  p_reference text,
+  p_description text,
+  p_lines jsonb,
+  p_source text default 'manual',
+  p_source_id uuid default null,
+  p_reverses uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+  v_line jsonb;
+  v_n int := 0;
+  v_acc uuid;
+  v_dr numeric(14,2) := 0;
+  v_cr numeric(14,2) := 0;
+begin
+  if not public.is_active_user() then
+    raise exception 'Not allowed.';
+  end if;
+  if coalesce(trim(p_description),'') = '' then
+    raise exception 'Description is required.';
+  end if;
+  if jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 2 then
+    raise exception 'An entry needs at least two lines.';
+  end if;
+
+  if p_source <> 'manual' and p_source <> 'reversal'
+     and coalesce(current_setting('app.module_post', true), '') <> '1' then
+    raise exception 'Only system modules can post % entries.', p_source;
+  end if;
+  if p_source = 'reversal' and p_reverses is null then
+    raise exception 'A reversal must point to the entry it reverses.';
+  end if;
+  if p_source = 'manual' and not public.is_owner() then
+    raise exception 'Only the owner can post manual journal entries.';
+  end if;
+  if p_reverses is not null and not public.is_owner() then
+    raise exception 'Only the owner can reverse entries.';
+  end if;
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    v_dr := v_dr + coalesce((v_line->>'debit')::numeric, 0);
+    v_cr := v_cr + coalesce((v_line->>'credit')::numeric, 0);
+  end loop;
+  if round(v_dr,2) <> round(v_cr,2) then
+    raise exception 'Debits (%) must equal credits (%).', v_dr, v_cr;
+  end if;
+  if v_dr = 0 then
+    raise exception 'Entry total cannot be zero.';
+  end if;
+
+  insert into public.journal_entries (entry_date, reference, description, source, source_id, reverses_id)
+  values (coalesce(p_date, current_date), p_reference, p_description, p_source, p_source_id, p_reverses)
+  returning id into v_id;
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    v_n := v_n + 1;
+    select id into v_acc from public.accounts
+      where code = v_line->>'account_code' and is_active;
+    if v_acc is null then
+      raise exception 'Unknown or inactive account %', v_line->>'account_code';
+    end if;
+    insert into public.journal_lines (entry_id, line_no, account_id, debit, credit, memo, customer_id, supplier_id)
+    values (
+      v_id, v_n, v_acc,
+      coalesce((v_line->>'debit')::numeric, 0),
+      coalesce((v_line->>'credit')::numeric, 0),
+      v_line->>'memo',
+      nullif(v_line->>'customer_id','')::uuid,
+      nullif(v_line->>'supplier_id','')::uuid
+    );
+  end loop;
+
+  return v_id;
+end;
+$$;
+
+create or replace function public.reverse_journal_entry(p_entry uuid, p_reason text)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_old public.journal_entries;
+  v_lines jsonb;
+begin
+  if not public.is_owner() then
+    raise exception 'Only the owner can reverse entries.';
+  end if;
+  select * into v_old from public.journal_entries where id = p_entry;
+  if not found then raise exception 'Entry not found.'; end if;
+  if v_old.reverses_id is not null then raise exception 'A reversal cannot be reversed.'; end if;
+  if v_old.source <> 'manual' then
+    raise exception 'This entry was posted by the % module. Void the original transaction in that module instead, so stock and books stay in step.', v_old.source;
+  end if;
+  if exists (select 1 from public.journal_entries where reverses_id = p_entry) then
+    raise exception 'This entry is already reversed.';
+  end if;
+
+  select jsonb_agg(jsonb_build_object(
+           'account_code', a.code,
+           'debit', l.credit, 'credit', l.debit,
+           'memo', l.memo, 'customer_id', l.customer_id, 'supplier_id', l.supplier_id)
+         order by l.line_no)
+    into v_lines
+  from public.journal_lines l join public.accounts a on a.id = l.account_id
+  where l.entry_id = p_entry;
+
+  return public.post_journal_entry(
+    current_date,
+    'REV-' || v_old.entry_no,
+    'Reversal of #' || v_old.entry_no || ': ' || coalesce(p_reason,''),
+    v_lines, 'reversal', p_entry, p_entry);
+end;
+$$;
+
+-- Internal: post an entry on behalf of a module
+create or replace function public.post_module_entry(
+  p_date date, p_reference text, p_description text, p_lines jsonb,
+  p_source text, p_source_id uuid, p_reverses uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+begin
+  perform set_config('app.module_post', '1', true);
+  return public.post_journal_entry(p_date, p_reference, p_description, p_lines, p_source, p_source_id, p_reverses);
+end;
+$$;
+
+-- Internal: reverse a module's journal entry
+create or replace function public.reverse_module_entry(
+  p_entry uuid, p_reason text, p_source text, p_source_id uuid
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_old public.journal_entries;
+  v_lines jsonb;
+begin
+  select * into v_old from public.journal_entries where id = p_entry;
+  if not found then raise exception 'Journal entry not found.'; end if;
+
+  select jsonb_agg(jsonb_build_object(
+           'account_code', a.code,
+           'debit', l.credit, 'credit', l.debit,
+           'memo', l.memo, 'customer_id', l.customer_id, 'supplier_id', l.supplier_id)
+         order by l.line_no)
+    into v_lines
+  from public.journal_lines l join public.accounts a on a.id = l.account_id
+  where l.entry_id = p_entry;
+
+  return public.post_module_entry(
+    current_date, 'REV-' || v_old.entry_no,
+    'Reversal of #' || v_old.entry_no || ': ' || coalesce(p_reason,''),
+    v_lines, p_source, p_source_id, p_entry);
+end;
+$$;
+
+-- ---------- 2. Materials and reorder levels --------------------------
+create sequence if not exists public.material_code_seq;
+
+create table if not exists public.materials (
+  id          uuid primary key default gen_random_uuid(),
+  code        text not null unique default ('MAT-' || lpad(nextval('public.material_code_seq')::text, 3, '0')),
+  name        text not null,
+  category    text not null check (category in ('oil','solvent','bottle','bottle_sticker','box','box_sticker','wrap')),
+  unit        text not null check (char_length(trim(unit)) > 0),
+  supplier_id uuid references public.suppliers(id),
+  notes       text,
+  is_active   boolean not null default true,
+  created_by  uuid references auth.users(id) default auth.uid(),
+  created_at  timestamptz not null default now(),
+  check (category not in ('oil','solvent') or unit = 'ml')
+);
+create unique index if not exists materials_name_uq on public.materials (lower(name));
+
+-- Owner-set thresholds. item_kind 'material' -> materials.id, 'size' -> perfume_sizes.id
+create table if not exists public.stock_thresholds (
+  item_kind     text not null check (item_kind in ('material','size')),
+  item_id       uuid not null,
+  reorder_level numeric(14,3) not null default 0 check (reorder_level >= 0),
+  updated_by    uuid references auth.users(id) default auth.uid(),
+  updated_at    timestamptz not null default now(),
+  primary key (item_kind, item_id)
+);
+
+-- ---------- 3. FIFO stock layers and movement log --------------------
+create table if not exists public.stock_layers (
+  id             uuid primary key default gen_random_uuid(),
+  stock_kind     text not null check (stock_kind in ('material','juice','bottled','finished')),
+  material_id    uuid references public.materials(id),
+  perfume_id     uuid references public.perfumes(id),      -- juice is kept per perfume
+  size_id        uuid references public.perfume_sizes(id), -- bottled / finished are kept per size
+  batch_id       uuid,
+  received_date  date not null,
+  source         text not null,
+  source_id      uuid,
+  qty_in         numeric(14,3) not null check (qty_in > 0),
+  cost_in        numeric(14,2) not null check (cost_in >= 0),
+  qty_remaining  numeric(14,3) not null check (qty_remaining >= 0),
+  cost_remaining numeric(14,2) not null check (cost_remaining >= 0),
+  created_at     timestamptz not null default now(),
+  check (
+    (stock_kind = 'material' and material_id is not null) or
+    (stock_kind = 'juice' and perfume_id is not null) or
+    (stock_kind in ('bottled','finished') and size_id is not null)
+  )
+);
+create index if not exists stock_layers_material_idx on public.stock_layers (material_id) where qty_remaining > 0;
+create index if not exists stock_layers_perfume_idx  on public.stock_layers (perfume_id)  where qty_remaining > 0;
+create index if not exists stock_layers_size_idx     on public.stock_layers (size_id)     where qty_remaining > 0;
+create index if not exists stock_layers_source_idx   on public.stock_layers (source, source_id);
+
+create table if not exists public.stock_movements (
+  id         uuid primary key default gen_random_uuid(),
+  layer_id   uuid not null references public.stock_layers(id),
+  move_date  date not null,
+  move_type  text not null check (move_type in ('in','out','void')),
+  qty        numeric(14,3) not null,
+  cost       numeric(14,2) not null,
+  ref_type   text,
+  ref_id     uuid,
+  created_by uuid references auth.users(id) default auth.uid(),
+  created_at timestamptz not null default now()
+);
+create index if not exists stock_movements_ref_idx on public.stock_movements (ref_type, ref_id);
+
+create or replace function public.block_stock_log_changes()
+returns trigger language plpgsql as $$
+begin
+  raise exception 'The stock movement log cannot be edited or deleted.';
+end;
+$$;
+drop trigger if exists sm_immutable on public.stock_movements;
+drop trigger if exists sm_immutable on public.stock_movements;
+create trigger sm_immutable before update or delete on public.stock_movements
+  for each row execute function public.block_stock_log_changes();
+
+-- Internal: receive stock into a new layer
+create or replace function public.stock_in(
+  p_kind text, p_material uuid, p_perfume uuid, p_size uuid, p_date date,
+  p_qty numeric, p_cost numeric, p_source text, p_source_id uuid, p_batch uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+begin
+  insert into public.stock_layers
+    (stock_kind, material_id, perfume_id, size_id, batch_id, received_date, source, source_id,
+     qty_in, cost_in, qty_remaining, cost_remaining)
+  values
+    (p_kind, p_material, p_perfume, p_size, p_batch, p_date, p_source, p_source_id,
+     p_qty, p_cost, p_qty, p_cost)
+  returning id into v_id;
+
+  insert into public.stock_movements (layer_id, move_date, move_type, qty, cost, ref_type, ref_id)
+  values (v_id, p_date, 'in', p_qty, p_cost, p_source, p_source_id);
+  return v_id;
+end;
+$$;
+
+-- Internal: take stock oldest-layer-first (FIFO). Returns the total cost taken.
+create or replace function public.stock_out(
+  p_kind text, p_key uuid, p_qty numeric, p_date date, p_ref_type text, p_ref_id uuid
+) returns numeric
+language plpgsql security definer set search_path = public as $$
+declare
+  r record;
+  v_need numeric := p_qty;
+  v_take numeric;
+  v_cost numeric(14,2);
+  v_total numeric(14,2) := 0;
+  v_label text;
+begin
+  if p_qty is null or p_qty <= 0 then
+    raise exception 'Quantity must be greater than zero.';
+  end if;
+
+  for r in
+    select * from public.stock_layers
+    where stock_kind = p_kind and qty_remaining > 0
+      and (case p_kind when 'material' then material_id when 'juice' then perfume_id else size_id end) = p_key
+    order by received_date, created_at, id
+    for update
+  loop
+    exit when v_need <= 0;
+    v_take := least(r.qty_remaining, v_need);
+    if v_take = r.qty_remaining then
+      v_cost := r.cost_remaining;
+    else
+      v_cost := round(r.cost_remaining * v_take / r.qty_remaining, 2);
+    end if;
+
+    update public.stock_layers
+       set qty_remaining = qty_remaining - v_take,
+           cost_remaining = cost_remaining - v_cost
+     where id = r.id;
+
+    insert into public.stock_movements (layer_id, move_date, move_type, qty, cost, ref_type, ref_id)
+    values (r.id, p_date, 'out', -v_take, -v_cost, p_ref_type, p_ref_id);
+
+    v_need := v_need - v_take;
+    v_total := v_total + v_cost;
+  end loop;
+
+  if v_need > 0 then
+    if p_kind = 'material' then
+      select name into v_label from public.materials where id = p_key;
+    else
+      v_label := case p_kind when 'juice' then 'matured juice'
+                             when 'bottled' then 'bottled perfume'
+                             else 'finished goods' end;
+    end if;
+    raise exception 'Not enough % in stock (short by %).', coalesce(v_label, p_kind), v_need;
+  end if;
+
+  return v_total;
+end;
+$$;
+
+-- Internal: use a packaging/bottling material, with optional spoiled units
+create or replace function public.consume_material(
+  p_material uuid, p_cat text, p_good numeric, p_spoiled numeric, p_date date,
+  p_ref_type text, p_ref_id uuid,
+  out o_total numeric, out o_spoiled numeric
+)
+language plpgsql security definer set search_path = public as $$
+begin
+  if p_material is null then
+    raise exception 'Choose the % to use.', replace(p_cat, '_', ' ');
+  end if;
+  perform 1 from public.materials where id = p_material and is_active and category = p_cat;
+  if not found then
+    raise exception 'Choose a valid % material.', replace(p_cat, '_', ' ');
+  end if;
+  o_total := public.stock_out('material', p_material, p_good + p_spoiled, p_date, p_ref_type, p_ref_id);
+  o_spoiled := case when p_spoiled > 0
+                    then round(o_total * p_spoiled / (p_good + p_spoiled), 2)
+                    else 0 end;
+end;
+$$;
+
+-- ---------- 4. Procurement -------------------------------------------
+create sequence if not exists public.purchase_no_seq;
+create sequence if not exists public.payment_no_seq;
+
+create table if not exists public.purchases (
+  id               uuid primary key default gen_random_uuid(),
+  purchase_no      bigint not null unique default nextval('public.purchase_no_seq'),
+  purchase_date    date not null,
+  supplier_id      uuid references public.suppliers(id),
+  reference        text,
+  payment_type     text not null check (payment_type in ('cash','bank','credit')),
+  due_date         date,
+  notes            text,
+  total            numeric(14,2) not null default 0 check (total >= 0),
+  status           text not null default 'Posted' check (status in ('Posted','Voided')),
+  journal_entry_id uuid references public.journal_entries(id),
+  void_entry_id    uuid references public.journal_entries(id),
+  created_by       uuid references auth.users(id) default auth.uid(),
+  created_at       timestamptz not null default now()
+);
+create index if not exists purchases_supplier_idx on public.purchases (supplier_id);
+
+create table if not exists public.purchase_lines (
+  id           uuid primary key default gen_random_uuid(),
+  purchase_id  uuid not null references public.purchases(id),
+  line_no      int not null,
+  line_type    text not null check (line_type in ('material','asset','expense')),
+  material_id  uuid references public.materials(id),
+  description  text,
+  account_code text not null,
+  qty          numeric(14,3) not null check (qty > 0),
+  unit_cost    numeric(14,4) not null check (unit_cost >= 0),
+  amount       numeric(14,2) not null check (amount >= 0),
+  unique (purchase_id, line_no)
+);
+
+create table if not exists public.supplier_payments (
+  id               uuid primary key default gen_random_uuid(),
+  pay_no           bigint not null unique default nextval('public.payment_no_seq'),
+  pay_date         date not null,
+  supplier_id      uuid not null references public.suppliers(id),
+  amount           numeric(14,2) not null default 0 check (amount >= 0),
+  method           text not null check (method in ('cash','bank')),
+  reference        text,
+  notes            text,
+  status           text not null default 'Posted' check (status in ('Posted','Voided')),
+  journal_entry_id uuid references public.journal_entries(id),
+  void_entry_id    uuid references public.journal_entries(id),
+  created_by       uuid references auth.users(id) default auth.uid(),
+  created_at       timestamptz not null default now()
+);
+
+create table if not exists public.payment_allocations (
+  id          uuid primary key default gen_random_uuid(),
+  payment_id  uuid not null references public.supplier_payments(id),
+  purchase_id uuid not null references public.purchases(id),
+  amount      numeric(14,2) not null check (amount > 0)
+);
+create index if not exists payment_alloc_purchase_idx on public.payment_allocations (purchase_id);
+
+-- Record a purchase: materials create FIFO layers; assets and expenses post straight to the books.
+-- p_lines: [{line_type:'material'|'asset'|'expense', material_id, account_code, description, qty, unit_cost}]
+create or replace function public.record_purchase(
+  p_date date, p_supplier uuid, p_reference text, p_payment text,
+  p_due date, p_notes text, p_lines jsonb
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_line jsonb;
+  v_n int := 0;
+  v_type text;
+  v_mat public.materials;
+  v_qty numeric;
+  v_cost numeric;
+  v_amt numeric(14,2);
+  v_code text;
+  v_desc text;
+  v_total numeric(14,2) := 0;
+  v_terms int := 0;
+  v_sup text;
+  v_due date;
+  v_dr jsonb;
+  v_cr_code text;
+  v_label text;
+  v_je uuid;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_payment not in ('cash','bank','credit') then raise exception 'Choose how this purchase is paid.'; end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 1 then
+    raise exception 'Add at least one line.';
+  end if;
+
+  if p_supplier is not null then
+    select name, payment_terms_days into v_sup, v_terms from public.suppliers where id = p_supplier;
+    if not found then raise exception 'Supplier not found.'; end if;
+  end if;
+  if p_payment = 'credit' and p_supplier is null then
+    raise exception 'A purchase on credit needs a supplier.';
+  end if;
+  v_due := case when p_payment = 'credit' then coalesce(p_due, v_date + coalesce(v_terms, 0)) end;
+
+  v_no := nextval('public.purchase_no_seq');
+  v_label := 'PUR-' || lpad(v_no::text, 4, '0');
+
+  insert into public.purchases (id, purchase_no, purchase_date, supplier_id, reference, payment_type, due_date, notes, total)
+  values (v_id, v_no, v_date, p_supplier, nullif(trim(p_reference), ''), p_payment, v_due, nullif(trim(p_notes), ''), 0);
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    v_n := v_n + 1;
+    v_type := v_line->>'line_type';
+    v_qty := coalesce((v_line->>'qty')::numeric, 0);
+    v_cost := coalesce((v_line->>'unit_cost')::numeric, 0);
+    if v_qty <= 0 then raise exception 'Line %: quantity must be more than zero.', v_n; end if;
+    if v_cost < 0 then raise exception 'Line %: cost cannot be negative.', v_n; end if;
+    v_amt := round(v_qty * v_cost, 2);
+    v_mat := null;
+
+    if v_type = 'material' then
+      select * into v_mat from public.materials
+       where id = nullif(v_line->>'material_id', '')::uuid and is_active;
+      if not found then raise exception 'Line %: choose a material.', v_n; end if;
+      v_code := case v_mat.category when 'oil' then '1200' when 'solvent' then '1210' else '1220' end;
+      v_desc := v_mat.name;
+    elsif v_type = 'asset' then
+      v_code := v_line->>'account_code';
+      if v_code is null or v_code not in ('1400','1500') then
+        raise exception 'Line %: an asset goes to Prepaid Expenses or Equipment.', v_n;
+      end if;
+      v_desc := nullif(trim(coalesce(v_line->>'description', '')), '');
+      if v_desc is null then raise exception 'Line %: describe the item.', v_n; end if;
+    elsif v_type = 'expense' then
+      v_code := v_line->>'account_code';
+      perform 1 from public.accounts
+       where code = v_code and type = 'expense' and is_active and not is_system and code not in ('6060','6080');
+      if not found then raise exception 'Line %: choose an expense account.', v_n; end if;
+      v_desc := nullif(trim(coalesce(v_line->>'description', '')), '');
+      if v_desc is null then raise exception 'Line %: describe the expense.', v_n; end if;
+    else
+      raise exception 'Line %: unknown line type.', v_n;
+    end if;
+
+    insert into public.purchase_lines (purchase_id, line_no, line_type, material_id, description, account_code, qty, unit_cost, amount)
+    values (v_id, v_n, v_type, v_mat.id, v_desc, v_code, v_qty, v_cost, v_amt);
+
+    if v_type = 'material' then
+      perform public.stock_in('material', v_mat.id, null, null, v_date, v_qty, v_amt, 'purchase', v_id);
+    end if;
+    v_total := v_total + v_amt;
+  end loop;
+
+  if v_total <= 0 then raise exception 'The purchase total cannot be zero.'; end if;
+
+  select jsonb_agg(jsonb_build_object('account_code', x.code, 'debit', x.amt, 'memo', 'Purchase ' || v_label) order by x.code)
+    into v_dr
+  from (
+    select account_code as code, sum(amount) as amt
+    from public.purchase_lines where purchase_id = v_id
+    group by account_code having sum(amount) > 0
+  ) x;
+
+  v_cr_code := case p_payment when 'cash' then '1010' when 'bank' then '1020' else '2000' end;
+
+  v_je := public.post_module_entry(
+    v_date, v_label,
+    'Purchase ' || v_label || coalesce(' from ' || v_sup, ''),
+    v_dr || jsonb_build_array(jsonb_build_object(
+      'account_code', v_cr_code, 'credit', v_total,
+      'memo', 'Purchase ' || v_label, 'supplier_id', p_supplier)),
+    'procurement', v_id);
+
+  update public.purchases set total = v_total, journal_entry_id = v_je where id = v_id;
+  return v_id;
+end;
+$$;
+
+-- Pay a supplier for credit purchases (owner only).
+-- p_allocations: [{purchase_id, amount}]
+create or replace function public.record_supplier_payment(
+  p_date date, p_supplier uuid, p_method text, p_reference text, p_notes text, p_allocations jsonb
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_a jsonb;
+  v_amt numeric(14,2);
+  v_total numeric(14,2) := 0;
+  v_pur public.purchases;
+  v_paid numeric;
+  v_sup text;
+  v_label text;
+  v_je uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can pay suppliers.'; end if;
+  if p_method not in ('cash','bank') then raise exception 'Choose cash or bank.'; end if;
+  if p_allocations is null or jsonb_typeof(p_allocations) <> 'array' or jsonb_array_length(p_allocations) < 1 then
+    raise exception 'Choose at least one purchase to pay.';
+  end if;
+  select name into v_sup from public.suppliers where id = p_supplier;
+  if not found then raise exception 'Supplier not found.'; end if;
+
+  v_no := nextval('public.payment_no_seq');
+  v_label := 'PAY-' || lpad(v_no::text, 4, '0');
+
+  insert into public.supplier_payments (id, pay_no, pay_date, supplier_id, amount, method, reference, notes)
+  values (v_id, v_no, v_date, p_supplier, 0, p_method, nullif(trim(p_reference), ''), nullif(trim(p_notes), ''));
+
+  for v_a in select * from jsonb_array_elements(p_allocations) loop
+    v_amt := round(coalesce((v_a->>'amount')::numeric, 0), 2);
+    if v_amt <= 0 then continue; end if;
+
+    select * into v_pur from public.purchases where id = (v_a->>'purchase_id')::uuid for update;
+    if not found or v_pur.supplier_id is distinct from p_supplier
+       or v_pur.payment_type <> 'credit' or v_pur.status <> 'Posted' then
+      raise exception 'One of the purchases cannot be paid here.';
+    end if;
+
+    insert into public.payment_allocations (payment_id, purchase_id, amount) values (v_id, v_pur.id, v_amt);
+
+    select coalesce(sum(a.amount), 0) into v_paid
+    from public.payment_allocations a
+    join public.supplier_payments sp on sp.id = a.payment_id and sp.status = 'Posted'
+    where a.purchase_id = v_pur.id;
+    if v_paid > v_pur.total then
+      raise exception 'Payment for PUR-% is more than its balance.', lpad(v_pur.purchase_no::text, 4, '0');
+    end if;
+    v_total := v_total + v_amt;
+  end loop;
+
+  if v_total <= 0 then raise exception 'Enter an amount to pay.'; end if;
+
+  v_je := public.post_module_entry(
+    v_date, v_label, 'Payment to ' || v_sup || ' (' || v_label || ')',
+    jsonb_build_array(
+      jsonb_build_object('account_code', '2000', 'debit', v_total, 'memo', 'Payment ' || v_label, 'supplier_id', p_supplier),
+      jsonb_build_object('account_code', case p_method when 'cash' then '1010' else '1020' end,
+                         'credit', v_total, 'memo', 'Payment ' || v_label)),
+    'supplier_payment', v_id);
+
+  update public.supplier_payments set amount = v_total, journal_entry_id = v_je where id = v_id;
+  return v_id;
+end;
+$$;
+
+-- Void a purchase (owner only): only if nothing was paid and none of its materials were used.
+create or replace function public.void_purchase(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v_pur public.purchases;
+  v_rev uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can void a purchase.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+  select * into v_pur from public.purchases where id = p_id for update;
+  if not found then raise exception 'Purchase not found.'; end if;
+  if v_pur.status <> 'Posted' then raise exception 'This purchase is already voided.'; end if;
+
+  if exists (
+    select 1 from public.payment_allocations a
+    join public.supplier_payments sp on sp.id = a.payment_id and sp.status = 'Posted'
+    where a.purchase_id = p_id
+  ) then
+    raise exception 'A payment was already made on this purchase. Void the payment first.';
+  end if;
+  if exists (
+    select 1 from public.stock_layers
+    where source = 'purchase' and source_id = p_id and qty_remaining <> qty_in
+  ) then
+    raise exception 'Some of these materials were already used in production, so the purchase cannot be voided.';
+  end if;
+
+  insert into public.stock_movements (layer_id, move_date, move_type, qty, cost, ref_type, ref_id)
+  select id, current_date, 'void', -qty_remaining, -cost_remaining, 'purchase_void', p_id
+  from public.stock_layers
+  where source = 'purchase' and source_id = p_id and qty_remaining > 0;
+
+  update public.stock_layers set qty_remaining = 0, cost_remaining = 0
+  where source = 'purchase' and source_id = p_id;
+
+  v_rev := public.reverse_module_entry(v_pur.journal_entry_id, p_reason, 'procurement_void', p_id);
+  update public.purchases set status = 'Voided', void_entry_id = v_rev where id = p_id;
+end;
+$$;
+
+create or replace function public.void_supplier_payment(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v_pay public.supplier_payments;
+  v_rev uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can void a payment.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+  select * into v_pay from public.supplier_payments where id = p_id for update;
+  if not found then raise exception 'Payment not found.'; end if;
+  if v_pay.status <> 'Posted' then raise exception 'This payment is already voided.'; end if;
+
+  v_rev := public.reverse_module_entry(v_pay.journal_entry_id, p_reason, 'supplier_payment_void', p_id);
+  update public.supplier_payments set status = 'Voided', void_entry_id = v_rev where id = p_id;
+end;
+$$;
+
+-- Open credit purchases (accounts payable schedule source)
+create or replace view public.payables_open
+with (security_invoker = true) as
+select p.id as purchase_id, p.purchase_no, p.purchase_date, p.due_date, p.supplier_id,
+       s.name as supplier_name, p.reference, p.total,
+       coalesce(x.paid, 0) as paid,
+       p.total - coalesce(x.paid, 0) as balance,
+       greatest(current_date - p.due_date, 0) as days_overdue
+from public.purchases p
+join public.suppliers s on s.id = p.supplier_id
+left join lateral (
+  select sum(a.amount) as paid
+  from public.payment_allocations a
+  join public.supplier_payments sp on sp.id = a.payment_id and sp.status = 'Posted'
+  where a.purchase_id = p.id
+) x on true
+where p.payment_type = 'credit' and p.status = 'Posted'
+  and p.total - coalesce(x.paid, 0) > 0;
+
+-- ---------- 5. Maceration --------------------------------------------
+create sequence if not exists public.maceration_no_seq;
+
+create table if not exists public.maceration_batches (
+  id               uuid primary key default gen_random_uuid(),
+  batch_no         bigint not null unique default nextval('public.maceration_no_seq'),
+  perfume_id       uuid not null references public.perfumes(id),
+  start_date       date not null,
+  ready_date       date not null,
+  status           text not null default 'Macerating' check (status in ('Macerating','Matured')),
+  total_input_ml   numeric(14,3) not null default 0 check (total_input_ml >= 0),
+  expected_ml      numeric(14,3) not null default 0 check (expected_ml >= 0),
+  total_cost       numeric(14,2) not null default 0 check (total_cost >= 0),
+  actual_yield_ml  numeric(14,3),
+  juice_cost       numeric(14,2),
+  loss_cost        numeric(14,2),
+  matured_date     date,
+  notes            text,
+  start_entry_id   uuid references public.journal_entries(id),
+  complete_entry_id uuid references public.journal_entries(id),
+  created_by       uuid references auth.users(id) default auth.uid(),
+  completed_by     uuid references auth.users(id),
+  created_at       timestamptz not null default now()
+);
+
+create table if not exists public.maceration_inputs (
+  id          uuid primary key default gen_random_uuid(),
+  batch_id    uuid not null references public.maceration_batches(id),
+  material_id uuid not null references public.materials(id),
+  qty         numeric(14,3) not null check (qty > 0),
+  cost        numeric(14,2) not null check (cost >= 0)
+);
+
+-- Start a batch: uses oils and solvent only. p_inputs: [{material_id, qty}]
+create or replace function public.start_maceration(
+  p_perfume uuid, p_date date, p_notes text, p_inputs jsonb
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_start date := coalesce(p_date, current_date);
+  v_days int;
+  v_loss numeric;
+  v_in jsonb;
+  v_mat public.materials;
+  v_qty numeric;
+  v_cost numeric(14,2);
+  v_total numeric(14,2) := 0;
+  v_oil_cost numeric(14,2) := 0;
+  v_solv_cost numeric(14,2) := 0;
+  v_oil_ml numeric := 0;
+  v_solv_ml numeric := 0;
+  v_lines jsonb;
+  v_je uuid;
+  v_label text;
+  v_pname text;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  select name into v_pname from public.perfumes where id = p_perfume and status <> 'Discontinued';
+  if not found then raise exception 'Choose a perfume for this batch.'; end if;
+  if p_inputs is null or jsonb_typeof(p_inputs) <> 'array' or jsonb_array_length(p_inputs) < 1 then
+    raise exception 'Add the oils and solvent for this batch.';
+  end if;
+
+  select maceration_days, normal_loss_pct into v_days, v_loss from public.business_settings where id;
+  v_no := nextval('public.maceration_no_seq');
+  v_label := 'MB-' || lpad(v_no::text, 4, '0');
+
+  insert into public.maceration_batches (id, batch_no, perfume_id, start_date, ready_date, notes)
+  values (v_id, v_no, p_perfume, v_start, v_start + v_days, nullif(trim(coalesce(p_notes, '')), ''));
+
+  for v_in in select * from jsonb_array_elements(p_inputs) loop
+    v_qty := coalesce((v_in->>'qty')::numeric, 0);
+    if v_qty <= 0 then raise exception 'Every ingredient needs a quantity above zero.'; end if;
+    select * into v_mat from public.materials
+     where id = nullif(v_in->>'material_id', '')::uuid and is_active and category in ('oil','solvent');
+    if not found then raise exception 'Maceration uses oils and solvent only.'; end if;
+
+    v_cost := public.stock_out('material', v_mat.id, v_qty, v_start, 'maceration', v_id);
+    insert into public.maceration_inputs (batch_id, material_id, qty, cost) values (v_id, v_mat.id, v_qty, v_cost);
+
+    v_total := v_total + v_cost;
+    if v_mat.category = 'oil' then
+      v_oil_cost := v_oil_cost + v_cost; v_oil_ml := v_oil_ml + v_qty;
+    else
+      v_solv_cost := v_solv_cost + v_cost; v_solv_ml := v_solv_ml + v_qty;
+    end if;
+  end loop;
+
+  if v_oil_ml <= 0 or v_solv_ml <= 0 then
+    raise exception 'A batch needs at least one oil and one solvent.';
+  end if;
+  if v_total <= 0 then
+    raise exception 'These materials have no recorded cost, so the batch cannot be valued.';
+  end if;
+
+  v_lines := jsonb_build_array(jsonb_build_object('account_code', '1300', 'debit', v_total, 'memo', v_label || ' ' || v_pname));
+  if v_oil_cost > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1200', 'credit', v_oil_cost, 'memo', 'Oils used'));
+  end if;
+  if v_solv_cost > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1210', 'credit', v_solv_cost, 'memo', 'Solvent used'));
+  end if;
+
+  v_je := public.post_module_entry(v_start, v_label, 'Maceration started ' || v_label || ' - ' || v_pname,
+                                   v_lines, 'maceration', v_id);
+
+  update public.maceration_batches
+     set total_input_ml = v_oil_ml + v_solv_ml,
+         expected_ml = round((v_oil_ml + v_solv_ml) * (1 - v_loss), 3),
+         total_cost = v_total,
+         start_entry_id = v_je
+   where id = v_id;
+  return v_id;
+end;
+$$;
+
+-- Complete a batch with the actual juice yield. Loss above the normal rate goes to Maceration Loss;
+-- normal evaporation stays inside the juice cost.
+create or replace function public.complete_maceration(p_batch uuid, p_date date, p_yield_ml numeric)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  b public.maceration_batches;
+  v_date date := coalesce(p_date, current_date);
+  v_abn_ml numeric := 0;
+  v_abn_cost numeric(14,2) := 0;
+  v_juice_cost numeric(14,2);
+  v_lines jsonb;
+  v_je uuid;
+  v_label text;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  select * into b from public.maceration_batches where id = p_batch for update;
+  if not found then raise exception 'Batch not found.'; end if;
+  if b.status <> 'Macerating' then raise exception 'This batch is already completed.'; end if;
+  if v_date < b.start_date then raise exception 'The completion date cannot be before the start date.'; end if;
+  if v_date < b.ready_date and not public.is_owner() then
+    raise exception 'This batch is not ready until %. Only the owner can complete it earlier.', b.ready_date;
+  end if;
+  if p_yield_ml is null or p_yield_ml <= 0 or p_yield_ml > b.total_input_ml then
+    raise exception 'The yield must be more than 0 and not more than the % ml put in.', b.total_input_ml;
+  end if;
+
+  if p_yield_ml < b.expected_ml then
+    v_abn_ml := b.expected_ml - p_yield_ml;
+    v_abn_cost := round(b.total_cost * v_abn_ml / b.expected_ml, 2);
+  end if;
+  v_juice_cost := b.total_cost - v_abn_cost;
+  v_label := 'MB-' || lpad(b.batch_no::text, 4, '0');
+
+  v_lines := '[]'::jsonb;
+  if v_juice_cost > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1310', 'debit', v_juice_cost, 'memo', 'Matured juice ' || v_label));
+  end if;
+  if v_abn_cost > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '5100', 'debit', v_abn_cost, 'memo', 'Loss above normal rate'));
+  end if;
+  v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1300', 'credit', b.total_cost, 'memo', v_label));
+
+  v_je := public.post_module_entry(v_date, v_label, 'Maceration completed ' || v_label, v_lines, 'maceration', b.id);
+
+  perform public.stock_in('juice', null, b.perfume_id, null, v_date, p_yield_ml, v_juice_cost, 'maceration', b.id, b.id);
+
+  update public.maceration_batches
+     set status = 'Matured', actual_yield_ml = p_yield_ml, juice_cost = v_juice_cost,
+         loss_cost = v_abn_cost, matured_date = v_date, complete_entry_id = v_je,
+         completed_by = auth.uid()
+   where id = b.id;
+  return b.id;
+end;
+$$;
+
+-- ---------- 6. Bottling ----------------------------------------------
+create sequence if not exists public.bottling_no_seq;
+
+create table if not exists public.bottling_runs (
+  id                  uuid primary key default gen_random_uuid(),
+  run_no              bigint not null unique default nextval('public.bottling_no_seq'),
+  run_date            date not null,
+  perfume_id          uuid not null references public.perfumes(id),
+  size_id             uuid not null references public.perfume_sizes(id),
+  qty                 int not null check (qty > 0),
+  spoiled_qty         int not null default 0 check (spoiled_qty >= 0),
+  juice_ml            numeric(14,3) not null,
+  juice_cost          numeric(14,2) not null,
+  bottle_material_id  uuid references public.materials(id),
+  sticker_material_id uuid references public.materials(id),
+  materials_cost      numeric(14,2) not null,
+  spoiled_cost        numeric(14,2) not null default 0,
+  bottled_cost        numeric(14,2) not null,
+  notes               text,
+  journal_entry_id    uuid references public.journal_entries(id),
+  created_by          uuid references auth.users(id) default auth.uid(),
+  created_at          timestamptz not null default now()
+);
+
+-- Bottling = matured juice + bottle + bottle sticker
+create or replace function public.record_bottling(
+  p_date date, p_size uuid, p_qty int, p_bottle uuid, p_sticker uuid, p_spoiled int, p_notes text
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_spoiled int := coalesce(p_spoiled, 0);
+  v_sz public.perfume_sizes;
+  v_pf public.perfumes;
+  v_ml numeric;
+  v_juice numeric(14,2);
+  v_bt numeric; v_bs numeric;
+  v_st numeric; v_ss numeric;
+  v_mats numeric(14,2);
+  v_spoil numeric(14,2);
+  v_bottled numeric(14,2);
+  v_lines jsonb := '[]'::jsonb;
+  v_je uuid;
+  v_label text;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many bottles were filled.'; end if;
+  if v_spoiled < 0 then raise exception 'Spoiled units cannot be negative.'; end if;
+
+  select * into v_sz from public.perfume_sizes where id = p_size and is_active;
+  if not found then raise exception 'Choose a perfume size.'; end if;
+  select * into v_pf from public.perfumes where id = v_sz.perfume_id and status <> 'Discontinued';
+  if not found then raise exception 'This perfume is discontinued.'; end if;
+
+  v_no := nextval('public.bottling_no_seq');
+  v_label := 'BT-' || lpad(v_no::text, 4, '0');
+  v_ml := p_qty * v_sz.size_ml;
+
+  v_juice := public.stock_out('juice', v_pf.id, v_ml, v_date, 'bottling', v_id);
+  select o_total, o_spoiled into v_bt, v_bs
+    from public.consume_material(p_bottle, 'bottle', p_qty, v_spoiled, v_date, 'bottling', v_id);
+  select o_total, o_spoiled into v_st, v_ss
+    from public.consume_material(p_sticker, 'bottle_sticker', p_qty, v_spoiled, v_date, 'bottling', v_id);
+
+  v_mats := v_bt + v_st;
+  v_spoil := v_bs + v_ss;
+  v_bottled := v_juice + (v_mats - v_spoil);
+
+  if v_bottled + v_spoil <= 0 then
+    raise exception 'The materials used have no recorded cost, so nothing can be posted.';
+  end if;
+
+  if v_bottled > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1320', 'debit', v_bottled, 'memo', v_label || ' ' || v_pf.name || ' ' || v_sz.size_ml || ' ml'));
+  end if;
+  if v_spoil > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '5110', 'debit', v_spoil, 'memo', 'Spoiled bottles/stickers'));
+  end if;
+  if v_juice > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1310', 'credit', v_juice, 'memo', 'Juice used'));
+  end if;
+  if v_mats > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1220', 'credit', v_mats, 'memo', 'Bottles and stickers used'));
+  end if;
+
+  v_je := public.post_module_entry(v_date, v_label,
+            'Bottling ' || v_label || ' - ' || p_qty || ' x ' || v_pf.name || ' ' || v_sz.size_ml || ' ml',
+            v_lines, 'bottling', v_id);
+
+  insert into public.bottling_runs
+    (id, run_no, run_date, perfume_id, size_id, qty, spoiled_qty, juice_ml, juice_cost,
+     bottle_material_id, sticker_material_id, materials_cost, spoiled_cost, bottled_cost, notes, journal_entry_id)
+  values
+    (v_id, v_no, v_date, v_pf.id, v_sz.id, p_qty, v_spoiled, v_ml, v_juice,
+     p_bottle, p_sticker, v_mats, v_spoil, v_bottled, nullif(trim(coalesce(p_notes, '')), ''), v_je);
+
+  perform public.stock_in('bottled', null, null, v_sz.id, v_date, p_qty, v_bottled, 'bottling', v_id);
+  return v_id;
+end;
+$$;
+
+-- ---------- 7. Packaging ---------------------------------------------
+create sequence if not exists public.packaging_no_seq;
+
+create table if not exists public.packaging_runs (
+  id                       uuid primary key default gen_random_uuid(),
+  run_no                   bigint not null unique default nextval('public.packaging_no_seq'),
+  run_date                 date not null,
+  perfume_id               uuid not null references public.perfumes(id),
+  size_id                  uuid not null references public.perfume_sizes(id),
+  qty                      int not null check (qty > 0),
+  spoiled_qty              int not null default 0 check (spoiled_qty >= 0),
+  bottled_cost             numeric(14,2) not null,
+  box_material_id          uuid references public.materials(id),
+  box_sticker_material_id  uuid references public.materials(id),
+  wrap_material_id         uuid references public.materials(id),
+  materials_cost           numeric(14,2) not null,
+  spoiled_cost             numeric(14,2) not null default 0,
+  finished_cost            numeric(14,2) not null,
+  notes                    text,
+  journal_entry_id         uuid references public.journal_entries(id),
+  created_by               uuid references auth.users(id) default auth.uid(),
+  created_at               timestamptz not null default now()
+);
+
+-- Packaging = bottled perfume + box + box sticker + wrap -> finished goods
+create or replace function public.record_packaging(
+  p_date date, p_size uuid, p_qty int, p_box uuid, p_box_sticker uuid, p_wrap uuid, p_spoiled int, p_notes text
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_spoiled int := coalesce(p_spoiled, 0);
+  v_sz public.perfume_sizes;
+  v_pf public.perfumes;
+  v_bottled numeric(14,2);
+  v_t numeric; v_s numeric;
+  v_mats numeric(14,2) := 0;
+  v_spoil numeric(14,2) := 0;
+  v_finished numeric(14,2);
+  v_lines jsonb := '[]'::jsonb;
+  v_je uuid;
+  v_label text;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many pieces were packaged.'; end if;
+  if v_spoiled < 0 then raise exception 'Spoiled units cannot be negative.'; end if;
+
+  select * into v_sz from public.perfume_sizes where id = p_size and is_active;
+  if not found then raise exception 'Choose a perfume size.'; end if;
+  select * into v_pf from public.perfumes where id = v_sz.perfume_id and status <> 'Discontinued';
+  if not found then raise exception 'This perfume is discontinued.'; end if;
+
+  v_no := nextval('public.packaging_no_seq');
+  v_label := 'PK-' || lpad(v_no::text, 4, '0');
+
+  v_bottled := public.stock_out('bottled', v_sz.id, p_qty, v_date, 'packaging', v_id);
+
+  select o_total, o_spoiled into v_t, v_s
+    from public.consume_material(p_box, 'box', p_qty, v_spoiled, v_date, 'packaging', v_id);
+  v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+  select o_total, o_spoiled into v_t, v_s
+    from public.consume_material(p_box_sticker, 'box_sticker', p_qty, v_spoiled, v_date, 'packaging', v_id);
+  v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+  select o_total, o_spoiled into v_t, v_s
+    from public.consume_material(p_wrap, 'wrap', p_qty, v_spoiled, v_date, 'packaging', v_id);
+  v_mats := v_mats + v_t; v_spoil := v_spoil + v_s;
+
+  v_finished := v_bottled + (v_mats - v_spoil);
+  if v_finished + v_spoil <= 0 then
+    raise exception 'The materials used have no recorded cost, so nothing can be posted.';
+  end if;
+
+  if v_finished > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1330', 'debit', v_finished, 'memo', v_label || ' ' || v_pf.name || ' ' || v_sz.size_ml || ' ml'));
+  end if;
+  if v_spoil > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '5110', 'debit', v_spoil, 'memo', 'Spoiled boxes/stickers/wrap'));
+  end if;
+  if v_bottled > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1320', 'credit', v_bottled, 'memo', 'Bottled perfume used'));
+  end if;
+  if v_mats > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1220', 'credit', v_mats, 'memo', 'Boxes, stickers and wrap used'));
+  end if;
+
+  v_je := public.post_module_entry(v_date, v_label,
+            'Packaging ' || v_label || ' - ' || p_qty || ' x ' || v_pf.name || ' ' || v_sz.size_ml || ' ml',
+            v_lines, 'packaging', v_id);
+
+  insert into public.packaging_runs
+    (id, run_no, run_date, perfume_id, size_id, qty, spoiled_qty, bottled_cost,
+     box_material_id, box_sticker_material_id, wrap_material_id,
+     materials_cost, spoiled_cost, finished_cost, notes, journal_entry_id)
+  values
+    (v_id, v_no, v_date, v_pf.id, v_sz.id, p_qty, v_spoiled, v_bottled,
+     p_box, p_box_sticker, p_wrap,
+     v_mats, v_spoil, v_finished, nullif(trim(coalesce(p_notes, '')), ''), v_je);
+
+  perform public.stock_in('finished', null, null, v_sz.id, v_date, p_qty, v_finished, 'packaging', v_id);
+  return v_id;
+end;
+$$;
+
+-- ---------- 8. Inventory overview (bird's-eye view + alert status) ---
+create or replace view public.inventory_status
+with (security_invoker = true) as
+with layer_sums as (
+  select stock_kind, coalesce(material_id, perfume_id, size_id) as key_id,
+         sum(qty_remaining) as qty, sum(cost_remaining) as val
+  from public.stock_layers
+  where qty_remaining > 0
+  group by 1, 2
+),
+macerating as (
+  select perfume_id, sum(expected_ml) as ml
+  from public.maceration_batches
+  where status = 'Macerating'
+  group by perfume_id
+)
+select 'material'::text as kind,
+       m.id as item_id,
+       m.code as sku,
+       m.name as item_name,
+       m.category as group_name,
+       null::numeric as size_ml,
+       m.unit as unit,
+       coalesce(s.qty, 0)::numeric as on_hand,
+       coalesce(s.val, 0)::numeric as value,
+       coalesce(t.reorder_level, 0)::numeric as reorder_level,
+       null::numeric as pipeline_units,
+       null::numeric as juice_ml,
+       null::numeric as macerating_ml,
+       (case when coalesce(t.reorder_level, 0) = 0 then 'No level'
+             when coalesce(s.qty, 0) <= 0 then 'Out'
+             when coalesce(s.qty, 0) <= t.reorder_level then 'Low'
+             else 'OK' end)::text as status,
+       'Purchase'::text as action
+from public.materials m
+left join layer_sums s on s.stock_kind = 'material' and s.key_id = m.id
+left join public.stock_thresholds t on t.item_kind = 'material' and t.item_id = m.id
+where m.is_active
+
+union all
+
+select 'finished'::text,
+       ps.id,
+       pf.sku,
+       pf.name,
+       coalesce(pf.collection, 'Perfume'),
+       ps.size_ml::numeric,
+       'pcs'::text,
+       coalesce(f.qty, 0)::numeric,
+       coalesce(f.val, 0)::numeric,
+       coalesce(t.reorder_level, 0)::numeric,
+       coalesce(b.qty, 0)::numeric,
+       coalesce(j.qty, 0)::numeric,
+       coalesce(mc.ml, 0)::numeric,
+       (case when coalesce(t.reorder_level, 0) = 0 then 'No level'
+             when coalesce(f.qty, 0) <= 0 then 'Out'
+             when coalesce(f.qty, 0) <= t.reorder_level then 'Low'
+             else 'OK' end)::text,
+       'Produce'::text
+from public.perfume_sizes ps
+join public.perfumes pf on pf.id = ps.perfume_id
+left join layer_sums f on f.stock_kind = 'finished' and f.key_id = ps.id
+left join layer_sums b on b.stock_kind = 'bottled'  and b.key_id = ps.id
+left join layer_sums j on j.stock_kind = 'juice'    and j.key_id = pf.id
+left join macerating mc on mc.perfume_id = pf.id
+left join public.stock_thresholds t on t.item_kind = 'size' and t.item_id = ps.id
+where ps.is_active and pf.status in ('Active Stock', 'In Production');
+
+-- ---------- 9. Row Level Security and grants -------------------------
+alter table public.materials           enable row level security;
+alter table public.stock_thresholds    enable row level security;
+alter table public.stock_layers        enable row level security;
+alter table public.stock_movements     enable row level security;
+alter table public.purchases           enable row level security;
+alter table public.purchase_lines      enable row level security;
+alter table public.supplier_payments   enable row level security;
+alter table public.payment_allocations enable row level security;
+alter table public.maceration_batches  enable row level security;
+alter table public.maceration_inputs   enable row level security;
+alter table public.bottling_runs       enable row level security;
+alter table public.packaging_runs      enable row level security;
+
+-- Materials: active users read/add/edit, owner deletes
+drop policy if exists materials_read on public.materials;
+create policy materials_read   on public.materials for select using (public.is_active_user());
+drop policy if exists materials_insert on public.materials;
+create policy materials_insert on public.materials for insert with check (public.is_active_user());
+drop policy if exists materials_update on public.materials;
+create policy materials_update on public.materials for update using (public.is_active_user()) with check (public.is_active_user());
+drop policy if exists materials_delete on public.materials;
+create policy materials_delete on public.materials for delete using (public.is_owner());
+
+-- Reorder levels: everyone sees them, only the owner changes them
+drop policy if exists thresholds_read on public.stock_thresholds;
+create policy thresholds_read  on public.stock_thresholds for select using (public.is_active_user());
+drop policy if exists thresholds_owner on public.stock_thresholds;
+create policy thresholds_owner on public.stock_thresholds for all using (public.is_owner()) with check (public.is_owner());
+
+-- Everything else is read-only from the browser; changes go through the functions below
+drop policy if exists stock_layers_read on public.stock_layers;
+create policy stock_layers_read      on public.stock_layers        for select using (public.is_active_user());
+drop policy if exists stock_movements_read on public.stock_movements;
+create policy stock_movements_read   on public.stock_movements     for select using (public.is_active_user());
+drop policy if exists purchases_read on public.purchases;
+create policy purchases_read         on public.purchases           for select using (public.is_active_user());
+drop policy if exists purchase_lines_read on public.purchase_lines;
+create policy purchase_lines_read    on public.purchase_lines      for select using (public.is_active_user());
+drop policy if exists supplier_payments_read on public.supplier_payments;
+create policy supplier_payments_read on public.supplier_payments   for select using (public.is_active_user());
+drop policy if exists payment_alloc_read on public.payment_allocations;
+create policy payment_alloc_read     on public.payment_allocations for select using (public.is_active_user());
+drop policy if exists maceration_read on public.maceration_batches;
+create policy maceration_read        on public.maceration_batches  for select using (public.is_active_user());
+drop policy if exists maceration_inputs_read on public.maceration_inputs;
+create policy maceration_inputs_read on public.maceration_inputs   for select using (public.is_active_user());
+drop policy if exists bottling_read on public.bottling_runs;
+create policy bottling_read          on public.bottling_runs       for select using (public.is_active_user());
+drop policy if exists packaging_read on public.packaging_runs;
+create policy packaging_read         on public.packaging_runs      for select using (public.is_active_user());
+
+revoke insert, update, delete on
+  public.stock_layers, public.stock_movements, public.purchases, public.purchase_lines,
+  public.supplier_payments, public.payment_allocations, public.maceration_batches,
+  public.maceration_inputs, public.bottling_runs, public.packaging_runs
+  from anon, authenticated;
+
+revoke all on public.payables_open, public.inventory_status from public, anon;
+grant select on public.payables_open, public.inventory_status to authenticated;
+
+-- Internal helpers: not callable from the browser
+revoke all on function public.stock_in(text,uuid,uuid,uuid,date,numeric,numeric,text,uuid,uuid) from public, anon, authenticated;
+revoke all on function public.stock_out(text,uuid,numeric,date,text,uuid) from public, anon, authenticated;
+revoke all on function public.consume_material(uuid,text,numeric,numeric,date,text,uuid) from public, anon, authenticated;
+revoke all on function public.post_module_entry(date,text,text,jsonb,text,uuid,uuid) from public, anon, authenticated;
+revoke all on function public.reverse_module_entry(uuid,text,text,uuid) from public, anon, authenticated;
+
+-- Actions the app may call
+revoke all on function public.record_purchase(date,uuid,text,text,date,text,jsonb) from public, anon;
+revoke all on function public.record_supplier_payment(date,uuid,text,text,text,jsonb) from public, anon;
+revoke all on function public.void_purchase(uuid,text) from public, anon;
+revoke all on function public.void_supplier_payment(uuid,text) from public, anon;
+revoke all on function public.start_maceration(uuid,date,text,jsonb) from public, anon;
+revoke all on function public.complete_maceration(uuid,date,numeric) from public, anon;
+revoke all on function public.record_bottling(date,uuid,int,uuid,uuid,int,text) from public, anon;
+revoke all on function public.record_packaging(date,uuid,int,uuid,uuid,uuid,int,text) from public, anon;
+
+grant execute on function public.record_purchase(date,uuid,text,text,date,text,jsonb) to authenticated;
+grant execute on function public.record_supplier_payment(date,uuid,text,text,text,jsonb) to authenticated;
+grant execute on function public.void_purchase(uuid,text) to authenticated;
+grant execute on function public.void_supplier_payment(uuid,text) to authenticated;
+grant execute on function public.start_maceration(uuid,date,text,jsonb) to authenticated;
+grant execute on function public.complete_maceration(uuid,date,numeric) to authenticated;
+grant execute on function public.record_bottling(date,uuid,int,uuid,uuid,int,text) to authenticated;
+grant execute on function public.record_packaging(date,uuid,int,uuid,uuid,uuid,int,text) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- 10. Checks (run one at a time) ----------------------------
+-- select count(*) from public.accounts;                      -- expect 35 (34 + Production Loss)
+-- select maceration_days, normal_loss_pct from public.business_settings;   -- 60, 0.0300
+-- select * from public.materials;                            -- empty until you add some
+
+-- ---------- 11. TEST DATA RESET (only while you are still testing!) ---
+-- Wipes ALL transactions, including journal entries, so re-post your owner capital afterwards.
+-- Master data (customers, suppliers, perfumes, materials, accounts) is kept.
+-- truncate public.payment_allocations, public.supplier_payments, public.purchase_lines, public.purchases,
+--          public.bottling_runs, public.packaging_runs, public.maceration_inputs, public.maceration_batches,
+--          public.stock_movements, public.stock_layers, public.journal_lines, public.journal_entries;
+-- alter sequence public.journal_no_seq restart;
+-- alter sequence public.purchase_no_seq restart;
+-- alter sequence public.payment_no_seq restart;
+-- alter sequence public.maceration_no_seq restart;
+-- alter sequence public.bottling_no_seq restart;
+-- alter sequence public.packaging_no_seq restart;

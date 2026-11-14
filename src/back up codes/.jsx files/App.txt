@@ -1,0 +1,297 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import Layout from './components/Layout';
+import Login from './components/Login';
+import UserManagement from './components/UserManagement';
+import ChangePassword from './components/ChangePassword';
+import Customers from './components/Customers';
+import Suppliers from './components/Suppliers';
+import Collection from './components/Collection';
+import Ledger from './components/Ledger';
+import Reports from './components/Reports';
+import Inventory, { InventoryAlertBanner } from './components/Inventory';
+import Procurement from './components/Procurement';
+import Maceration from './components/Maceration';
+import Bottling from './components/Bottling';
+import Packaging from './components/Packaging';
+import StockWriteoffs from './components/StockWriteoffs';
+import RawMaterials from './components/RawMaterials';
+import { EmptyState, peso, fmtDate } from './components/ui';
+import { supabase } from './supabaseClient';
+import { Sparkles, ArrowUpRight, Database, FileText, FlaskConical, BookOpen } from 'lucide-react';
+
+function StatCard({ title, value, caption, icon: Icon, onClick }) {
+  return (
+    <button type="button" onClick={onClick} className="cs-card cs-card-hover p-6 text-left w-full cursor-pointer">
+      <div className="flex items-center justify-between mb-5">
+        <span className="text-xs font-medium text-[#a8a090] uppercase tracking-wider">{title}</span>
+        <span className="p-2.5 rounded-xl bg-[#1c1916] border border-[#2a2622]">
+          <Icon className="w-5 h-5 text-[#d9b24c]" aria-hidden="true" />
+        </span>
+      </div>
+      <div className="font-serif text-3xl font-semibold mb-1">{value}</div>
+      <div className="text-xs text-[#a8a090]">{caption}</div>
+    </button>
+  );
+}
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [booting, setBooting] = useState(true);
+  const [authNotice, setAuthNotice] = useState('');
+  const [activeTab, setActiveTab] = useState('dashboard');
+
+  const [summary, setSummary] = useState({ entryCount: 0, recent: [], perfumeCount: 0, inventoryValue: 0 });
+
+  // ───── Auth: load profile, restore session, sign out, idle timeout ─────
+  const loadProfile = async (authUserId) => {
+    const { data, error } = await supabase.from('profiles').select('*').eq('id', authUserId).maybeSingle();
+    let problem = '';
+    if (error || !data) problem = 'This account is not set up yet. Please contact the owner.';
+    else if (data.status === 'Revoked') problem = 'Your user credential has been revoked. Please contact the management.';
+    else if (data.status !== 'Active') problem = 'Your account is awaiting approval.';
+    if (problem) {
+      await supabase.auth.signOut();
+      return { profile: null, problem };
+    }
+    return { profile: data, problem: '' };
+  };
+
+  const handleSignedIn = async (authUserId) => {
+    const result = await loadProfile(authUserId);
+    if (result.profile) {
+      setAuthNotice('');
+      setUser(result.profile);
+    }
+    return result;
+  };
+
+  const handleSignOut = async (notice) => {
+    await supabase.auth.signOut();
+    setUser(null);
+    setActiveTab('dashboard');
+    setAuthNotice(typeof notice === 'string' ? notice : '');
+  };
+
+  // Keep people signed in across refreshes
+  useEffect(() => {
+    let active = true;
+    supabase.auth.getSession().then(async ({ data }) => {
+      if (data.session) {
+        const { profile, problem } = await loadProfile(data.session.user.id);
+        if (active) {
+          setUser(profile);
+          if (problem) setAuthNotice(problem);
+        }
+      }
+      if (active) setBooting(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') setUser(null);
+    });
+    return () => {
+      active = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  // Sign out after 20 minutes without activity
+  useEffect(() => {
+    if (!user) return;
+    const IDLE_MS = 20 * 60 * 1000;
+    let timer;
+    const reset = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => handleSignOut('You were signed out after 20 minutes of inactivity.'), IDLE_MS);
+    };
+    const events = ['mousemove', 'keydown', 'click', 'scroll', 'touchstart'];
+    events.forEach((ev) => window.addEventListener(ev, reset, { passive: true }));
+    reset();
+    return () => {
+      clearTimeout(timer);
+      events.forEach((ev) => window.removeEventListener(ev, reset));
+    };
+  }, [user]);
+
+  // ───── Dashboard numbers from the database ─────
+  const loadSummary = useCallback(async () => {
+    // Book any month-end interest that has become due on installment purchases (no-op when none)
+    await supabase.rpc('accrue_installment_interest');
+    const [je, pf, tb] = await Promise.all([
+      supabase
+        .from('journal_entries')
+        .select('id, entry_no, entry_date, description, journal_lines(debit)', { count: 'exact' })
+        .order('entry_no', { ascending: false })
+        .limit(4),
+      supabase.from('perfumes').select('id', { count: 'exact', head: true }),
+      supabase.rpc('trial_balance'),
+    ]);
+
+    const inventoryValue = (tb.data || [])
+      .filter((r) => r.code.startsWith('12') || r.code.startsWith('13'))
+      .reduce((sum, r) => sum + Number(r.debit || 0) - Number(r.credit || 0), 0);
+
+    setSummary({
+      entryCount: je.count || 0,
+      recent: (je.data || []).map((e) => ({
+        id: e.id,
+        no: e.entry_no,
+        date: e.entry_date,
+        desc: e.description,
+        total: (e.journal_lines || []).reduce((s, l) => s + Number(l.debit || 0), 0),
+      })),
+      perfumeCount: pf.count || 0,
+      inventoryValue,
+    });
+  }, []);
+
+  const signedIn = !!user && !user.must_change_password;
+  useEffect(() => {
+    if (signedIn && activeTab === 'dashboard') loadSummary();
+  }, [signedIn, activeTab, loadSummary]);
+
+  if (booting) {
+    return (
+      <div className="min-h-screen bg-[#0e0d0c] flex items-center justify-center text-sm text-[#a8a090]">
+        Loading...
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <Login onSignedIn={handleSignedIn} notice={authNotice} />;
+  }
+
+  // First sign in with a temporary password: must choose a new one before anything else
+  if (user.must_change_password) {
+    return (
+      <ChangePassword
+        user={user}
+        onDone={() => setUser({ ...user, must_change_password: false })}
+        onSignOut={handleSignOut}
+      />
+    );
+  }
+
+  return (
+    <Layout activeTab={activeTab} setActiveTab={setActiveTab} onSignOut={handleSignOut} user={user}>
+      {/* ───────── Dashboard ───────── */}
+      {activeTab === 'dashboard' && (
+        <div className="space-y-6">
+          <InventoryAlertBanner onOpen={() => setActiveTab('stock')} />
+          <section
+            className="relative overflow-hidden cs-card p-8 lg:p-10 shadow-2xl"
+            style={{ background: 'radial-gradient(600px 240px at 90% 0%, #251f10, #161412 70%)' }}
+          >
+            <div className="relative max-w-2xl">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#d9b24c]/10 border border-[#d9b24c]/30 text-[#e3bf5a] text-xs font-medium mb-4">
+                <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Chinito Scento Architecture</span>
+              </div>
+              <h1 className="font-serif text-4xl lg:text-5xl font-semibold leading-[1.1] mb-4">
+                Perfumery Manufacturing &amp; Management System
+              </h1>
+              <p className="text-[#a8a090] text-base leading-relaxed mb-7 max-w-xl">
+                Built on a Journal-Entry-First accounting framework. Every operational action flows from immutable ledger events to inventory balances.
+              </p>
+              <div className="flex flex-wrap gap-3">
+                <button onClick={() => setActiveTab('ledger')} className="cs-btn cs-btn-gold px-5 py-3">
+                  <span>{user.role === 'owner' ? 'New Journal Entry' : 'View Journal Ledger'}</span>
+                  <ArrowUpRight className="w-4 h-4" aria-hidden="true" />
+                </button>
+                <button onClick={() => setActiveTab('inventory')} className="cs-btn cs-btn-ghost px-5 py-3">
+                  <Database className="w-4 h-4 text-[#d9b24c]" aria-hidden="true" />
+                  <span>Audit Signature Catalog</span>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+            <StatCard
+              title="Total Ledger Entries"
+              value={summary.entryCount.toString()}
+              caption={summary.entryCount === 0 ? 'Awaiting initial posting' : 'Posted to the ledger'}
+              icon={FileText}
+              onClick={() => setActiveTab('ledger')}
+            />
+            <StatCard
+              title="Signature Fragrances"
+              value={`${summary.perfumeCount} Formulations`}
+              caption="Loaded collection catalog"
+              icon={Sparkles}
+              onClick={() => setActiveTab('inventory')}
+            />
+            <StatCard
+              title="Inventory at Cost"
+              value={peso(summary.inventoryValue)}
+              caption="Materials, work in process and goods"
+              icon={Database}
+              onClick={() => setActiveTab('ledger')}
+            />
+          </section>
+
+          <section className="grid grid-cols-1 lg:grid-cols-5 gap-5">
+            <div className="cs-card p-6 lg:col-span-3">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-[15px] font-semibold">Recent journal entries</h3>
+                {summary.recent.length > 0 && (
+                  <button onClick={() => setActiveTab('ledger')} className="text-xs text-[#e3bf5a] hover:underline cursor-pointer">
+                    View all
+                  </button>
+                )}
+              </div>
+              {summary.recent.length === 0 ? (
+                <EmptyState
+                  icon={BookOpen}
+                  title="No entries yet"
+                  text="Posted journal entries will appear here as they happen."
+                  actionLabel={user.role === 'owner' ? 'Record first entry' : undefined}
+                  onAction={() => setActiveTab('ledger')}
+                />
+              ) : (
+                <ul>
+                  {summary.recent.map((je) => (
+                    <li key={je.id} className="flex items-center justify-between gap-4 px-2.5 py-3 rounded-lg text-sm hover:bg-[#1c1916] transition-colors">
+                      <span>
+                        <span className="font-mono text-xs text-[#e3bf5a] mr-3">JE-{String(je.no).padStart(8, '0')}</span>
+                        {je.desc}
+                        <span className="block text-xs text-[#a8a090] mt-0.5">{fmtDate(je.date)}</span>
+                      </span>
+                      <span className="font-mono text-[#a8a090] whitespace-nowrap">{peso(je.total)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="cs-card p-6 lg:col-span-2">
+              <h3 className="text-[15px] font-semibold mb-2">Maceration Lab</h3>
+              <EmptyState
+                icon={FlaskConical}
+                title="No active batches"
+                text="Aging batches and their progress will show here."
+                actionLabel="Open Maceration Lab"
+                onAction={() => setActiveTab('maceration')}
+              />
+            </div>
+          </section>
+        </div>
+      )}
+
+      {activeTab === 'customers' && <Customers user={user} />}
+      {activeTab === 'suppliers' && <Suppliers />}
+      {activeTab === 'inventory' && <Collection />}
+      {activeTab === 'materials' && <RawMaterials user={user} onNavigate={setActiveTab} onChanged={loadSummary} />}
+      {activeTab === 'stock' && <Inventory user={user} onNavigate={setActiveTab} onChanged={loadSummary} />}
+      {activeTab === 'procurement' && <Procurement user={user} onChanged={loadSummary} />}
+      {activeTab === 'maceration' && <Maceration user={user} onChanged={loadSummary} />}
+      {activeTab === 'bottling' && <Bottling user={user} onChanged={loadSummary} />}
+      {activeTab === 'packaging' && <Packaging user={user} onChanged={loadSummary} />}
+      {activeTab === 'writeoffs' && <StockWriteoffs user={user} onChanged={loadSummary} />}
+      {activeTab === 'ledger' && <Ledger user={user} onChanged={loadSummary} />}
+      {activeTab === 'reports' && user.role === 'owner' && <Reports user={user} />}
+
+      {activeTab === 'users' && user.role === 'owner' && <UserManagement />}
+    </Layout>
+  );
+}

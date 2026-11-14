@@ -1,0 +1,295 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Droplets, PlusCircle, Ban } from 'lucide-react';
+import { supabase } from '../supabaseClient';
+import { EmptyState, PageHeader, ErrorNote, Modal, nz, peso, fmtDate } from './ui';
+
+const todayLocal = () => new Date().toLocaleDateString('en-CA');
+const pad = (n) => String(n).padStart(8, '0');
+const qty = (v) => Number(v || 0).toLocaleString('en-PH', { maximumFractionDigits: 3 });
+
+function Badge({ tone, children }) {
+  const tones = {
+    green: 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30',
+    amber: 'bg-[#e5a93d]/10 text-[#e5a93d] border-[#e5a93d]/30',
+    red: 'bg-[#e5736d]/10 text-[#e5736d] border-[#e5736d]/30',
+    gray: 'bg-[#1c1916] text-[#a8a090] border-[#2a2622]',
+  };
+  return <span className={`inline-flex px-2.5 py-0.5 rounded-full text-[10px] font-medium border ${tones[tone]}`}>{children}</span>;
+}
+
+function MaterialSelect({ id, label, cat, value, onChange, mats, hideLabel }) {
+  const options = mats.filter((m) => (Array.isArray(cat) ? cat.includes(m.group_name) : m.group_name === cat));
+  return (
+    <div>
+      <label htmlFor={id} className={hideLabel ? 'sr-only' : 'cs-label'}>{label}</label>
+      <select id={id} value={value} onChange={(e) => onChange(e.target.value)} className="cs-input px-3 py-2.5">
+        <option value="">Select...</option>
+        {options.map((m) => (
+          <option key={m.item_id} value={m.item_id}>
+            {m.item_name} - {qty(m.on_hand)} {m.unit} on hand
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function Stat({ label, value, tone }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-[#a8a090]">{label}</div>
+      <div className={`font-mono ${tone || ''}`}>{value}</div>
+    </div>
+  );
+}
+
+export default function Bottling({ user, onChanged }) {
+  const isOwner = user?.role === 'owner';
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [sizes, setSizes] = useState([]);
+  const [stock, setStock] = useState([]); // inventory_status rows
+  const [runs, setRuns] = useState([]);
+  const [saving, setSaving] = useState(false);
+
+  // bottling
+  const [btOpen, setBtOpen] = useState(false);
+  const [bt, setBt] = useState({ date: todayLocal(), size: '', qty: '', spoiled: '0', bottle: '', sticker: '', notes: '' });
+  const [btError, setBtError] = useState('');
+
+  // void
+  const [voiding, setVoiding] = useState(null);
+  const [reason, setReason] = useState('');
+  const [voidError, setVoidError] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError('');
+    const [sz, inv, rn] = await Promise.all([
+      supabase.from('perfume_sizes').select('id, size_ml, perfume_id, perfumes(name, status)').eq('is_active', true),
+      supabase.from('inventory_status').select('*'),
+      supabase.from('bottling_runs').select('*, perfume_sizes(size_ml, perfumes(name))').order('run_no', { ascending: false }).limit(100),
+    ]);
+    const err = [sz, inv, rn].find((r) => r.error);
+    if (err) setLoadError(err.error.message);
+    setSizes((sz.data || []).filter((s) => s.perfumes && s.perfumes.status !== 'Discontinued'));
+    setStock(inv.data || []);
+    setRuns(rn.data || []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const afterChange = async () => {
+    await load();
+    onChanged && onChanged();
+  };
+
+  const mats = useMemo(() => stock.filter((r) => r.kind === 'material'), [stock]);
+  const matById = useMemo(() => Object.fromEntries(mats.map((m) => [m.item_id, m])), [mats]);
+  const finishedBySize = useMemo(() => Object.fromEntries(stock.filter((r) => r.kind === 'finished').map((r) => [r.item_id, r])), [stock]);
+  const sizeOptions = useMemo(
+    () => [...sizes].sort((a, b) => a.perfumes.name.localeCompare(b.perfumes.name) || Number(a.size_ml) - Number(b.size_ml)),
+    [sizes]
+  );
+  const sizeName = (r) => (r.perfume_sizes ? `${r.perfume_sizes.perfumes?.name} · ${qty(r.perfume_sizes.size_ml)} ml` : '-');
+
+  // ---------- bottling ----------
+  const openBottling = () => {
+    setBt({ date: todayLocal(), size: '', qty: '', spoiled: '0', bottle: '', sticker: '', notes: '' });
+    setBtError('');
+    setBtOpen(true);
+  };
+  const btSize = sizes.find((s) => s.id === bt.size);
+  const btStock = finishedBySize[bt.size];
+  const btQty = parseInt(bt.qty, 10) || 0;
+  const btSpoiled = parseInt(bt.spoiled, 10) || 0;
+  const btJuiceNeed = btSize ? btQty * Number(btSize.size_ml) : 0;
+
+  const saveBottling = async (e) => {
+    e.preventDefault();
+    if (!bt.size) return setBtError('Choose the perfume and size.');
+    if (!(btQty > 0)) return setBtError('Enter how many bottles were filled.');
+    if (!bt.bottle || !bt.sticker) return setBtError('Choose the bottle and the bottle sticker.');
+    if (btJuiceNeed > Number(btStock?.juice_ml || 0)) return setBtError(`Not enough matured juice: ${qty(btJuiceNeed)} ml needed, ${qty(btStock?.juice_ml)} ml available.`);
+    for (const id of [bt.bottle, bt.sticker]) {
+      if (btQty + btSpoiled > Number(matById[id]?.on_hand || 0)) return setBtError(`Not enough ${matById[id]?.item_name} in stock.`);
+    }
+    setSaving(true);
+    setBtError('');
+    const { error } = await supabase.rpc('record_bottling', {
+      p_date: bt.date || todayLocal(),
+      p_size: bt.size,
+      p_qty: btQty,
+      p_bottle: bt.bottle,
+      p_sticker: bt.sticker,
+      p_spoiled: btSpoiled,
+      p_notes: nz(bt.notes),
+    });
+    setSaving(false);
+    if (error) return setBtError(error.message);
+    setBtOpen(false);
+    await afterChange();
+  };
+
+
+  // ---------- void ----------
+  const openVoid = (row) => {
+    setVoiding(row);
+    setReason('');
+    setVoidError('');
+  };
+  const doVoid = async (e) => {
+    e.preventDefault();
+    if (!reason.trim()) return setVoidError('Please give a reason.');
+    setSaving(true);
+    setVoidError('');
+    const { error } = await supabase.rpc('void_bottling', { p_id: voiding.id, p_reason: reason.trim() });
+    setSaving(false);
+    if (error) return setVoidError(error.message);
+    setVoiding(null);
+    await afterChange();
+  };
+
+  return (
+    <div>
+      <PageHeader title="Bottling" subtitle="Matured juice, bottles and stickers turned into bottled perfume, costed from the oldest stock first">
+        <button onClick={openBottling} className="cs-btn cs-btn-gold px-4 py-2.5">
+          <PlusCircle className="w-4 h-4" aria-hidden="true" />
+          <span>Record Bottling</span>
+        </button>
+      </PageHeader>
+
+      <ErrorNote>{loadError}</ErrorNote>
+
+      {loading ? (
+        <p className="text-sm text-[#a8a090]">Loading...</p>
+      ) : (
+        <div className="cs-card overflow-hidden">
+          {runs.length === 0 ? (
+            <EmptyState icon={Droplets} title="No bottling yet" text="Bottling uses matured juice, a bottle and a bottle sticker." actionLabel="Record Bottling" onAction={openBottling} />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-[#1a1816] text-xs uppercase tracking-wider text-[#a8a090] border-b border-[#2a2622]">
+                  <tr>
+                    <th className="px-4 py-3 font-medium">Run</th>
+                    <th className="px-4 py-3 font-medium">Date</th>
+                    <th className="px-4 py-3 font-medium">Perfume</th>
+                    <th className="px-4 py-3 font-medium text-right">Bottles</th>
+                    <th className="px-4 py-3 font-medium text-right">Juice used</th>
+                    <th className="px-4 py-3 font-medium text-right">Spoiled</th>
+                    <th className="px-4 py-3 font-medium text-right">Cost per bottle</th>
+                    <th className="px-4 py-3 font-medium text-right">Total cost</th>
+                    <th className="px-4 py-3 font-medium">Status</th>
+                    {isOwner && <th className="px-4 py-3"><span className="sr-only">Actions</span></th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#24201c]">
+                  {runs.map((r) => (
+                    <tr key={r.id} className={`hover:bg-[#1c1916] transition-colors ${r.status === 'Voided' ? 'opacity-60' : ''}`}>
+                      <td className="px-4 py-3 font-mono text-xs text-[#e3bf5a]">BT-{pad(r.run_no)}</td>
+                      <td className="px-4 py-3 text-xs text-[#a8a090] whitespace-nowrap">{fmtDate(r.run_date)}</td>
+                      <td className="px-4 py-3">{sizeName(r)}</td>
+                      <td className="px-4 py-3 text-right font-mono">{qty(r.qty)}</td>
+                      <td className="px-4 py-3 text-right font-mono">{qty(r.juice_ml)} ml</td>
+                      <td className="px-4 py-3 text-right font-mono">{r.spoiled_qty > 0 ? `${r.spoiled_qty} (${peso(r.spoiled_cost)})` : '-'}</td>
+                      <td className="px-4 py-3 text-right font-mono">{peso(Number(r.bottled_cost) / r.qty)}</td>
+                      <td className="px-4 py-3 text-right font-mono">{peso(r.bottled_cost)}</td>
+                      <td className="px-4 py-3">
+                        <Badge tone={r.status === 'Voided' ? 'red' : 'green'}>{r.status || 'Posted'}</Badge>
+                        {r.status === 'Voided' && r.void_reason && <div className="text-[10px] text-[#a8a090] mt-1">{r.void_reason}</div>}
+                      </td>
+                      {isOwner && (
+                        <td className="px-4 py-3 text-right">
+                          {(r.status || 'Posted') === 'Posted' && (
+                            <button onClick={() => openVoid(r)} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs" aria-label={`Void BT-${pad(r.run_no)}`}>
+                              <Ban className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+                              <span>Void</span>
+                            </button>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------- Bottling ---------- */}
+      {btOpen && (
+        <Modal title="Record Bottling" onClose={() => setBtOpen(false)}>
+          <form onSubmit={saveBottling} className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="sm:col-span-2">
+                <label htmlFor="bt-size" className="cs-label">Perfume and size</label>
+                <select id="bt-size" value={bt.size} onChange={(e) => setBt((p) => ({ ...p, size: e.target.value }))} className="cs-input px-3 py-2.5">
+                  <option value="">Select...</option>
+                  {sizeOptions.map((s) => (
+                    <option key={s.id} value={s.id}>{s.perfumes.name} · {qty(s.size_ml)} ml</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="bt-date" className="cs-label">Date</label>
+                <input id="bt-date" type="date" value={bt.date} onChange={(e) => setBt((p) => ({ ...p, date: e.target.value }))} required className="cs-input px-3 py-2.5" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="bt-qty" className="cs-label">Bottles filled</label>
+                <input id="bt-qty" type="number" min="1" step="1" value={bt.qty} onChange={(e) => setBt((p) => ({ ...p, qty: e.target.value }))} className="cs-input px-3 py-2.5 text-right" />
+              </div>
+              <div>
+                <label htmlFor="bt-sp" className="cs-label">Spoiled bottles (optional)</label>
+                <input id="bt-sp" type="number" min="0" step="1" value={bt.spoiled} onChange={(e) => setBt((p) => ({ ...p, spoiled: e.target.value }))} className="cs-input px-3 py-2.5 text-right" />
+              </div>
+            </div>
+            <MaterialSelect id="bt-bottle" label="Bottle" cat="bottle" value={bt.bottle} onChange={(v) => setBt((p) => ({ ...p, bottle: v }))} mats={mats} />
+            <MaterialSelect id="bt-sticker" label="Bottle sticker" cat="bottle_sticker" value={bt.sticker} onChange={(v) => setBt((p) => ({ ...p, sticker: v }))} mats={mats} />
+            {btSize && (
+              <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 grid grid-cols-2 gap-3 text-sm">
+                <Stat label="Juice needed" value={`${qty(btJuiceNeed)} ml`} />
+                <Stat label="Matured juice available" value={`${qty(btStock?.juice_ml)} ml`} tone={btJuiceNeed > Number(btStock?.juice_ml || 0) ? 'text-[#e5736d]' : 'text-[#3ecf8e]'} />
+              </div>
+            )}
+            <div>
+              <label htmlFor="bt-notes" className="cs-label">Notes (optional)</label>
+              <input id="bt-notes" value={bt.notes} onChange={(e) => setBt((p) => ({ ...p, notes: e.target.value }))} className="cs-input px-3 py-2.5" />
+            </div>
+            <p className="text-[11px] text-[#a8a090]">Spoiled bottles and their stickers are charged to Production Loss, not to the perfume&rsquo;s cost.</p>
+            <ErrorNote>{btError}</ErrorNote>
+            <div className="pt-2 flex justify-end gap-3">
+              <button type="button" onClick={() => setBtOpen(false)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
+              <button type="submit" disabled={saving} className="cs-btn cs-btn-gold px-5 py-2.5">{saving ? 'Posting...' : 'Post Bottling'}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+
+      {/* ---------- Void ---------- */}
+      {voiding && (
+        <Modal title={`Void BT-${pad(voiding.run_no)}`} onClose={() => setVoiding(null)}>
+          <form onSubmit={doVoid} className="space-y-4">
+            <p className="text-sm text-[#a8a090]">This puts the juice, bottles and stickers back in stock, removes the bottled perfume it created and reverses the journal entry. It only works if none of these bottles have been packaged yet.</p>
+            <div>
+              <label htmlFor="void-reason" className="cs-label">Reason</label>
+              <input id="void-reason" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Entered twice" required autoFocus className="cs-input px-3.5 py-2.5" />
+            </div>
+            <ErrorNote>{voidError}</ErrorNote>
+            <div className="pt-2 flex justify-end gap-3">
+              <button type="button" onClick={() => setVoiding(null)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
+              <button type="submit" disabled={saving} className="cs-btn cs-btn-gold px-5 py-2.5">{saving ? 'Voiding...' : 'Void'}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}

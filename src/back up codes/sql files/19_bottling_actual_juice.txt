@@ -1,0 +1,228 @@
+alter table public.business_settings
+  add column if not exists bottling_variance_pct numeric(5,2) not null default 15
+  check (bottling_variance_pct >= 0 and bottling_variance_pct <= 100);
+
+alter table public.bottling_runs
+  add column if not exists std_juice_ml numeric(14,3);
+
+create sequence if not exists public.bottling_request_no_seq;
+
+create table if not exists public.bottling_requests (
+  id                  uuid primary key default gen_random_uuid(),
+  request_no          bigint not null unique default nextval('public.bottling_request_no_seq'),
+  run_date            date not null,
+  size_id             uuid not null references public.perfume_sizes(id),
+  qty                 int not null check (qty > 0),
+  spoiled_qty         int not null default 0 check (spoiled_qty >= 0),
+  bottle_material_id  uuid references public.materials(id),
+  sticker_material_id uuid references public.materials(id),
+  actual_juice_ml     numeric(14,3) not null check (actual_juice_ml > 0),
+  std_juice_ml        numeric(14,3) not null,
+  variance_pct        numeric(7,2) not null,
+  notes               text,
+  status              text not null default 'Pending' check (status in ('Pending','Approved','Rejected')),
+  run_id              uuid,
+  reject_reason       text,
+  decided_by          uuid references auth.users(id),
+  decided_at          timestamptz,
+  created_by          uuid references auth.users(id) default auth.uid(),
+  created_at          timestamptz not null default now()
+);
+
+alter table public.bottling_requests enable row level security;
+drop policy if exists bottling_requests_read on public.bottling_requests;
+create policy bottling_requests_read on public.bottling_requests for select using (public.is_active_user());
+revoke insert, update, delete on public.bottling_requests from anon, authenticated;
+
+drop function if exists public.record_bottling(date, uuid, int, uuid, uuid, int, text);
+
+create or replace function public.post_bottling_internal(
+  p_date date, p_size uuid, p_qty int, p_bottle uuid, p_sticker uuid, p_spoiled int, p_notes text,
+  p_actual_ml numeric
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_spoiled int := coalesce(p_spoiled, 0);
+  v_sz public.perfume_sizes;
+  v_pf public.perfumes;
+  v_std numeric;
+  v_ml numeric;
+  v_juice numeric(14,2);
+  v_bt numeric; v_bs numeric;
+  v_st numeric; v_ss numeric;
+  v_mats numeric(14,2);
+  v_spoil numeric(14,2);
+  v_bottled numeric(14,2);
+  v_lines jsonb := '[]'::jsonb;
+  v_je uuid;
+  v_label text;
+begin
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many bottles were filled.'; end if;
+  if v_spoiled < 0 then raise exception 'Spoiled units cannot be negative.'; end if;
+
+  select * into v_sz from public.perfume_sizes where id = p_size and is_active;
+  if not found then raise exception 'Choose a perfume size.'; end if;
+  select * into v_pf from public.perfumes where id = v_sz.perfume_id and status <> 'Discontinued';
+  if not found then raise exception 'This perfume is discontinued.'; end if;
+
+  v_std := p_qty * v_sz.size_ml;
+  v_ml := coalesce(p_actual_ml, v_std);
+  if v_ml <= 0 then raise exception 'The juice used must be more than zero.'; end if;
+
+  v_no := nextval('public.bottling_no_seq');
+  v_label := 'BT-' || lpad(v_no::text, 4, '0');
+
+  v_juice := public.stock_out('juice', v_pf.id, v_ml, v_date, 'bottling', v_id);
+  select o_total, o_spoiled into v_bt, v_bs
+    from public.consume_material(p_bottle, 'bottle', p_qty, v_spoiled, v_date, 'bottling', v_id);
+  select o_total, o_spoiled into v_st, v_ss
+    from public.consume_material(p_sticker, 'bottle_sticker', p_qty, v_spoiled, v_date, 'bottling', v_id);
+
+  v_mats := v_bt + v_st;
+  v_spoil := v_bs + v_ss;
+  v_bottled := v_juice + (v_mats - v_spoil);
+
+  if v_bottled + v_spoil <= 0 then
+    raise exception 'The materials used have no recorded cost, so nothing can be posted.';
+  end if;
+
+  if v_bottled > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1320', 'debit', v_bottled, 'memo', v_label || ' ' || v_pf.name || ' ' || v_sz.size_ml || ' ml'));
+  end if;
+  if v_spoil > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '5110', 'debit', v_spoil, 'memo', 'Spoiled bottles/stickers'));
+  end if;
+  if v_juice > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1310', 'credit', v_juice, 'memo', 'Juice used'));
+  end if;
+  if v_mats > 0 then
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1220', 'credit', v_mats, 'memo', 'Bottles and stickers used'));
+  end if;
+
+  v_je := public.post_module_entry(v_date, v_label,
+            'Bottling ' || v_label || ' - ' || p_qty || ' x ' || v_pf.name || ' ' || v_sz.size_ml || ' ml',
+            v_lines, 'bottling', v_id);
+
+  insert into public.bottling_runs
+    (id, run_no, run_date, perfume_id, size_id, qty, spoiled_qty, juice_ml, std_juice_ml, juice_cost,
+     bottle_material_id, sticker_material_id, materials_cost, spoiled_cost, bottled_cost, notes, journal_entry_id)
+  values
+    (v_id, v_no, v_date, v_pf.id, v_sz.id, p_qty, v_spoiled, v_ml, v_std, v_juice,
+     p_bottle, p_sticker, v_mats, v_spoil, v_bottled, nullif(trim(coalesce(p_notes, '')), ''), v_je);
+
+  perform public.stock_in('bottled', null, null, v_sz.id, v_date, p_qty, v_bottled, 'bottling', v_id);
+  return v_id;
+end;
+$$;
+
+create or replace function public.record_bottling(
+  p_date date, p_size uuid, p_qty int, p_bottle uuid, p_sticker uuid, p_spoiled int, p_notes text,
+  p_actual_ml numeric default null, p_confirm boolean default false
+) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  v_sz public.perfume_sizes;
+  v_std numeric;
+  v_avail numeric;
+  v_ml numeric;
+  v_var numeric;
+  v_thr numeric;
+  v_run uuid;
+  v_req uuid;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many bottles were filled.'; end if;
+  if p_bottle is null or p_sticker is null then raise exception 'Choose the bottle and the bottle sticker.'; end if;
+  if p_actual_ml is not null and p_actual_ml <= 0 then raise exception 'The juice used must be more than zero.'; end if;
+
+  select * into v_sz from public.perfume_sizes where id = p_size and is_active;
+  if not found then raise exception 'Choose a perfume size.'; end if;
+
+  v_std := p_qty * v_sz.size_ml;
+  select coalesce(sum(qty_remaining), 0) into v_avail
+    from public.stock_layers where stock_kind = 'juice' and perfume_id = v_sz.perfume_id;
+  if p_actual_ml is not null then
+    v_ml := p_actual_ml;
+  elsif v_std > v_avail and v_avail > 0 then
+    v_ml := v_avail;
+  else
+    v_ml := v_std;
+  end if;
+  v_var := round(abs(v_ml - v_std) * 100 / v_std, 2);
+  select coalesce(bottling_variance_pct, 15) into v_thr from public.business_settings where id;
+  v_thr := coalesce(v_thr, 15);
+
+  if v_var > v_thr then
+    if public.is_owner() then
+      if not coalesce(p_confirm, false) then
+        raise exception 'The juice used (% ml) is % percent away from the catalogue amount (% ml). Confirm it to continue.', v_ml, v_var, v_std;
+      end if;
+    else
+      insert into public.bottling_requests
+        (run_date, size_id, qty, spoiled_qty, bottle_material_id, sticker_material_id,
+         actual_juice_ml, std_juice_ml, variance_pct, notes)
+      values
+        (coalesce(p_date, current_date), p_size, p_qty, coalesce(p_spoiled, 0), p_bottle, p_sticker,
+         v_ml, v_std, v_var, nullif(trim(coalesce(p_notes, '')), ''))
+      returning id into v_req;
+      return jsonb_build_object('status', 'Pending', 'id', v_req);
+    end if;
+  end if;
+
+  v_run := public.post_bottling_internal(p_date, p_size, p_qty, p_bottle, p_sticker, p_spoiled, p_notes, v_ml);
+  return jsonb_build_object('status', 'Posted', 'id', v_run);
+end;
+$$;
+
+create or replace function public.approve_bottling_request(p_id uuid)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  q public.bottling_requests;
+  v_run uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can approve a bottling request.'; end if;
+  select * into q from public.bottling_requests where id = p_id for update;
+  if not found then raise exception 'Request not found.'; end if;
+  if q.status <> 'Pending' then raise exception 'This request was already decided.'; end if;
+
+  v_run := public.post_bottling_internal(q.run_date, q.size_id, q.qty, q.bottle_material_id, q.sticker_material_id,
+                                         q.spoiled_qty, q.notes, q.actual_juice_ml);
+
+  update public.bottling_requests
+     set status = 'Approved', run_id = v_run, decided_by = auth.uid(), decided_at = now()
+   where id = p_id;
+  return v_run;
+end;
+$$;
+
+create or replace function public.reject_bottling_request(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  q public.bottling_requests;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can reject a bottling request.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+  select * into q from public.bottling_requests where id = p_id for update;
+  if not found then raise exception 'Request not found.'; end if;
+  if q.status <> 'Pending' then raise exception 'This request was already decided.'; end if;
+
+  update public.bottling_requests
+     set status = 'Rejected', reject_reason = trim(p_reason), decided_by = auth.uid(), decided_at = now()
+   where id = p_id;
+end;
+$$;
+
+revoke all on function public.post_bottling_internal(date, uuid, int, uuid, uuid, int, text, numeric) from public, anon, authenticated;
+revoke all on function public.record_bottling(date, uuid, int, uuid, uuid, int, text, numeric, boolean) from public, anon;
+revoke all on function public.approve_bottling_request(uuid) from public, anon;
+revoke all on function public.reject_bottling_request(uuid, text) from public, anon;
+grant execute on function public.record_bottling(date, uuid, int, uuid, uuid, int, text, numeric, boolean) to authenticated;
+grant execute on function public.approve_bottling_request(uuid) to authenticated;
+grant execute on function public.reject_bottling_request(uuid, text) to authenticated;
+
+notify pgrst, 'reload schema';

@@ -1,0 +1,102 @@
+// Supabase Edge Function: create-user
+// Only an ACTIVE OWNER can call this. It creates the login (hashed password)
+// and the profile row together, and rolls back if either step fails.
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+const cors = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { ...cors, 'Content-Type': 'application/json' } });
+
+const USERNAME_RE = /^[A-Za-z0-9._]{3,30}$/;
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const PHONE_RE = /^[0-9+()\-\s]{7,20}$/;
+
+Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
+
+  try {
+    const url = Deno.env.get('SUPABASE_URL')!;
+    const anonKey = Deno.env.get('SUPABASE_ANON_KEY')!;
+    const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+
+    // 1. Who is calling?
+    const caller = createClient(url, anonKey, {
+      global: { headers: { Authorization: req.headers.get('Authorization') ?? '' } },
+    });
+    const { data: { user } } = await caller.auth.getUser();
+    if (!user) return json({ error: 'You are not signed in.' }, 401);
+
+    const admin = createClient(url, serviceKey);
+
+    // 2. Are they an active owner?
+    const { data: me } = await admin.from('profiles').select('role, status').eq('id', user.id).maybeSingle();
+    if (!me || me.role !== 'owner' || me.status !== 'Active') {
+      return json({ error: 'Only the owner can create accounts.' }, 403);
+    }
+
+    // 3. Validate input (the app checks too, but never trust the browser)
+    const b = await req.json();
+    const username = String(b.username ?? '').trim();
+    const firstName = String(b.first_name ?? '').trim();
+    const lastName = String(b.last_name ?? '').trim();
+    const email = String(b.email ?? '').trim().toLowerCase();
+    const contact = String(b.contact_number ?? '').trim();
+    const birthdate = String(b.birthdate ?? '');
+    const role = b.role === 'owner' ? 'owner' : 'user';
+    const password = String(b.password ?? '');
+
+    if (!USERNAME_RE.test(username)) return json({ error: 'Username must be 3-30 characters: letters, numbers, dot or underscore.' }, 400);
+    if (!firstName || !lastName) return json({ error: 'First and last name are required.' }, 400);
+    if (!EMAIL_RE.test(email)) return json({ error: 'Enter a valid email address.' }, 400);
+    if (!PHONE_RE.test(contact)) return json({ error: 'Enter a valid contact number.' }, 400);
+    const bd = new Date(birthdate);
+    if (Number.isNaN(bd.getTime()) || bd > new Date() || bd < new Date('1900-01-01')) {
+      return json({ error: 'Enter a valid birthdate.' }, 400);
+    }
+    if (password.length < 10 || !/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/\d/.test(password)) {
+      return json({ error: 'Temporary password needs 10+ characters with upper, lower and a number.' }, 400);
+    }
+
+    // 4. Friendly duplicate checks (the database also enforces them)
+    const { data: sameUsername } = await admin.from('profiles').select('id').eq('username', username).maybeSingle();
+    if (sameUsername) return json({ error: `The username "${username}" is already taken.` }, 409);
+    const { data: sameEmail } = await admin.from('profiles').select('id').eq('email', email).maybeSingle();
+    if (sameEmail) return json({ error: 'That email address is already registered.' }, 409);
+
+    // 5. Create the login, then the profile
+    const { data: created, error: createErr } = await admin.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+    });
+    if (createErr || !created.user) {
+      return json({ error: createErr?.message ?? 'Could not create the login.' }, 400);
+    }
+
+    const { error: profileErr } = await admin.from('profiles').insert({
+      id: created.user.id,
+      username,
+      first_name: firstName,
+      last_name: lastName,
+      birthdate,
+      email,
+      contact_number: contact,
+      role,
+      status: 'Active',
+      must_change_password: true,
+    });
+
+    if (profileErr) {
+      await admin.auth.admin.deleteUser(created.user.id); // roll back
+      return json({ error: profileErr.message }, 400);
+    }
+
+    return json({ ok: true, id: created.user.id });
+  } catch (err) {
+    return json({ error: err instanceof Error ? err.message : 'Unexpected error.' }, 500);
+  }
+});

@@ -1,0 +1,481 @@
+-- Chinito Scento: one-time correction of the Emily batch
+-- Take a backup first. Run the whole file in the Supabase SQL Editor.
+-- The call at the very bottom says false = dry run, nothing is saved.
+-- Read the report, then change false to true and run the whole file again to save.
+-- Nothing is voided or deleted. Correcting ADJ journal entries are added.
+
+create or replace function pg_temp.fx_add(
+  p_layer uuid, p_qty numeric, p_cost numeric, p_date date, p_ref_type text, p_ref_id uuid
+) returns void
+language plpgsql as $$
+begin
+  update public.stock_layers
+     set qty_in = qty_in + p_qty, cost_in = cost_in + p_cost,
+         qty_remaining = qty_remaining + p_qty, cost_remaining = cost_remaining + p_cost
+   where id = p_layer;
+  if not found then raise exception 'Stock layer % not found.', p_layer; end if;
+  insert into public.stock_movements (layer_id, move_date, move_type, qty, cost, ref_type, ref_id)
+  values (p_layer, p_date, 'in', p_qty, p_cost, p_ref_type, p_ref_id);
+end;
+$$;
+
+create or replace function pg_temp.fx_take(
+  p_layer uuid, p_qty numeric, p_date date, p_ref_type text, p_ref_id uuid
+) returns numeric
+language plpgsql as $$
+declare
+  l public.stock_layers;
+  v_cost numeric(14,2);
+begin
+  select * into l from public.stock_layers where id = p_layer for update;
+  if not found then raise exception 'Stock layer % not found.', p_layer; end if;
+  if p_qty <= 0 or p_qty > l.qty_remaining then
+    raise exception 'A stock layer has % left, so % cannot be taken from it.', l.qty_remaining, p_qty;
+  end if;
+  v_cost := case when p_qty = l.qty_remaining then l.cost_remaining
+                 else round(l.cost_remaining * p_qty / l.qty_remaining, 2) end;
+  update public.stock_layers
+     set qty_remaining = qty_remaining - p_qty, cost_remaining = cost_remaining - v_cost
+   where id = p_layer;
+  insert into public.stock_movements (layer_id, move_date, move_type, qty, cost, ref_type, ref_id)
+  values (p_layer, p_date, 'out', -p_qty, -v_cost, p_ref_type, p_ref_id);
+  return v_cost;
+end;
+$$;
+
+create or replace function pg_temp.fx_used_by(p_layer uuid, p_ref_type text, p_ref_id uuid)
+returns boolean
+language sql stable as $$
+  select exists (
+    select 1 from public.stock_movements
+     where layer_id = p_layer and move_type = 'out' and ref_type = p_ref_type and ref_id = p_ref_id);
+$$;
+
+create or replace function pg_temp.fx_recon()
+returns table (code text, books numeric, stock numeric)
+language sql stable as $$
+  with gl as (
+    select a.code, coalesce(sum(l.debit - l.credit), 0) as b
+      from public.accounts a
+      left join public.journal_lines l on l.account_id = a.id
+     where a.code in ('1200','1210','1220','1300','1310','1320','1330')
+     group by a.code
+  ), st as (
+    select '1200'::text as code, coalesce(sum(sl.cost_remaining), 0) as v
+      from public.stock_layers sl join public.materials m on m.id = sl.material_id
+     where sl.stock_kind = 'material' and m.category = 'oil'
+    union all
+    select '1210', coalesce(sum(sl.cost_remaining), 0)
+      from public.stock_layers sl join public.materials m on m.id = sl.material_id
+     where sl.stock_kind = 'material' and m.category = 'solvent'
+    union all
+    select '1220', coalesce(sum(sl.cost_remaining), 0)
+      from public.stock_layers sl join public.materials m on m.id = sl.material_id
+     where sl.stock_kind = 'material' and m.category not in ('oil','solvent')
+    union all
+    select '1300', coalesce(sum(total_cost), 0) from public.maceration_batches where status = 'Macerating'
+    union all
+    select '1310', coalesce(sum(cost_remaining), 0) from public.stock_layers where stock_kind = 'juice'
+    union all
+    select '1320', coalesce(sum(cost_remaining), 0) from public.stock_layers where stock_kind = 'bottled'
+    union all
+    select '1330', coalesce(sum(cost_remaining), 0) from public.stock_layers where stock_kind = 'finished'
+  )
+  select gl.code, gl.b, st.v from gl join st on st.code = gl.code order by gl.code;
+$$;
+
+create or replace function pg_temp.fix_emily_july(p_apply boolean)
+returns text
+language plpgsql
+set search_path = public, pg_temp
+as $$
+declare
+  c_oil_total constant numeric := 1455.72;
+  c_solvent_total constant numeric := 3451.14;
+  c_bottle_total  constant numeric := 2760.00;
+  c_sticker_total constant numeric := 140.99;
+  c_oil_ml        constant numeric := 230;
+  c_solvent_ml    constant numeric := 920;
+  c_old_pieces    constant int := 13;
+  c_pieces        constant int := 23;
+  rpt         text := '';
+  v_owner     uuid;
+  v_before    jsonb;
+  t           record;
+  r           record;
+  v_pur       public.purchases;
+  v_ln        public.purchase_lines;
+  v_lay       public.stock_layers;
+  v_mb        public.maceration_batches;
+  v_mi_oil    public.maceration_inputs;
+  v_mi_sol    public.maceration_inputs;
+  v_lay_j     public.stock_layers;
+  v_lay_b     public.stock_layers;
+  v_lay_f     public.stock_layers;
+  v_br        public.bottling_runs;
+  v_pr        public.packaging_runs;
+  v_cnt       int;
+  v_lines     jsonb;
+  v_mname     text;
+  v_cat       text;
+  v_label     text;
+  v_old_u     numeric;
+  v_new_u     numeric;
+  v_tot       numeric;
+  v_new_total numeric;
+  v_m_oil uuid; v_m_sol uuid; v_m_btl uuid; v_m_stk uuid;
+  v_l_oil uuid; v_l_sol uuid; v_l_btl uuid; v_l_stk uuid;
+  v_d_oil numeric; v_d_sol numeric; v_d_yield numeric; v_d_ml numeric; v_d_pcs int;
+  v_x_oil numeric; v_x_sol numeric; v_x_extra numeric;
+  v_x_juice numeric; v_x_btl numeric; v_x_stk numeric; v_x_mats numeric; v_x_bot numeric;
+  v_y_bot numeric; v_y_mats numeric; v_y_c numeric;
+  v_new_in numeric; v_new_exp numeric;
+  v_size_ml numeric;
+  v_mid uuid;
+  v_bb numeric; v_bs numeric;
+begin
+  select id into v_owner from public.profiles
+   where role = 'owner' and status = 'Active' order by created_at limit 1;
+  if v_owner is null then raise exception 'No active owner profile was found.'; end if;
+  v_before := (select jsonb_object_agg(code, jsonb_build_array(books, stock)) from pg_temp.fx_recon());
+  begin
+    perform set_config('request.jwt.claim.sub', v_owner::text, true);
+    perform set_config('request.jwt.claims', json_build_object('sub', v_owner, 'role', 'authenticated')::text, true);
+    create temp table fx_t (
+      k text primary key,
+      purchase_id uuid, purchase_no bigint, purchase_date date, pay_type text,
+      material_id uuid, mat_name text, category text, layer_id uuid,
+      old_qty numeric, new_qty numeric, old_amt numeric, new_amt numeric
+    ) on commit drop;
+    rpt := rpt || '1) PURCHASES, June 30' || E'\n';
+    for t in
+      select * from (values
+        ('oil',     2::bigint, 180::numeric,  '%emily%',     280::numeric,  c_oil_total),
+        ('solvent', 2::bigint, 6240::numeric, '%easyblend%', 6640::numeric, c_solvent_total),
+        ('bottle',  3::bigint, 82::numeric,   '%',           92::numeric,   c_bottle_total),
+        ('sticker', 4::bigint, 13::numeric,   '%',           23::numeric,   c_sticker_total)
+      ) as x(k, pno, old_qty, pat, new_qty, new_amt)
+    loop
+      select * into v_pur from public.purchases where purchase_no = t.pno;
+      if not found then raise exception 'Purchase number % was not found.', t.pno; end if;
+      if v_pur.status <> 'Posted' then
+        raise exception 'PUR-% is voided. Stopping.', lpad(t.pno::text, 4, '0');
+      end if;
+      if v_pur.purchase_date <> date '2026-06-30' then
+        raise exception 'PUR-% is dated %, not 2026-06-30. Stopping.', lpad(t.pno::text, 4, '0'), v_pur.purchase_date;
+      end if;
+      if v_pur.payment_type not in ('cash','bank') then
+        raise exception 'PUR-% was bought on credit. This script only handles cash or bank purchases. Tell me and I will extend it.', lpad(t.pno::text, 4, '0');
+      end if;
+      select count(*) into v_cnt
+        from public.purchase_lines pl join public.materials m on m.id = pl.material_id
+       where pl.purchase_id = v_pur.id and pl.line_type = 'material'
+         and pl.qty = t.old_qty and m.name ilike t.pat;
+      if v_cnt <> 1 then
+        raise exception 'PUR-%: expected exactly one material line of % units matching "%", but found %. Stopping.',
+          lpad(t.pno::text, 4, '0'), trim_scale(t.old_qty), t.pat, v_cnt;
+      end if;
+      select pl.* into v_ln
+        from public.purchase_lines pl join public.materials m on m.id = pl.material_id
+       where pl.purchase_id = v_pur.id and pl.line_type = 'material'
+         and pl.qty = t.old_qty and m.name ilike t.pat;
+      select m.name, m.category into v_mname, v_cat from public.materials m where m.id = v_ln.material_id;
+      select count(*) into v_cnt from public.stock_layers
+       where source = 'purchase' and source_id = v_pur.id and material_id = v_ln.material_id;
+      if v_cnt <> 1 then
+        raise exception 'PUR-%, %: expected one stock record, found %. Stopping.', lpad(t.pno::text, 4, '0'), v_mname, v_cnt;
+      end if;
+      select * into v_lay from public.stock_layers
+       where source = 'purchase' and source_id = v_pur.id and material_id = v_ln.material_id;
+      if v_lay.qty_in <> v_ln.qty or v_lay.cost_in <> v_ln.amount then
+        raise exception 'PUR-%, %: the stock record (%, %) does not match the purchase line (%, %). Stopping so nothing gets worse.',
+          lpad(t.pno::text, 4, '0'), v_mname, v_lay.qty_in, v_lay.cost_in, v_ln.qty, v_ln.amount;
+      end if;
+      if t.new_qty <= t.old_qty or t.new_amt <= v_ln.amount then
+        raise exception 'PUR-%, %: this script only handles increases. Stopping.', lpad(t.pno::text, 4, '0'), v_mname;
+      end if;
+      v_old_u := v_ln.amount / v_ln.qty;
+      v_new_u := t.new_amt / t.new_qty;
+      rpt := rpt || '  PUR-' || lpad(t.pno::text, 4, '0') || ' ' || v_mname || ': '
+          || trim_scale(t.old_qty)::text || ' -> ' || trim_scale(t.new_qty)::text || ' units, PHP '
+          || to_char(v_ln.amount, 'FM999,999,990.00') || ' -> ' || to_char(t.new_amt, 'FM999,999,990.00')
+          || ', per unit ' || to_char(v_old_u, 'FM990.0000') || ' -> ' || to_char(v_new_u, 'FM990.0000') || E'\n';
+      if abs(v_new_u / v_old_u - 1) > 0.005 then
+        rpt := rpt || '     *** WARNING: the cost per unit changes by more than 0.5%. If you only meant to buy more at the same price, check the total you typed. ***' || E'\n';
+      end if;
+      update public.purchase_lines
+         set qty = t.new_qty, amount = t.new_amt, unit_cost = round(t.new_amt / t.new_qty, 4)
+       where id = v_ln.id;
+      perform pg_temp.fx_add(v_lay.id, t.new_qty - t.old_qty, t.new_amt - v_ln.amount,
+                             v_pur.purchase_date, 'purchase', v_pur.id);
+      insert into pg_temp.fx_t values (t.k, v_pur.id, v_pur.purchase_no, v_pur.purchase_date, v_pur.payment_type,
+                                       v_ln.material_id, v_mname, v_cat, v_lay.id,
+                                       t.old_qty, t.new_qty, v_ln.amount, t.new_amt);
+    end loop;
+    for r in select distinct purchase_id, purchase_no, purchase_date, pay_type
+               from pg_temp.fx_t order by purchase_no
+    loop
+      update public.purchases
+         set total = (select sum(pl.amount) from public.purchase_lines pl where pl.purchase_id = r.purchase_id)
+       where id = r.purchase_id;
+      select total into v_new_total from public.purchases where id = r.purchase_id;
+      select sum(f.new_amt - f.old_amt) into v_tot from pg_temp.fx_t f where f.purchase_id = r.purchase_id;
+      select jsonb_agg(jsonb_build_object('account_code', x.acct, 'debit', x.amt,
+                                          'memo', 'Correction of PUR-' || lpad(r.purchase_no::text, 4, '0'))
+                       order by x.acct)
+        into v_lines
+        from (select case f.category when 'oil' then '1200' when 'solvent' then '1210' else '1220' end as acct,
+                     sum(f.new_amt - f.old_amt) as amt
+                from pg_temp.fx_t f where f.purchase_id = r.purchase_id group by 1) x;
+      v_lines := v_lines || jsonb_build_array(jsonb_build_object(
+        'account_code', case r.pay_type when 'cash' then '1010' else '1020' end,
+        'credit', v_tot, 'memo', 'Correction of PUR-' || lpad(r.purchase_no::text, 4, '0')));
+      perform public.post_module_entry(
+        r.purchase_date, 'ADJ-PUR-' || lpad(r.purchase_no::text, 4, '0'),
+        'Correction of PUR-' || lpad(r.purchase_no::text, 4, '0') || ': quantity and amount increased',
+        v_lines, 'procurement', r.purchase_id);
+      rpt := rpt || '  PUR-' || lpad(r.purchase_no::text, 4, '0') || ' total: PHP '
+          || to_char(v_new_total - v_tot, 'FM999,999,990.00') || ' -> ' || to_char(v_new_total, 'FM999,999,990.00')
+          || ' (extra paid ' || to_char(v_tot, 'FM999,999,990.00') || ' by ' || r.pay_type || ')' || E'\n';
+    end loop;
+    select material_id, layer_id into v_m_oil, v_l_oil from pg_temp.fx_t where k = 'oil';
+    select material_id, layer_id into v_m_sol, v_l_sol from pg_temp.fx_t where k = 'solvent';
+    select material_id, layer_id into v_m_btl, v_l_btl from pg_temp.fx_t where k = 'bottle';
+    select material_id, layer_id into v_m_stk, v_l_stk from pg_temp.fx_t where k = 'sticker';
+    select count(*) into v_cnt
+      from public.maceration_batches b join public.perfumes pf on pf.id = b.perfume_id
+     where pf.name ilike 'emily%' and b.start_date = date '2026-07-01';
+    if v_cnt <> 1 then
+      raise exception 'Expected exactly one Emily maceration started 2026-07-01, found %. Stopping.', v_cnt;
+    end if;
+    select b.* into v_mb
+      from public.maceration_batches b join public.perfumes pf on pf.id = b.perfume_id
+     where pf.name ilike 'emily%' and b.start_date = date '2026-07-01';
+    if v_mb.status <> 'Matured' then
+      raise exception 'The Emily batch is not completed yet. Stopping.';
+    end if;
+    if coalesce(v_mb.loss_cost, 0) <> 0 or v_mb.actual_yield_ml <> v_mb.total_input_ml then
+      raise exception 'The Emily batch recorded a loss (% ml came out of % ml put in). Tell me how the extra volume should yield and I will extend the script.',
+        v_mb.actual_yield_ml, v_mb.total_input_ml;
+    end if;
+    select count(*) into v_cnt from public.maceration_inputs i join public.materials m on m.id = i.material_id
+     where i.batch_id = v_mb.id and m.category = 'oil';
+    if v_cnt <> 1 then raise exception 'The Emily batch has % oil lines, expected exactly one. Stopping.', v_cnt; end if;
+    select count(*) into v_cnt from public.maceration_inputs i join public.materials m on m.id = i.material_id
+     where i.batch_id = v_mb.id and m.category = 'solvent';
+    if v_cnt <> 1 then raise exception 'The Emily batch has % solvent lines, expected exactly one. Stopping.', v_cnt; end if;
+    select i.* into v_mi_oil from public.maceration_inputs i join public.materials m on m.id = i.material_id
+     where i.batch_id = v_mb.id and m.category = 'oil';
+    select i.* into v_mi_sol from public.maceration_inputs i join public.materials m on m.id = i.material_id
+     where i.batch_id = v_mb.id and m.category = 'solvent';
+    if v_mi_oil.material_id is distinct from v_m_oil then
+      raise exception 'The Emily batch used a different oil than the one on PUR-00000002. Stopping.';
+    end if;
+    if v_mi_sol.material_id is distinct from v_m_sol then
+      raise exception 'The Emily batch used a different solvent than the Easyblend on PUR-00000002. Stopping.';
+    end if;
+    if not pg_temp.fx_used_by(v_l_oil, 'maceration', v_mb.id) or not pg_temp.fx_used_by(v_l_sol, 'maceration', v_mb.id) then
+      raise exception 'The Emily batch took its oil or solvent from a different purchase than PUR-00000002, so the extra volume cannot be paired with it. Stopping.';
+    end if;
+    v_d_oil := c_oil_ml - v_mi_oil.qty;
+    v_d_sol := c_solvent_ml - v_mi_sol.qty;
+    if v_d_oil <= 0 or v_d_sol <= 0 then
+      raise exception 'The maceration already has % ml oil and % ml solvent. This script only handles increases. Stopping.',
+        v_mi_oil.qty, v_mi_sol.qty;
+    end if;
+    v_x_oil := pg_temp.fx_take(v_l_oil, v_d_oil, v_mb.start_date, 'maceration', v_mb.id);
+    v_x_sol := pg_temp.fx_take(v_l_sol, v_d_sol, v_mb.start_date, 'maceration', v_mb.id);
+    v_x_extra := v_x_oil + v_x_sol;
+    update public.maceration_inputs set qty = c_oil_ml,     cost = cost + v_x_oil where id = v_mi_oil.id;
+    update public.maceration_inputs set qty = c_solvent_ml, cost = cost + v_x_sol where id = v_mi_sol.id;
+    v_new_in  := v_mb.total_input_ml + v_d_oil + v_d_sol;
+    v_new_exp := round(v_mb.expected_ml * v_new_in / v_mb.total_input_ml, 3);
+    v_d_yield := v_new_in - v_mb.actual_yield_ml;
+    update public.maceration_batches
+       set total_input_ml = v_new_in, expected_ml = v_new_exp,
+           total_cost = total_cost + v_x_extra,
+           actual_yield_ml = v_new_in, juice_cost = juice_cost + v_x_extra
+     where id = v_mb.id;
+    select count(*) into v_cnt from public.stock_layers
+     where stock_kind = 'juice' and source = 'maceration' and source_id = v_mb.id;
+    if v_cnt <> 1 then raise exception 'Expected one juice stock record for the Emily batch, found %. Stopping.', v_cnt; end if;
+    select * into v_lay_j from public.stock_layers
+     where stock_kind = 'juice' and source = 'maceration' and source_id = v_mb.id;
+    if v_lay_j.qty_in <> v_mb.actual_yield_ml or v_lay_j.cost_in <> v_mb.juice_cost then
+      raise exception 'The Emily juice stock record (% ml, PHP %) does not match the batch (% ml, PHP %). Stopping.',
+        v_lay_j.qty_in, v_lay_j.cost_in, v_mb.actual_yield_ml, v_mb.juice_cost;
+    end if;
+    perform pg_temp.fx_add(v_lay_j.id, v_d_yield, v_x_extra, v_mb.matured_date, 'maceration', v_mb.id);
+    v_label := 'MB-' || lpad(v_mb.batch_no::text, 4, '0');
+    v_lines := jsonb_build_array(jsonb_build_object('account_code', '1300', 'debit', v_x_extra, 'memo', v_label || ' correction'));
+    if v_x_oil > 0 then
+      v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1200', 'credit', v_x_oil, 'memo', 'Extra oil used (correction)'));
+    end if;
+    if v_x_sol > 0 then
+      v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1210', 'credit', v_x_sol, 'memo', 'Extra solvent used (correction)'));
+    end if;
+    perform public.post_module_entry(v_mb.start_date, 'ADJ-' || v_label,
+      'Correction of ' || v_label || ' (Emily): more oil and solvent used', v_lines, 'maceration', v_mb.id);
+    perform public.post_module_entry(v_mb.matured_date, 'ADJ-' || v_label,
+      'Correction of ' || v_label || ' completion: juice volume and cost increased',
+      jsonb_build_array(
+        jsonb_build_object('account_code', '1310', 'debit',  v_x_extra, 'memo', v_label || ' correction'),
+        jsonb_build_object('account_code', '1300', 'credit', v_x_extra, 'memo', v_label || ' correction')),
+      'maceration', v_mb.id);
+    rpt := rpt || E'\n2) MACERATION ' || v_label || ' (Emily, started ' || v_mb.start_date::text || E')\n'
+        || '  oil:      ' || trim_scale(v_mi_oil.qty)::text || ' -> ' || trim_scale(c_oil_ml)::text
+        || ' ml (extra cost PHP ' || to_char(v_x_oil, 'FM999,999,990.00') || ')' || E'\n'
+        || '  solvent:  ' || trim_scale(v_mi_sol.qty)::text || ' -> ' || trim_scale(c_solvent_ml)::text
+        || ' ml (extra cost PHP ' || to_char(v_x_sol, 'FM999,999,990.00') || ')' || E'\n'
+        || '  juice:    ' || trim_scale(v_mb.actual_yield_ml)::text || ' -> ' || trim_scale(v_new_in)::text || ' ml, cost PHP '
+        || to_char(v_mb.juice_cost, 'FM999,999,990.00') || ' -> ' || to_char(v_mb.juice_cost + v_x_extra, 'FM999,999,990.00')
+        || ', per ml ' || to_char(v_mb.juice_cost / v_mb.actual_yield_ml, 'FM990.0000')
+        || ' -> ' || to_char((v_mb.juice_cost + v_x_extra) / v_new_in, 'FM990.0000') || E'\n';
+    select count(*) into v_cnt from public.bottling_runs b
+     where b.perfume_id = v_mb.perfume_id and b.run_date = date '2026-07-07'
+       and b.qty = c_old_pieces and b.status = 'Posted';
+    if v_cnt <> 1 then
+      raise exception 'Expected exactly one Emily bottling of % pieces on 2026-07-07, found %. Stopping.', c_old_pieces, v_cnt;
+    end if;
+    select b.* into v_br from public.bottling_runs b
+     where b.perfume_id = v_mb.perfume_id and b.run_date = date '2026-07-07'
+       and b.qty = c_old_pieces and b.status = 'Posted';
+    select ps.size_ml into v_size_ml from public.perfume_sizes ps where ps.id = v_br.size_id;
+    if v_br.spoiled_qty <> 0 or v_br.spoiled_cost <> 0 then
+      raise exception 'The Emily bottling has spoiled units recorded. Tell me and I will extend the script. Stopping.';
+    end if;
+    if v_br.bottle_material_id is distinct from v_m_btl or v_br.sticker_material_id is distinct from v_m_stk then
+      raise exception 'The Emily bottling used a different bottle or sticker than PUR-00000003 / PUR-00000004. Stopping.';
+    end if;
+    if not pg_temp.fx_used_by(v_lay_j.id, 'bottling', v_br.id)
+       or not pg_temp.fx_used_by(v_l_btl, 'bottling', v_br.id)
+       or not pg_temp.fx_used_by(v_l_stk, 'bottling', v_br.id) then
+      raise exception 'The Emily bottling took its juice, bottles or stickers from different stock than expected. Stopping.';
+    end if;
+    v_d_pcs := c_pieces - v_br.qty;
+    if v_d_pcs <= 0 then raise exception 'This script only handles increases in pieces. Stopping.'; end if;
+    v_d_ml := v_d_pcs * v_size_ml;
+    v_x_juice := pg_temp.fx_take(v_lay_j.id, v_d_ml, v_br.run_date, 'bottling', v_br.id);
+    v_x_btl   := pg_temp.fx_take(v_l_btl, v_d_pcs, v_br.run_date, 'bottling', v_br.id);
+    v_x_stk   := pg_temp.fx_take(v_l_stk, v_d_pcs, v_br.run_date, 'bottling', v_br.id);
+    v_x_mats  := v_x_btl + v_x_stk;
+    v_x_bot   := v_x_juice + v_x_mats;
+    update public.bottling_runs
+       set qty = c_pieces, juice_ml = juice_ml + v_d_ml, juice_cost = juice_cost + v_x_juice,
+           materials_cost = materials_cost + v_x_mats, bottled_cost = bottled_cost + v_x_bot
+     where id = v_br.id;
+    select count(*) into v_cnt from public.stock_layers
+     where stock_kind = 'bottled' and source = 'bottling' and source_id = v_br.id;
+    if v_cnt <> 1 then raise exception 'Expected one bottled stock record for the Emily bottling, found %. Stopping.', v_cnt; end if;
+    select * into v_lay_b from public.stock_layers
+     where stock_kind = 'bottled' and source = 'bottling' and source_id = v_br.id;
+    if v_lay_b.qty_in <> v_br.qty or v_lay_b.cost_in <> v_br.bottled_cost then
+      raise exception 'The bottled stock record (%, PHP %) does not match the bottling (%, PHP %). Stopping.',
+        v_lay_b.qty_in, v_lay_b.cost_in, v_br.qty, v_br.bottled_cost;
+    end if;
+    perform pg_temp.fx_add(v_lay_b.id, v_d_pcs, v_x_bot, v_br.run_date, 'bottling', v_br.id);
+    v_label := 'BT-' || lpad(v_br.run_no::text, 4, '0');
+    v_lines := jsonb_build_array(jsonb_build_object('account_code', '1320', 'debit', v_x_bot, 'memo', v_label || ' correction'));
+    if v_x_juice > 0 then
+      v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1310', 'credit', v_x_juice, 'memo', 'Extra juice used (correction)'));
+    end if;
+    if v_x_mats > 0 then
+      v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1220', 'credit', v_x_mats, 'memo', 'Extra bottles and stickers used (correction)'));
+    end if;
+    perform public.post_module_entry(v_br.run_date, 'ADJ-' || v_label,
+      'Correction of ' || v_label || ' (Emily): ' || v_br.qty || ' -> ' || c_pieces || ' bottles', v_lines, 'bottling', v_br.id);
+    rpt := rpt || E'\n3) BOTTLING ' || v_label || ' (Emily, ' || v_br.run_date::text || E')\n'
+        || '  bottles: ' || v_br.qty || ' -> ' || c_pieces || ', juice ' || trim_scale(v_br.juice_ml)::text || ' -> '
+        || trim_scale(v_br.juice_ml + v_d_ml)::text || ' ml' || E'\n'
+        || '  extra cost PHP ' || to_char(v_x_bot, 'FM999,999,990.00') || ' (juice ' || to_char(v_x_juice, 'FM999,999,990.00')
+        || ', bottles ' || to_char(v_x_btl, 'FM999,999,990.00') || ', stickers ' || to_char(v_x_stk, 'FM999,999,990.00') || ')' || E'\n'
+        || '  cost per bottled piece: ' || to_char(v_br.bottled_cost / v_br.qty, 'FM999,999,990.00') || ' -> '
+        || to_char((v_br.bottled_cost + v_x_bot) / c_pieces, 'FM999,999,990.00') || E'\n';
+    select count(*) into v_cnt from public.packaging_runs p
+     where p.perfume_id = v_mb.perfume_id and p.size_id = v_br.size_id and p.run_date = date '2026-07-07'
+       and p.qty = c_old_pieces and p.status = 'Posted';
+    if v_cnt <> 1 then
+      raise exception 'Expected exactly one Emily packaging of % pieces on 2026-07-07, found %. Stopping.', c_old_pieces, v_cnt;
+    end if;
+    select p.* into v_pr from public.packaging_runs p
+     where p.perfume_id = v_mb.perfume_id and p.size_id = v_br.size_id and p.run_date = date '2026-07-07'
+       and p.qty = c_old_pieces and p.status = 'Posted';
+    if v_pr.spoiled_qty <> 0 or v_pr.spoiled_cost <> 0 then
+      raise exception 'The Emily packaging has spoiled units recorded. Tell me and I will extend the script. Stopping.';
+    end if;
+    if v_pr.bottled_cost <> v_br.bottled_cost then
+      raise exception 'The packaging used bottled perfume worth PHP % but the bottling cost PHP %. Stopping.', v_pr.bottled_cost, v_br.bottled_cost;
+    end if;
+    if not pg_temp.fx_used_by(v_lay_b.id, 'packaging', v_pr.id) then
+      raise exception 'The Emily packaging took its bottled perfume from different stock than the bottling above. Stopping.';
+    end if;
+    v_y_bot := pg_temp.fx_take(v_lay_b.id, v_d_pcs, v_pr.run_date, 'packaging', v_pr.id);
+    v_y_mats := 0;
+    for v_mid in select unnest(array[v_pr.box_material_id, v_pr.box_sticker_material_id, v_pr.wrap_material_id,
+                                     v_pr.pouch_material_id, v_pr.pouch_sticker_material_id])
+    loop
+      continue when v_mid is null;
+      v_y_c := public.stock_out('material', v_mid, v_d_pcs, v_pr.run_date, 'packaging', v_pr.id);
+      v_y_mats := v_y_mats + v_y_c;
+    end loop;
+    update public.packaging_runs
+       set qty = c_pieces, bottled_cost = bottled_cost + v_y_bot, materials_cost = materials_cost + v_y_mats,
+           finished_cost = finished_cost + v_y_bot + v_y_mats
+     where id = v_pr.id;
+    select count(*) into v_cnt from public.stock_layers
+     where stock_kind = 'finished' and source = 'packaging' and source_id = v_pr.id;
+    if v_cnt <> 1 then raise exception 'Expected one finished-goods stock record for the Emily packaging, found %. Stopping.', v_cnt; end if;
+    select * into v_lay_f from public.stock_layers
+     where stock_kind = 'finished' and source = 'packaging' and source_id = v_pr.id;
+    if v_lay_f.qty_in <> v_pr.qty or v_lay_f.cost_in <> v_pr.finished_cost then
+      raise exception 'The finished-goods stock record (%, PHP %) does not match the packaging (%, PHP %). Stopping.',
+        v_lay_f.qty_in, v_lay_f.cost_in, v_pr.qty, v_pr.finished_cost;
+    end if;
+    perform pg_temp.fx_add(v_lay_f.id, v_d_pcs, v_y_bot + v_y_mats, v_pr.run_date, 'packaging', v_pr.id);
+    v_label := 'PK-' || lpad(v_pr.run_no::text, 4, '0');
+    v_lines := jsonb_build_array(jsonb_build_object('account_code', '1330', 'debit', v_y_bot + v_y_mats, 'memo', v_label || ' correction'));
+    if v_y_bot > 0 then
+      v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1320', 'credit', v_y_bot, 'memo', 'Extra bottled perfume used (correction)'));
+    end if;
+    if v_y_mats > 0 then
+      v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', '1220', 'credit', v_y_mats, 'memo', 'Extra packaging materials used (correction)'));
+    end if;
+    perform public.post_module_entry(v_pr.run_date, 'ADJ-' || v_label,
+      'Correction of ' || v_label || ' (Emily): ' || v_pr.qty || ' -> ' || c_pieces || ' pieces', v_lines, 'packaging', v_pr.id);
+    rpt := rpt || E'\n4) PACKAGING ' || v_label || ' (Emily, ' || v_pr.run_date::text || E')\n'
+        || '  pieces: ' || v_pr.qty || ' -> ' || c_pieces || E'\n'
+        || '  extra cost PHP ' || to_char(v_y_bot + v_y_mats, 'FM999,999,990.00') || ' (bottled perfume '
+        || to_char(v_y_bot, 'FM999,999,990.00') || ', boxes/stickers/wrap taken from current stock '
+        || to_char(v_y_mats, 'FM999,999,990.00') || ')' || E'\n'
+        || '  cost per finished piece: ' || to_char(v_pr.finished_cost / v_pr.qty, 'FM999,999,990.00') || ' -> '
+        || to_char((v_pr.finished_cost + v_y_bot + v_y_mats) / c_pieces, 'FM999,999,990.00') || E'\n';
+    rpt := rpt || E'\n5) BOOKS vs STOCK RECORDS, before -> after (the gap must not change)' || E'\n';
+    for r in select code, books, stock from pg_temp.fx_recon() order by code loop
+      v_bb := ((v_before -> r.code) ->> 0)::numeric;
+      v_bs := ((v_before -> r.code) ->> 1)::numeric;
+      rpt := rpt || '  ' || r.code || ': books ' || to_char(v_bb, 'FM999,999,990.00') || ' -> ' || to_char(r.books, 'FM999,999,990.00')
+          || ' | stock records ' || to_char(v_bs, 'FM999,999,990.00') || ' -> ' || to_char(r.stock, 'FM999,999,990.00')
+          || ' | gap ' || to_char(v_bb - v_bs, 'FM999,999,990.00') || ' -> ' || to_char(r.books - r.stock, 'FM999,999,990.00') || E'\n';
+      if abs((r.books - r.stock) - (v_bb - v_bs)) > 0.005 then
+        raise exception 'Account %: the gap between the books and the stock records changed (% -> %). Nothing was saved.',
+          r.code, (v_bb - v_bs), (r.books - r.stock);
+      end if;
+    end loop;
+    rpt := rpt || E'\nAll checks passed.' || E'\n';
+    if not p_apply then
+      raise exception 'FX_DRYRUN';
+    end if;
+  exception when others then
+    if sqlerrm <> 'FX_DRYRUN' then
+      raise;
+    end if;
+    return '*** DRY RUN: everything above was undone, nothing is saved. Change false to true in the select line at the bottom of the file to save. ***'
+           || E'\n\n' || rpt;
+  end;
+  return '*** SAVED ***' || E'\n\n' || rpt;
+end;
+$$;
+
+-- RUN IT
+-- false = dry run (saves nothing). true = save.
+select regexp_split_to_table(pg_temp.fix_emily_july(false), E'\n') as report;

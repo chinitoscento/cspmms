@@ -1,0 +1,131 @@
+-- Chinito Scento: READ-ONLY check of whether the correction (file 21) is already in the books.
+-- It changes nothing and saves nothing. Run the whole file in the Supabase SQL Editor,
+-- then send me the full result (copy the "report" column or take a screenshot).
+-- Expected AFTER the correction: PUR-29 has 4 lines (Emily 5, Dwight 4, Reine De Nuit 3, Blanche 1), total 79.69;
+-- the Posted bottling and packaging runs show 16 (Dwight), 16 (Blanche), 17 (Reine MB-12) and 11 (Reine MB-11).
+-- Batches: MB 9 (Dwight), 11, 12 (Reine de Nuit), 13 (Blanche). Purchase: PUR 29 (bottle stickers).
+
+with targets(mb_no) as (
+  values (9), (11), (12), (13)
+),
+mb as (
+  select b.*, pf.name as perfume_name
+    from public.maceration_batches b
+    join public.perfumes pf on pf.id = b.perfume_id
+    join targets t on t.mb_no = b.batch_no
+),
+jl as (
+  select l.id as layer_id, l.source_id as batch_id, l.qty_in, l.qty_remaining
+    from public.stock_layers l
+    join mb on mb.id = l.source_id
+   where l.stock_kind = 'juice' and l.source = 'maceration'
+),
+br as (
+  select distinct mb.batch_no as mb_no, r.id as run_id
+    from mb
+    join jl on jl.batch_id = mb.id
+    join public.stock_movements m
+      on m.layer_id = jl.layer_id and m.move_type = 'out' and m.ref_type = 'bottling'
+    join public.bottling_runs r on r.id = m.ref_id
+),
+pur as (
+  select * from public.purchases where purchase_no = 29
+),
+lines_out as (
+
+  -- 1) the sticker purchase
+  select 1 as s, 0::numeric as o, 0::numeric as o2,
+         format('PUR-%s | %s | %s | %s | total %s | supplier %s',
+                lpad(p.purchase_no::text, 8, '0'), p.purchase_date, p.payment_type, p.status, p.total,
+                coalesce(sp.name, '-')) as line
+    from pur p
+    left join public.suppliers sp on sp.id = p.supplier_id
+
+  union all
+  select 2, pl.qty, 0,
+         format('   line: %s [%s] | %s pcs | PHP %s | unit %s | stock record: in %s, left %s (PHP %s left)',
+                coalesce(m.name, '?'), coalesce(m.category, '?'), pl.qty, pl.amount, pl.unit_cost,
+                sl.qty_in, sl.qty_remaining, sl.cost_remaining)
+    from pur p
+    join public.purchase_lines pl on pl.purchase_id = p.id
+    left join public.materials m on m.id = pl.material_id
+    left join public.stock_layers sl
+           on sl.source = 'purchase' and sl.source_id = pl.purchase_id and sl.material_id = pl.material_id
+
+  union all
+  select 3, 0, 0,
+         format('   used: %s took %s pcs (PHP %s) on %s for %s',
+                coalesce(m.name, '?'), -mv.qty, -mv.cost, mv.move_date,
+                coalesce('BT-' || lpad(b.run_no::text, 8, '0'), mv.ref_type))
+    from pur p
+    join public.stock_layers sl on sl.source = 'purchase' and sl.source_id = p.id
+    join public.stock_movements mv on mv.layer_id = sl.id and mv.move_type = 'out'
+    left join public.materials m on m.id = sl.material_id
+    left join public.bottling_runs b on mv.ref_type = 'bottling' and b.id = mv.ref_id
+
+  -- 2) the maceration batches
+  union all
+  select 4, mb.batch_no, 0,
+         format('MB-%s %s | started %s | %s | input %s ml | yield %s ml | juice cost PHP %s | loss PHP %s',
+                lpad(mb.batch_no::text, 8, '0'), mb.perfume_name, mb.start_date, mb.status,
+                mb.total_input_ml, mb.actual_yield_ml, mb.juice_cost, coalesce(mb.loss_cost, 0))
+    from mb
+
+  union all
+  select 5, mb.batch_no, 1,
+         format('   juice stock record: in %s ml, left %s ml', jl.qty_in, jl.qty_remaining)
+    from mb
+    join jl on jl.batch_id = mb.id
+
+  -- 3) the bottling runs of each batch
+  union all
+  select 6, br.mb_no, r.run_no,
+         format('   BT-%s | %s | %s | %s ml bottle | recorded qty %s | spoiled %s | juice %s ml | bottled cost PHP %s | bottle: %s | sticker: %s',
+                lpad(r.run_no::text, 8, '0'), r.status, r.run_date, ps.size_ml, r.qty, r.spoiled_qty, r.juice_ml,
+                r.bottled_cost, coalesce(mb2.name, '-'), coalesce(ms.name, '-'))
+    from br
+    join public.bottling_runs r on r.id = br.run_id
+    left join public.perfume_sizes ps on ps.id = r.size_id
+    left join public.materials mb2 on mb2.id = r.bottle_material_id
+    left join public.materials ms on ms.id = r.sticker_material_id
+
+  -- the sticker stock each bottling run actually took (and from which purchase)
+  union all
+  select 7, br.mb_no, r.run_no,
+         format('        stickers taken: %s pcs, PHP %s, from %s',
+                -mv.qty, -mv.cost, coalesce('PUR-' || lpad(pu.purchase_no::text, 8, '0'), sl.source))
+    from br
+    join public.bottling_runs r on r.id = br.run_id
+    join public.stock_movements mv on mv.ref_type = 'bottling' and mv.ref_id = r.id and mv.move_type = 'out'
+    join public.stock_layers sl on sl.id = mv.layer_id and sl.stock_kind = 'material'
+                              and sl.material_id = r.sticker_material_id
+    left join public.purchases pu on sl.source = 'purchase' and pu.id = sl.source_id
+
+  -- 4) the packaging of each bottling run
+  union all
+  select 8, br.mb_no, r.run_no,
+         format('        PK-%s | %s | %s | recorded qty %s | spoiled %s | finished cost PHP %s | finished stock: in %s, left %s',
+                lpad(pr.run_no::text, 8, '0'), pr.status, pr.run_date, pr.qty, pr.spoiled_qty, pr.finished_cost,
+                fl.qty_in, fl.qty_remaining)
+    from br
+    join public.bottling_runs r on r.id = br.run_id
+    join public.stock_layers bl on bl.stock_kind = 'bottled' and bl.source = 'bottling' and bl.source_id = r.id
+    join public.stock_movements mv on mv.layer_id = bl.id and mv.move_type = 'out' and mv.ref_type = 'packaging'
+    join public.packaging_runs pr on pr.id = mv.ref_id
+    left join public.stock_layers fl on fl.stock_kind = 'finished' and fl.source = 'packaging' and fl.source_id = pr.id
+
+  -- 5) every sticker material and what is on hand
+  union all
+  select 9, 0, 0, 'STICKER MATERIALS ON HAND'
+  union all
+  select 10, row_number() over (order by m.name), 0,
+         format('   %s [%s] | in stock %s pcs, PHP %s', m.name, m.category,
+                coalesce(sum(sl.qty_remaining), 0), coalesce(sum(sl.cost_remaining), 0))
+    from public.materials m
+    left join public.stock_layers sl on sl.material_id = m.id and sl.stock_kind = 'material'
+   where m.name ilike '%sticker%'
+   group by m.id, m.name, m.category
+)
+select line as report
+  from lines_out
+ order by s, o, o2;

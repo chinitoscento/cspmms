@@ -1,0 +1,1642 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { ShoppingBag, PlusCircle, FileText, Printer, RotateCcw, CheckCircle2, Ban, Trash2, Search, Plus, Minus } from 'lucide-react';
+import { supabase } from '../supabaseClient';
+import { EmptyState, PageHeader, ErrorNote, Modal, nz, peso, fmtDate, ModalActions } from './ui';
+import { LateEntryNotice, isLateEntry, withLateNote } from './lateEntry';
+
+const todayLocal = () => new Date().toLocaleDateString('en-CA');
+const pad = (n) => String(n).padStart(8, '0');
+const qty = (v) => Number(v || 0).toLocaleString('en-PH', { maximumFractionDigits: 3 });
+const daysUntil = (iso) => Math.round((new Date(`${iso}T00:00:00`) - new Date(`${todayLocal()}T00:00:00`)) / 86400000);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// Date and time of an approval, in Philippine time
+const fmtStamp = (ts) =>
+  ts ? new Date(ts).toLocaleString('en-PH', { timeZone: 'Asia/Manila', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '-';
+
+const PAY = { cash: 'Cash', bank: 'Bank transfer', credit: 'Credit' };
+const KIND = {
+  exchange: 'Wrong item / swap',
+  refund: 'Damaged, refund',
+  replace: 'Damaged, replacement',
+};
+// A good piece sent back for a refund uses the 'refund' outcome too, so the reason tells them apart.
+const kindOf = (x) => (x?.reason === 'returned' ? 'Returned, refund' : KIND[x?.resolution]);
+
+let keySeed = 0;
+const blankReturn = (sale = '') => ({ date: todayLocal(), sale, reason: 'wrong_item', resolution: 'exchange', notes: '', lines: [] });
+const newLine = (size = '', price = '') => ({ key: `l${++keySeed}`, size, qty: size ? '1' : '', price });
+
+function Badge({ tone, children }) {
+  const tones = {
+    green: 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30',
+    amber: 'bg-[#e5a93d]/10 text-[#e5a93d] border-[#e5a93d]/30',
+    red: 'bg-[#e5736d]/10 text-[#e5736d] border-[#e5736d]/30',
+    gray: 'bg-[#1c1916] text-[#a8a090] border-[#2a2622]',
+  };
+  return <span className={`inline-flex px-2.5 py-0.5 rounded-full text-[10px] font-medium border whitespace-nowrap ${tones[tone]}`}>{children}</span>;
+}
+
+const SALE_TONE = { Posted: 'green', Pending: 'amber', Rejected: 'red', Voided: 'gray' };
+const SALE_TEXT = { Pending: 'Pending approval' };
+const RET_TONE = { Approved: 'green', Pending: 'amber', Rejected: 'red', Voided: 'gray' };
+const RET_TEXT = { Pending: 'Pending approval' };
+
+function Stat({ label, value, tone }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-[#a8a090]">{label}</div>
+      <div className={`font-mono ${tone || ''}`}>{value}</div>
+    </div>
+  );
+}
+
+// Opens a clean print window for an invoice or slip
+function printDoc(title, body) {
+  const w = window.open('', '_blank', 'width=820,height=900');
+  if (!w) {
+    window.alert('Please allow pop-ups to print.');
+    return;
+  }
+  w.document.write(
+    `<!doctype html><html><head><title>${esc(title)}</title><style>
+      body{font-family:Arial,Helvetica,sans-serif;color:#111;padding:32px;max-width:720px;margin:auto}
+      h1{font-size:22px;margin:0}
+      table{width:100%;border-collapse:collapse;margin-top:16px}
+      th,td{border-bottom:1px solid #ccc;padding:8px;text-align:left;font-size:13px}
+      .r{text-align:right}
+      .meta{display:flex;justify-content:space-between;gap:24px;margin-top:16px;font-size:13px;line-height:1.6}
+      .total{text-align:right;font-weight:bold;margin-top:12px;font-size:15px}
+      .sig{display:flex;justify-content:space-between;margin-top:64px;font-size:12px}
+      .sig div{border-top:1px solid #111;width:40%;text-align:center;padding-top:4px}
+      .sub{font-size:12px;color:#555}
+      h3{font-size:14px;margin:28px 0 4px}
+      .tt{width:58%;margin-left:auto;margin-top:12px}
+      .tt td{border-bottom:none;padding:3px 8px}
+      .tt tr.b td{font-weight:bold;border-top:1px solid #111}
+      .int{border:1px dashed #666;padding:8px 10px;margin-top:8px;font-size:11px;color:#333}
+      .banner{border:2px solid #111;padding:6px;text-align:center;font-weight:bold;font-size:12px;margin-bottom:16px}
+    </style></head><body>${body}</body></html>`
+  );
+  w.document.close();
+  w.focus();
+  w.print();
+}
+
+export default function Sales({ user, onChanged }) {
+  const isOwner = user?.role === 'owner';
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [tab, setTab] = useState('sales');
+  const [allSizes, setAllSizes] = useState([]);
+  const [stock, setStock] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [credit, setCredit] = useState({});
+  const [arBal, setArBal] = useState({});
+  const [invBal, setInvBal] = useState({}); // balance still owed per credit invoice
+  const [refundMethod, setRefundMethod] = useState('bank'); // how an already-paid refund goes back
+  const [sales, setSales] = useState([]);
+  const [returns, setReturns] = useState([]);
+  const [jeNo, setJeNo] = useState({}); // journal entry id -> entry number, for the paper trail
+  const [saving, setSaving] = useState(false);
+
+  // new sale
+  const [sOpen, setSOpen] = useState(false);
+  const [sf, setSf] = useState({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', lines: [] });
+  const [sQuery, setSQuery] = useState(''); // perfume search in the New Sale picker
+  const [sError, setSError] = useState('');
+
+  // new return / exchange
+  const [rOpen, setROpen] = useState(false);
+  const [rQuery, setRQuery] = useState(''); // type a customer name or invoice number to find the invoice
+  const [rActive, setRActive] = useState(0); // highlighted match (arrow keys + Enter)
+  const [rf, setRf] = useState(blankReturn());
+  const [rError, setRError] = useState('');
+
+  // approve / reject, void, documents
+  const [deciding, setDeciding] = useState(null); // { kind: 'sale' | 'return', row }
+  const [reason, setReason] = useState('');
+  const [decError, setDecError] = useState('');
+  const [voiding, setVoiding] = useState(null);
+  const [voidReason, setVoidReason] = useState('');
+  const [voidError, setVoidError] = useState('');
+  const [voidingRet, setVoidingRet] = useState(null); // the return slip (request) being voided
+  const [invoiceId, setInvoiceId] = useState(null);
+  const [slipId, setSlipId] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError('');
+    const calls = [
+      supabase.from('perfume_sizes').select('id, size_ml, price, is_active, perfume_id, perfumes(name, status)'),
+      supabase.from('inventory_status').select('*').eq('kind', 'finished'),
+      supabase.from('customers').select('id, name, address, status').order('name'),
+      supabase.from('sales').select('*, customers(name, address), sale_lines(*)').order('sale_no', { ascending: false }).limit(200),
+      supabase.from('sales_returns').select('*, sales(sale_no, invoice_no, payment_type, customers(name))').order('return_no', { ascending: false }).limit(200),
+    ];
+    calls.push(supabase.from('credit_invoice_balances').select('sale_id, total, returned, paid, balance, pay_status'));
+    if (isOwner) {
+      calls.push(supabase.from('customer_credit').select('*'));
+      calls.push(supabase.from('customer_ar').select('*'));
+    }
+    const res = await Promise.all(calls);
+    const err = res.find((r) => r.error);
+    if (err) setLoadError(err.error.message);
+    setAllSizes(res[0].data || []);
+    setStock(res[1].data || []);
+    setCustomers(res[2].data || []);
+    setSales(res[3].data || []);
+    setReturns(res[4].data || []);
+    setInvBal(Object.fromEntries((res[5].data || []).map((b) => [b.sale_id, { ...b, balance: Number(b.balance || 0), paid: Number(b.paid || 0), returned: Number(b.returned || 0) }])));
+    if (isOwner) {
+      setCredit(Object.fromEntries((res[6].data || []).map((c) => [c.customer_id, c])));
+      setArBal(Object.fromEntries((res[7].data || []).map((c) => [c.customer_id, Number(c.balance || 0)])));
+    }
+    // journal entry numbers of approved returns, so a slip can be traced to the books
+    const jeIds = [...new Set((res[4].data || []).map((r) => r.journal_entry_id).filter(Boolean))];
+    if (jeIds.length > 0) {
+      const je = await supabase.from('journal_entries').select('id, entry_no').in('id', jeIds);
+      if (je.error) setLoadError(je.error.message);
+      setJeNo(Object.fromEntries((je.data || []).map((e) => [e.id, e.entry_no])));
+    } else {
+      setJeNo({});
+    }
+    setLoading(false);
+  }, [isOwner]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const afterChange = async () => {
+    await load();
+    onChanged && onChanged();
+  };
+
+  const sizeById = useMemo(() => Object.fromEntries(allSizes.map((s) => [s.id, s])), [allSizes]);
+  const sizeName = (id) => (sizeById[id] ? `${sizeById[id].perfumes?.name} · ${qty(sizeById[id].size_ml)} ml` : '-');
+  const onHand = useMemo(() => Object.fromEntries(stock.map((r) => [r.item_id, Number(r.on_hand || 0)])), [stock]);
+  const sellable = useMemo(
+    () =>
+      allSizes
+        .filter((s) => s.is_active && s.perfumes && s.perfumes.status !== 'Discontinued')
+        .sort((a, b) => a.perfumes.name.localeCompare(b.perfumes.name) || Number(a.size_ml) - Number(b.size_ml)),
+    [allSizes]
+  );
+  // one card per perfume, its sellable sizes shown as buttons
+  const perfumeGroups = useMemo(() => {
+    const m = new Map();
+    sellable.forEach((s) => {
+      if (!m.has(s.perfume_id)) m.set(s.perfume_id, { id: s.perfume_id, name: s.perfumes.name, sizes: [] });
+      m.get(s.perfume_id).sizes.push(s);
+    });
+    return [...m.values()];
+  }, [sellable]);
+  // price on a sale line: starts at the collection price, staff can change it
+  const linePrice = (l) => (l.price === '' ? 0 : Number(l.price) || 0);
+  const listOf = (l) => Number(sizeById[l.size]?.price || 0);
+  const saleById = useMemo(() => Object.fromEntries(sales.map((s) => [s.id, s])), [sales]);
+
+  // How a damaged refund is settled. Approved returns show what was booked.
+  // On a credit sale the refund first lowers what the customer still owes on that invoice;
+  // anything the customer already paid goes back in cash or by bank transfer.
+  const refundSplit = (r) => {
+    if (r.resolution !== 'refund') return { ar: 0, paid: 0, method: null };
+    if (r.status === 'Approved') return { ar: Number(r.refund_ar || 0), paid: Number(r.refund_paid || 0), method: r.refund_method };
+    const amt = Number(r.refund_amount || 0);
+    if (r.sales?.payment_type !== 'credit') return { ar: 0, paid: amt, method: r.sales?.payment_type === 'bank' ? 'bank' : 'cash' };
+    const bal = Math.max(invBal[r.sale_id]?.balance || 0, 0);
+    const ar = Math.min(amt, bal);
+    return { ar, paid: Math.round((amt - ar) * 100) / 100, method: null };
+  };
+
+  // The same split for every item of a request. On a credit invoice the refunds take down what is still owed one after another.
+  const splitsOf = (q) => {
+    let bal = Math.max(invBal[q.sale_id]?.balance || 0, 0);
+    return q.lines.map((r) => {
+      if (r.resolution !== 'refund' || r.status === 'Approved' || r.sales?.payment_type !== 'credit') return refundSplit(r);
+      const amt = Number(r.refund_amount || 0);
+      const ar = Math.min(amt, bal);
+      bal -= ar;
+      return { ar, paid: Math.round((amt - ar) * 100) / 100, method: null };
+    });
+  };
+
+  const pendingSales = sales.filter((s) => s.status === 'Pending').length;
+  // One return request = every item that shares one RT number on one invoice
+  const requests = useMemo(() => {
+    const m = new Map();
+    returns.forEach((r) => {
+      const key = `${r.return_no}|${r.sale_id}`;
+      if (!m.has(key)) m.set(key, { key, return_no: r.return_no, return_date: r.return_date, sale_id: r.sale_id, sales: r.sales, notes: r.notes, reject_reason: r.reject_reason, void_reason: r.void_reason, lines: [] });
+      m.get(key).lines.push(r);
+    });
+    return [...m.values()]
+      .map((q) => {
+        const lines = q.lines.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id)));
+        const status = lines.some((l) => l.status === 'Pending') ? 'Pending' : lines[0].status;
+        return { ...q, lines, status };
+      })
+      .sort((a, b) => b.return_no - a.return_no);
+  }, [returns]);
+  const pendingReturns = requests.filter((q) => q.status === 'Pending').length;
+
+  // ---------- new sale ----------
+  const openSale = () => {
+    setSf({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', lines: [] });
+    setSQuery('');
+    setSError('');
+    setSOpen(true);
+  };
+  const setLine = (key, patch) => setSf((p) => ({ ...p, lines: p.lines.map((l) => (l.key === key ? { ...l, ...patch } : l)) }));
+
+  const customerOptions = customers.filter((c) => c.status === 'Active' && !(sf.pay === 'credit' && isOwner && !credit[c.id]?.credit_allowed));
+  const needBySize = {};
+  sf.lines.forEach((l) => {
+    if (l.size) needBySize[l.size] = (needBySize[l.size] || 0) + (parseInt(l.qty, 10) || 0);
+  });
+  const sTotal = sf.lines.reduce((sum, l) => sum + (parseInt(l.qty, 10) || 0) * linePrice(l), 0);
+  const sDiscount = sf.lines.reduce((sum, l) => sum + (parseInt(l.qty, 10) || 0) * Math.max(0, listOf(l) - linePrice(l)), 0);
+  const sShort = Object.entries(needBySize)
+    .filter(([id, n]) => n > (onHand[id] || 0))
+    .map(([id, n]) => `${sizeName(id)}: ${qty(n)} needed, ${qty(onHand[id] || 0)} in stock.`);
+  const sIsCredit = sf.pay === 'credit';
+  const sBlocked = !sIsCredit && sShort.length > 0; // credit sales do not reserve stock, so they only warn
+  const shownPerfumes = perfumeGroups.filter((g) => g.name.toLowerCase().includes(sQuery.trim().toLowerCase()));
+
+  // tapping a size adds one piece at the collection price; tapping again adds another.
+  // A line whose price was changed for a discount stays separate from a full-price line.
+  const tapSize = (s) => {
+    setSError('');
+    setSf((p) => {
+      const planned = p.lines.filter((l) => l.size === s.id).reduce((n, l) => n + (parseInt(l.qty, 10) || 0), 0);
+      const have = onHand[s.id] || 0;
+      if (have <= 0) return p; // nothing in stock, whatever the payment type
+      if (!sIsCredit && planned >= have) return p; // cash and bank sales cannot go past the stock
+      const same = p.lines.find((l) => l.size === s.id && Number(l.price) === Number(s.price));
+      if (same) return { ...p, lines: p.lines.map((l) => (l === same ? { ...l, qty: String((parseInt(l.qty, 10) || 0) + 1) } : l)) };
+      return { ...p, lines: [...p.lines, newLine(s.id, String(s.price))] };
+    });
+  };
+  const stepLine = (l, delta) => {
+    const next = (parseInt(l.qty, 10) || 0) + delta;
+    if (next < 1) return setSf((p) => ({ ...p, lines: p.lines.filter((x) => x.key !== l.key) }));
+    setLine(l.key, { qty: String(next) });
+  };
+
+  const saveSale = async (e) => {
+    e.preventDefault();
+    const used = sf.lines.filter((l) => l.size || l.qty);
+    if (used.length === 0) return setSError('Tap a perfume size to add at least one item.');
+    if (used.some((l) => !l.size || !(parseInt(l.qty, 10) > 0))) return setSError('Every item needs a perfume size and a quantity.');
+    if (used.some((l) => !(linePrice(l) > 0))) return setSError('Every item needs a price above zero.');
+    if (sIsCredit && !sf.customer) return setSError('Choose the customer for a credit sale.');
+    if (sBlocked) return setSError(sShort[0]);
+    if (isLateEntry(sf.date) && !sf.lateReason.trim()) return setSError('This is a late entry. Enter why it was not recorded on the day.');
+    setSaving(true);
+    setSError('');
+    const { data, error } = await supabase.rpc('record_sale', {
+      p_date: sf.date || todayLocal(),
+      p_customer: sf.customer || null,
+      p_payment: sf.pay,
+      p_notes: withLateNote(nz(sf.notes), sf.date, sf.lateReason),
+      p_lines: used.map((l) => ({ size_id: l.size, qty: parseInt(l.qty, 10), unit_price: linePrice(l) })),
+    });
+    setSaving(false);
+    if (error) return setSError(error.message);
+    setSOpen(false);
+    await afterChange();
+    if (!sIsCredit && data) setInvoiceId(data); // cash and bank sales get their invoice straight away
+  };
+
+  // ---------- return / exchange ----------
+  const soldBySize = (sale) => {
+    const m = {};
+    (sale?.sale_lines || []).forEach((l) => {
+      m[l.size_id] = m[l.size_id] || { size_id: l.size_id, qty: 0, amount: 0, list: 0 };
+      m[l.size_id].qty += l.qty;
+      m[l.size_id].amount += Number(l.amount);
+      m[l.size_id].list = Math.max(m[l.size_id].list, Number(l.list_price ?? l.unit_price));
+    });
+    // price = collection price (a replacement must match it); paid = what the customer really paid per piece
+    return Object.values(m).map((i) => ({ ...i, price: i.list, paid: i.qty ? i.amount / i.qty : 0 }));
+  };
+  // Pieces of one invoice that can still come back: the invoice's own lines, plus the pieces swapped in
+  // by an APPROVED exchange or replacement on that invoice. Pending and approved requests both use up pieces.
+  const returnSources = (sale) => {
+    if (!sale) return [];
+    const live = returns.filter((r) => r.sale_id === sale.id && r.status !== 'Rejected' && r.status !== 'Voided');
+    const used = (src, sizeId) =>
+      live.filter((r) => (src ? r.source_return_id === src : !r.source_return_id && r.size_id === sizeId)).reduce((n, r) => n + r.qty, 0);
+    // collection price of a swapped-in piece: follow the chain back to the original invoice line
+    const slotPrice = (r) => {
+      const fallback = Number(sizeById[r.repl_size_id]?.price || 0);
+      let c = r;
+      for (let n = 0; c.source_return_id && n < 20; n++) {
+        const up = returns.find((x) => x.id === c.source_return_id);
+        if (!up) return fallback;
+        c = up;
+      }
+      return soldBySize(sale).find((i) => i.size_id === c.size_id)?.price ?? fallback;
+    };
+    const items = soldBySize(sale).map((i) => ({ ...i, key: `o:${i.size_id}`, src: null, swapNo: null, left: i.qty - used(null, i.size_id) }));
+    returns
+      .filter((r) => r.sale_id === sale.id && r.status === 'Approved' && r.repl_size_id && (r.resolution === 'exchange' || r.resolution === 'replace'))
+      .forEach((r) => {
+        items.push({
+          key: `r:${r.id}`, src: r.id, size_id: r.repl_size_id, qty: r.qty,
+          paid: Number(r.unit_price || 0), price: slotPrice(r), swapNo: r.return_no,
+          left: r.qty - used(r.id, r.repl_size_id),
+        });
+      });
+    return items;
+  };
+
+  const openReturn = (saleId = '') => {
+    setRf(blankReturn(saleId));
+    setRQuery('');
+    setRActive(0);
+    setRError('');
+    setROpen(true);
+  };
+  const postedSales = sales.filter((s) => s.status === 'Posted');
+  const rSale = saleById[rf.sale];
+  // Every word typed must appear somewhere in: invoice number, customer name, date or amount
+  const rTokens = rQuery.toLowerCase().split(/\s+/).filter(Boolean);
+  const rMatches = postedSales.filter((s) => {
+    if (rTokens.length === 0) return true;
+    const hay = `inv-${pad(s.invoice_no)} ${s.invoice_no} ${s.customers?.name || 'walk-in'} ${fmtDate(s.invoice_date)} ${s.total}`.toLowerCase();
+    return rTokens.every((t) => hay.includes(t));
+  });
+  const pickSale = (sale) => {
+    setRf((p) => ({ ...p, sale: sale.id, lines: [] }));
+    setRQuery('');
+    setRActive(0);
+  };
+  const rItems = returnSources(rSale).filter((i) => i.left > 0);
+  const rItemByKey = Object.fromEntries(rItems.map((i) => [i.key, i]));
+  const srcTag = (i) => (i?.swapNo ? ` (swapped in, RT-${String(i.swapNo).padStart(4, '0')})` : '');
+  const rPlanned = {}; // pieces added to this request, per item (an item is an invoice line or a swapped-in piece)
+  rf.lines.forEach((l) => { rPlanned[l.item] = (rPlanned[l.item] || 0) + (parseInt(l.qty, 10) || 0); });
+  const rReplNeed = {}; // replacement pieces that must leave Finished Goods, per item
+  rf.lines.forEach((l) => {
+    if (l.resolution === 'refund') return;
+    const id = l.repl || l.size;
+    rReplNeed[id] = (rReplNeed[id] || 0) + (parseInt(l.qty, 10) || 0);
+  });
+  const rShort = Object.entries(rReplNeed)
+    .filter(([id, n]) => n > (onHand[id] || 0))
+    .map(([id, n]) => `${sizeName(id)}: ${n} needed, ${qty(onHand[id] || 0)} in stock`);
+  const rPieces = rf.lines.reduce((n, l) => n + (parseInt(l.qty, 10) || 0), 0);
+  const rGiven = Object.values(rReplNeed).reduce((n, v) => n + v, 0);
+  const rRefund = rf.lines.reduce((t, l) => (l.resolution === 'refund' ? t + (parseInt(l.qty, 10) || 0) * (rItemByKey[l.item]?.paid || 0) : t), 0);
+  const replOptionsFor = (itemKey) => (rItemByKey[itemKey] ? sellable.filter((s) => Number(s.price) === rItemByKey[itemKey].price) : []);
+
+  // Tapping an item adds one piece with the reason and outcome currently chosen; tapping again adds another.
+  const tapReturnItem = (item) => {
+    setRError('');
+    setRf((p) => {
+      const planned = p.lines.filter((l) => l.item === item.key).reduce((n, l) => n + (parseInt(l.qty, 10) || 0), 0);
+      if (planned >= item.left) return p;
+      const same = p.lines.find((l) => l.item === item.key && l.reason === p.reason && l.resolution === p.resolution);
+      if (same) return { ...p, lines: p.lines.map((l) => (l === same ? { ...l, qty: String((parseInt(l.qty, 10) || 0) + 1) } : l)) };
+      return { ...p, lines: [...p.lines, { key: `r${++keySeed}`, item: item.key, src: item.src, size: item.size_id, qty: '1', reason: p.reason, resolution: p.resolution, repl: '' }] };
+    });
+  };
+  const setRLine = (key, patch) => setRf((p) => ({ ...p, lines: p.lines.map((l) => (l.key === key ? { ...l, ...patch } : l)) }));
+  const stepRLine = (l, delta) => {
+    const next = (parseInt(l.qty, 10) || 0) + delta;
+    if (next < 1) return setRf((p) => ({ ...p, lines: p.lines.filter((x) => x.key !== l.key) }));
+    if (delta > 0 && (rPlanned[l.item] || 0) >= (rItemByKey[l.item]?.left || 0)) return;
+    setRLine(l.key, { qty: String(next) });
+  };
+
+  const saveReturn = async (e) => {
+    e.preventDefault();
+    if (!rf.sale) return setRError('Choose the invoice the items were sold on.');
+    if (rf.lines.length === 0) return setRError('Tap an item on the left to add it to the return.');
+    for (const l of rf.lines) {
+      if (!((parseInt(l.qty, 10) || 0) > 0)) return setRError('Every item needs a number of pieces.');
+    }
+    for (const [itemKey, n] of Object.entries(rPlanned)) {
+      const left = rItemByKey[itemKey]?.left || 0;
+      if (n > left) return setRError(`Only ${left} piece(s) of ${sizeName(rItemByKey[itemKey]?.size_id)}${srcTag(rItemByKey[itemKey])} can still be returned on this sale.`);
+    }
+    setSaving(true);
+    setRError('');
+    const { error } = await supabase.rpc('request_sales_return_batch', {
+      p_date: rf.date || todayLocal(),
+      p_sale: rf.sale,
+      p_notes: nz(rf.notes),
+      p_lines: rf.lines.map((l) => ({
+        size_id: l.size,
+        source_return_id: l.src || null,
+        qty: parseInt(l.qty, 10),
+        reason: l.reason,
+        resolution: l.resolution,
+        repl_size_id: l.resolution === 'refund' ? null : l.repl || l.size,
+      })),
+    });
+    setSaving(false);
+    if (error) return setRError(error.message);
+    setROpen(false);
+    setTab('returns');
+    await afterChange();
+  };
+
+  // ---------- approve / reject ----------
+  const openDecision = (kind, row) => {
+    setDeciding({ kind, row });
+    setRefundMethod('bank');
+    setReason('');
+    setDecError('');
+  };
+  const decide = async (approve) => {
+    const { kind, row } = deciding;
+    if (!approve && !reason.trim()) return setDecError('Please give a reason for rejecting.');
+    setSaving(true);
+    setDecError('');
+    const fn = kind === 'sale' ? (approve ? 'approve_credit_sale' : 'reject_credit_sale') : approve ? 'approve_sales_return' : 'reject_sales_return';
+    // a return request is decided as a whole: the database applies it to every item that shares the RT number
+    const id = kind === 'return' ? row.lines[0].id : row.id;
+    const needsMethod = kind === 'return' && row.sales?.payment_type === 'credit' && row.lines.some((l) => l.resolution === 'refund');
+    const args = !approve ? { p_id: id, p_reason: reason.trim() } : needsMethod ? { p_id: id, p_refund_method: refundMethod } : { p_id: id };
+    const { error } = await supabase.rpc(fn, args);
+    setSaving(false);
+    if (error) return setDecError(error.message);
+    setDeciding(null);
+    await afterChange();
+    if (approve && kind === 'sale') setInvoiceId(row.id);
+  };
+
+  // ---------- void ----------
+  const doVoid = async (e) => {
+    e.preventDefault();
+    if (!voidReason.trim()) return setVoidError('Please give a reason.');
+    setSaving(true);
+    setVoidError('');
+    const { error } = await supabase.rpc('void_sale', { p_id: voiding.id, p_reason: voidReason.trim() });
+    setSaving(false);
+    if (error) return setVoidError(error.message);
+    setVoiding(null);
+    await afterChange();
+  };
+
+  // A return slip is voided as a whole: the database applies it to every item that shares the RT number
+  const doVoidReturn = async (e) => {
+    e.preventDefault();
+    if (!voidReason.trim()) return setVoidError('Please give a reason.');
+    setSaving(true);
+    setVoidError('');
+    const { error } = await supabase.rpc('void_sales_return', { p_id: voidingRet.lines[0].id, p_reason: voidReason.trim() });
+    setSaving(false);
+    if (error) return setVoidError(error.message);
+    setVoidingRet(null);
+    await afterChange();
+  };
+
+  // ---------- documents ----------
+  const invoice = saleById[invoiceId];
+  const slip = requests.find((q) => q.key === slipId);
+  const linesOf = (s) => [...(s.sale_lines || [])].sort((a, b) => a.line_no - b.line_no);
+
+  // ----- what happened to an invoice after it was issued (the invoice lines themselves never change) -----
+  const reqsOf = (saleId) => requests.filter((q) => q.sale_id === saleId).sort((a, b) => a.return_no - b.return_no);
+  const lineText = (r) => {
+    const from = r.source_return_id ? returns.find((x) => x.id === r.source_return_id) : null;
+    const what = `${sizeName(r.size_id)} × ${r.qty}${from ? ` (swapped in on RT-${String(from.return_no).padStart(4, '0')})` : ''}`;
+    if (r.resolution === 'exchange') return { what, result: `exchanged for ${sizeName(r.repl_size_id)} × ${r.qty}` };
+    if (r.resolution === 'replace') return { what, result: `damaged, replaced with ${sizeName(r.repl_size_id)} × ${r.qty}` };
+    return { what, result: `${r.reason === 'returned' ? 'returned' : 'damaged'}, refunded ${peso(r.refund_amount)}` };
+  };
+  // Only APPROVED requests count towards amounts and what the customer holds. Pending ones are shown but not counted.
+  const statementOf = (s) => {
+    const qs = reqsOf(s.id);
+    const done = qs.filter((q) => q.status === 'Approved');
+    const doneLines = done.flatMap((q) => q.lines);
+    const refunds = doneLines.reduce((t, l) => t + (l.resolution === 'refund' ? Number(l.refund_amount || 0) : 0), 0);
+    const paidBack = doneLines.reduce((t, l) => t + Number(l.refund_paid || 0), 0);
+    const held = {};
+    linesOf(s).forEach((l) => { held[l.size_id] = (held[l.size_id] || 0) + l.qty; });
+    doneLines.forEach((l) => {
+      held[l.size_id] = (held[l.size_id] || 0) - l.qty;
+      if (l.repl_size_id) held[l.repl_size_id] = (held[l.repl_size_id] || 0) + l.qty;
+    });
+    const holds = Object.entries(held)
+      .filter(([, n]) => n > 0)
+      .map(([id, n]) => ({ name: sizeName(id), n }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return {
+      qs,
+      done,
+      pending: qs.filter((q) => q.status === 'Pending'),
+      refunds,
+      paidBack,
+      net: Number(s.total) - refunds,
+      holds,
+      bal: s.payment_type === 'credit' ? invBal[s.id] || null : null, // balances exist for credit invoices only
+    };
+  };
+  // Internal record of how a request was decided
+  const decisionText = (q) => {
+    const l = q.lines[0];
+    if (q.status === 'Pending') return 'Waiting for the owner to approve.';
+    if (q.status === 'Rejected') return `Rejected ${fmtStamp(l.decided_at)}${l.reject_reason ? `. Reason: ${l.reject_reason}` : ''}`;
+    if (q.status === 'Voided') return `Voided ${fmtStamp(l.voided_at)}${l.void_reason ? `. Reason: ${l.void_reason}` : ''}. Stock and books were reversed.`;
+    const je = l.journal_entry_id ? (jeNo[l.journal_entry_id] != null ? ` · Journal entry ${jeNo[l.journal_entry_id]}` : ' · Journal entry (number not available)') : ' · No journal entry was needed';
+    return `Approved ${fmtStamp(l.decided_at)}${je}`;
+  };
+
+  // Printed section under the invoice: returns and exchanges, the amounts and what the customer holds now.
+  // The customer copy shows approved requests only; the internal copy also shows pending and rejected ones and the decision details.
+  const adjustmentsHtml = (s, internal) => {
+    const st = statementOf(s);
+    const shown = internal ? st.qs : st.done;
+    if (shown.length === 0 && !st.bal) return '';
+    const asOf = fmtDate(todayLocal());
+    const row = (label, val, cls = '') => `<tr class="${cls}"><td>${esc(label)}</td><td class="r">${esc(val)}</td></tr>`;
+    let h = '';
+    if (shown.length > 0) {
+      h += `<h3>Returns and exchanges after invoicing</h3><div class="sub">The items above are as invoiced. Later changes are listed here.</div>`;
+      shown.forEach((q) => {
+        h += `<div style="margin-top:14px;font-size:13px"><strong>RT-${pad(q.return_no)}</strong> · ${esc(fmtDate(q.return_date))}${q.status !== 'Approved' ? ` · ${esc(RET_TEXT[q.status] || q.status)}` : ''}</div>`;
+        h += `<table><tbody>${q.lines.map((r) => { const t = lineText(r); return `<tr><td>${esc(t.what)}</td><td>${esc(t.result)}</td></tr>`; }).join('')}</tbody></table>`;
+        if (internal) h += `<div class="int">${esc(decisionText(q))}</div>`;
+      });
+    }
+    if (st.done.length > 0 || st.bal) {
+      h += '<table class="tt"><tbody>';
+      h += row('Invoice total', peso(s.total));
+      if (st.refunds > 0) h += row('Less: refunds', `(${peso(st.refunds)})`);
+      if (st.done.length > 0) h += row('Net amount', peso(st.net), 'b');
+      if (st.bal) {
+        h += row(`Less: payments received (up to ${asOf})`, `(${peso(st.bal.paid)})`);
+        if (st.paidBack > 0) h += row(internal ? 'Add: refunds already paid back to the customer' : 'Add: refunds already paid back to you', peso(st.paidBack));
+        h += row(`Balance as of ${asOf}`, peso(st.bal.balance), 'b');
+      }
+      h += '</tbody></table>';
+    }
+    if (st.done.length > 0) {
+      h += `<h3>${internal ? 'Items the customer holds now' : 'Items you hold now'}</h3><div style="font-size:13px">${st.holds.length ? st.holds.map((x) => `${esc(x.name)} × ${x.n}`).join('; ') : 'None'}</div>`;
+    }
+    return h;
+  };
+
+  const printInvoice = (s, internal = false) =>
+    printDoc(
+      `INV-${pad(s.invoice_no)}${internal ? ' (internal copy)' : ''}`,
+      `${internal ? '<div class="banner">INTERNAL COPY - not for the customer</div>' : ''}<h1>Chinito Scento</h1><div class="sub">Sales Invoice</div>
+       <div class="meta">
+         <div><strong>INV-${pad(s.invoice_no)}</strong><br>Date: ${esc(fmtDate(s.invoice_date))}<br>Sale ref: SL-${pad(s.sale_no)}</div>
+         <div><strong>${esc(s.customers?.name || 'Walk-in customer')}</strong><br>${esc(s.customers?.address || '')}<br>Payment: ${esc(PAY[s.payment_type])}
+         ${s.payment_type === 'credit' ? `<br><strong>Due date: ${esc(fmtDate(s.due_date))}</strong>` : ''}</div>
+       </div>
+       <table><thead><tr><th>Item</th><th class="r">Qty</th><th class="r">Unit price</th><th class="r">Amount</th></tr></thead><tbody>
+       ${linesOf(s).map((l) => `<tr><td>${esc(sizeName(l.size_id))}</td><td class="r">${l.qty}</td><td class="r">${esc(peso(l.unit_price))}</td><td class="r">${esc(peso(l.amount))}</td></tr>`).join('')}
+       </tbody></table>
+       <div class="total">Total: ${esc(peso(s.total))}</div>
+       ${adjustmentsHtml(s, internal)}
+       <p class="sub" style="margin-top:28px">${s.payment_type === 'credit' ? 'Payable on or before the due date. Balance shown as of the print date. See your statement of account for the latest.' : 'Paid. Thank you!'}</p>`
+    );
+
+  const slipOutcome = (r, sp = refundSplit(r)) => {
+    if (r.resolution === 'exchange') return 'Exchanged for the same-priced item. No money changes hands.';
+    if (r.resolution === 'replace') return 'Damaged piece replaced. No money changes hands.';
+    const how = (m) => (m === 'bank' ? 'by bank transfer' : 'in cash');
+    const what = r.reason === 'returned' ? 'Piece returned and refunded' : 'Damaged piece refunded';
+    const stockNote = r.reason === 'returned' ? ' The piece goes back into Finished Goods.' : '';
+    if (r.sales?.payment_type !== 'credit') return `${what}: ${peso(r.refund_amount)} ${how(sp.method)}.${stockNote}`;
+    const parts = [];
+    if (sp.ar > 0) parts.push(`${peso(sp.ar)} deducted from the customer balance`);
+    if (sp.paid > 0) parts.push(`${peso(sp.paid)} already paid by the customer, paid back ${sp.method ? how(sp.method) : 'in cash or by bank transfer (chosen on approval)'}`);
+    return `${what}: ${peso(r.refund_amount)} (${parts.join('; ')}).${stockNote}`;
+  };
+  const printSlip = (q, internal = false) => {
+    const sps = splitsOf(q);
+    const refundTotal = q.lines.reduce((t, r) => t + (r.resolution === 'refund' ? Number(r.refund_amount || 0) : 0), 0);
+    return printDoc(
+      `RT-${pad(q.return_no)}${internal ? ' (internal copy)' : ''}`,
+      `${internal ? '<div class="banner">INTERNAL COPY - not for the customer</div>' : ''}<h1>Chinito Scento</h1><div class="sub">Return / Exchange Slip</div>
+       <div class="meta">
+         <div><strong>RT-${pad(q.return_no)}</strong><br>Date: ${esc(fmtDate(q.return_date))}${internal || q.status !== 'Approved' ? `<br>Status: ${esc(RET_TEXT[q.status] || q.status)}` : ''}</div>
+         <div><strong>${esc(q.sales?.customers?.name || 'Walk-in customer')}</strong><br>Original invoice: INV-${pad(q.sales?.invoice_no)}</div>
+       </div>
+       <table><thead><tr><th>Reason</th><th>Item returned</th><th>Item given</th><th>Outcome</th></tr></thead><tbody>
+       ${q.lines.map((r, i) => `<tr><td>${esc(kindOf(r))}</td><td>${esc(sizeName(r.size_id))} × ${r.qty}</td><td>${r.repl_size_id ? `${esc(sizeName(r.repl_size_id))} × ${r.qty}` : '-'}</td><td>${esc(slipOutcome(r, sps[i]))}</td></tr>`).join('')}
+       </tbody></table>
+       ${refundTotal > 0 ? `<div class="total">Total refund: ${esc(peso(refundTotal))}</div>` : ''}
+       ${q.notes ? `<p class="sub">Notes: ${esc(q.notes)}</p>` : ''}
+       ${internal ? `<div class="int"><strong>Internal record</strong><br>Invoice INV-${pad(q.sales?.invoice_no)} · ${esc(decisionText(q))}</div>` : ''}
+       <div class="sig"><div>Customer</div><div>Received by</div></div>`
+    );
+  };
+
+  // ---------- render ----------
+  return (
+    <div>
+      <PageHeader title="Sales and Return/Exchange" subtitle="Cash and credit sales, invoices, and returns or exchanges">
+        <div className="flex flex-wrap gap-2">
+          <button onClick={() => openReturn()} className="cs-btn cs-btn-ghost px-4 py-2.5">
+            <RotateCcw className="w-4 h-4 text-[#d9b24c]" aria-hidden="true" />
+            <span>Return / Exchange</span>
+          </button>
+          <button onClick={openSale} className="cs-btn cs-btn-gold px-4 py-2.5">
+            <PlusCircle className="w-4 h-4" aria-hidden="true" />
+            <span>New Sale</span>
+          </button>
+        </div>
+      </PageHeader>
+
+      <ErrorNote>{loadError}</ErrorNote>
+
+      <div className="flex gap-2 mb-5" role="tablist" aria-label="Sales sections">
+        {[['sales', 'Sales', pendingSales], ['returns', 'Returns & Exchanges', pendingReturns]].map(([id, label, n]) => (
+          <button
+            key={id}
+            role="tab"
+            aria-selected={tab === id}
+            onClick={() => setTab(id)}
+            className={`px-4 py-2 rounded-xl text-sm font-medium border cursor-pointer transition-colors ${tab === id ? 'bg-[#1f1b12] text-[#e3bf5a] border-[#3a3014]' : 'text-[#a8a090] border-[#2a2622] hover:bg-[#1a1816]'}`}
+          >
+            {label}
+            {n > 0 && <span className="ml-2 inline-flex min-w-[18px] h-[18px] px-1 rounded-full bg-[#e5a93d] text-[#0e0d0c] text-[10px] font-semibold items-center justify-center">{n}</span>}
+          </button>
+        ))}
+      </div>
+
+      {loading ? (
+        <p className="text-sm text-[#a8a090]">Loading...</p>
+      ) : tab === 'sales' ? (
+        <div className="cs-card overflow-hidden">
+          {sales.length === 0 ? (
+            <EmptyState icon={ShoppingBag} title="No sales yet" text="Cash and bank sales post at once. Credit sales wait for the owner's approval." actionLabel="New Sale" onAction={openSale} />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-[#1a1816] text-xs uppercase tracking-wider text-[#a8a090] border-b border-[#2a2622]">
+                  <tr>
+                    <th className="px-4 py-3 font-medium">Sale</th>
+                    <th className="px-4 py-3 font-medium">Customer</th>
+                    <th className="px-4 py-3 font-medium">Payment</th>
+                    <th className="px-4 py-3 font-medium text-right">Total</th>
+                    <th className="px-4 py-3 font-medium">Invoice</th>
+                    <th className="px-4 py-3 font-medium">Due</th>
+                    <th className="px-4 py-3 font-medium">Status</th>
+                    <th className="px-4 py-3 sticky right-0 z-10 bg-[#1a1816]"><span className="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#24201c]">
+                  {sales.map((s) => {
+                    const left = s.due_date ? daysUntil(s.due_date) : null;
+                    return (
+                      <tr key={s.id} className={`bg-[#141210] hover:bg-[#1c1916] transition-colors ${s.status === 'Voided' || s.status === 'Rejected' ? 'opacity-60' : ''}`}>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <div className="font-mono text-xs text-[#e3bf5a]">SL-{pad(s.sale_no)}</div>
+                          <div className="text-xs text-[#a8a090] mt-0.5">{fmtDate(s.sale_date)}</div>
+                        </td>
+                        <td className="px-4 py-3">{s.customers?.name || <span className="text-[#a8a090]">Walk-in</span>}</td>
+                        <td className="px-4 py-3 text-xs">{PAY[s.payment_type]}</td>
+                        <td className="px-4 py-3 text-right font-mono">{peso(s.total)}</td>
+                        <td className="px-4 py-3 font-mono text-xs whitespace-nowrap">{s.invoice_no ? `INV-${pad(s.invoice_no)}` : <span className="text-[#a8a090]">-</span>}</td>
+                        <td className="px-4 py-3 text-xs whitespace-nowrap">
+                          {s.payment_type !== 'credit' ? (
+                            <span className="text-[#a8a090]">-</span>
+                          ) : s.due_date && s.status === 'Posted' ? (
+                            <>
+                              {fmtDate(s.due_date)}
+                              {invBal[s.id] && invBal[s.id].balance <= 0 ? (
+                                <div className="text-[#3ecf8e]">Fully paid</div>
+                              ) : (
+                                <>
+                                  <div className={left < 0 ? 'text-[#e5736d]' : 'text-[#a8a090]'}>{left < 0 ? `${-left} day${left === -1 ? '' : 's'} overdue` : left === 0 ? 'Due today' : `in ${left} day${left === 1 ? '' : 's'}`}</div>
+                                  {invBal[s.id] && invBal[s.id].paid > 0 && <div className="text-[10px] text-[#a8a090]">Balance {peso(invBal[s.id].balance)}</div>}
+                                </>
+                              )}
+                            </>
+                          ) : (
+                            <span className="text-[#a8a090]">{s.status === 'Pending' ? 'Set on approval' : '-'}</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          <Badge tone={SALE_TONE[s.status]}>{SALE_TEXT[s.status] || s.status}</Badge>
+                          {s.status === 'Rejected' && s.reject_reason && <div className="text-[10px] text-[#a8a090] mt-1">{s.reject_reason}</div>}
+                          {s.status === 'Voided' && s.void_reason && <div className="text-[10px] text-[#a8a090] mt-1">{s.void_reason}</div>}
+                        </td>
+                        <td className="px-4 py-3 text-right whitespace-nowrap sticky right-0 z-10 bg-inherit shadow-[-14px_0_12px_-12px_rgba(0,0,0,0.7)]">
+                          <div className="inline-flex gap-2">
+                            {s.status === 'Pending' && isOwner && (
+                              <button onClick={() => openDecision('sale', s)} className="cs-btn cs-btn-gold px-3 py-1.5 text-xs">
+                                <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />
+                                <span>Review</span>
+                              </button>
+                            )}
+                            {s.status === 'Posted' && (
+                              <>
+                                <button onClick={() => setInvoiceId(s.id)} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs" aria-label={`View invoice INV-${pad(s.invoice_no)}`}>
+                                  <FileText className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+                                  <span>Invoice</span>
+                                </button>
+                                <button onClick={() => openReturn(s.id)} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs" title="Return / Exchange" aria-label={`Return or exchange on INV-${pad(s.invoice_no)}`}>
+                                  <RotateCcw className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+                                  <span className="sr-only">Return</span>
+                                </button>
+                                {isOwner && (
+                                  <button onClick={() => { setVoiding(s); setVoidReason(''); setVoidError(''); }} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs" title="Void sale" aria-label={`Void INV-${pad(s.invoice_no)}`}>
+                                    <Ban className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+                                    <span className="sr-only">Void</span>
+                                  </button>
+                                )}
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="cs-card overflow-hidden">
+          {requests.length === 0 ? (
+            <EmptyState icon={RotateCcw} title="No returns or exchanges" text="Swaps, damaged pieces and good items sent back are recorded here and approved by the owner." actionLabel="Return / Exchange" onAction={() => openReturn()} />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-[#1a1816] text-xs uppercase tracking-wider text-[#a8a090] border-b border-[#2a2622]">
+                  <tr>
+                    <th className="px-4 py-3 font-medium">Slip</th>
+                    <th className="px-4 py-3 font-medium">Invoice</th>
+                    <th className="px-4 py-3 font-medium">Customer</th>
+                    <th className="px-4 py-3 font-medium">Type</th>
+                    <th className="px-4 py-3 font-medium">Items</th>
+                    <th className="px-4 py-3 font-medium text-right">Qty</th>
+                    <th className="px-4 py-3 font-medium">Status</th>
+                    <th className="px-4 py-3 sticky right-0 z-10 bg-[#1a1816]"><span className="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#24201c]">
+                  {requests.map((q) => {
+                    const kinds = [...new Set(q.lines.map((l) => kindOf(l)))];
+                    const pieces = q.lines.reduce((n, l) => n + l.qty, 0);
+                    const only = q.lines[0];
+                    return (
+                      <tr key={q.key} className={`bg-[#141210] hover:bg-[#1c1916] transition-colors ${q.status === 'Rejected' || q.status === 'Voided' ? 'opacity-60' : ''}`}>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <div className="font-mono text-xs text-[#e3bf5a]">RT-{pad(q.return_no)}</div>
+                          <div className="text-xs text-[#a8a090] mt-0.5">{fmtDate(q.return_date)}</div>
+                        </td>
+                        <td className="px-4 py-3 font-mono text-xs whitespace-nowrap">INV-{pad(q.sales?.invoice_no)}</td>
+                        <td className="px-4 py-3">{q.sales?.customers?.name || <span className="text-[#a8a090]">Walk-in</span>}</td>
+                        <td className="px-4 py-3 text-xs">{kinds.length === 1 ? kinds[0] : 'Mixed'}</td>
+                        <td className="px-4 py-3">
+                          {q.lines.length === 1 ? (
+                            <>
+                              {sizeName(only.size_id)}
+                              {only.repl_size_id && only.repl_size_id !== only.size_id && <div className="text-[10px] text-[#a8a090]">Swap with {sizeName(only.repl_size_id)}</div>}
+                            </>
+                          ) : (
+                            <>
+                              <div>{q.lines.length} items</div>
+                              <div className="text-[10px] text-[#a8a090]">
+                                {q.lines.slice(0, 2).map((l) => sizeName(l.size_id)).join(', ')}
+                                {q.lines.length > 2 ? ` +${q.lines.length - 2} more` : ''}
+                              </div>
+                            </>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-right font-mono">{pieces}</td>
+                        <td className="px-4 py-3">
+                          <Badge tone={RET_TONE[q.status]}>{RET_TEXT[q.status] || q.status}</Badge>
+                          {q.status === 'Rejected' && q.reject_reason && <div className="text-[10px] text-[#a8a090] mt-1">{q.reject_reason}</div>}
+                          {q.status === 'Voided' && q.void_reason && <div className="text-[10px] text-[#a8a090] mt-1">{q.void_reason}</div>}
+                        </td>
+                        <td className="px-4 py-3 text-right whitespace-nowrap sticky right-0 z-10 bg-inherit shadow-[-14px_0_12px_-12px_rgba(0,0,0,0.7)]">
+                          <div className="inline-flex gap-2">
+                            {q.status === 'Pending' && isOwner && (
+                              <button onClick={() => openDecision('return', q)} className="cs-btn cs-btn-gold px-3 py-1.5 text-xs">
+                                <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />
+                                <span>Review</span>
+                              </button>
+                            )}
+                            {q.status === 'Approved' && isOwner && (
+                              <button onClick={() => { setVoidingRet(q); setVoidReason(''); setVoidError(''); }} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs" title="Void return / exchange" aria-label={`Void RT-${pad(q.return_no)}`}>
+                                <Ban className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+                                <span className="sr-only">Void</span>
+                              </button>
+                            )}
+                            <button onClick={() => setSlipId(q.key)} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs" aria-label={`View slip RT-${pad(q.return_no)}`}>
+                              <FileText className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+                              <span>Slip</span>
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------- New sale ---------- */}
+      {sOpen && (
+        <Modal title="New Sale" onClose={() => setSOpen(false)} dirty={sf.lines.length > 0} xl>
+          <form onSubmit={saveSale} className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,28rem)] gap-6 lg:flex-1 lg:min-h-0">
+            {/* ---------- LEFT: what to choose ---------- */}
+            <div className="flex flex-col gap-3 lg:min-h-0">
+              <div className="flex flex-wrap items-end justify-between gap-3">
+                <fieldset>
+                  <legend className="cs-label">Payment</legend>
+                  <div className="flex gap-1.5">
+                    {Object.entries(PAY).map(([val, label]) => (
+                      <label key={val} className={`cursor-pointer rounded-lg border px-3.5 py-2 text-sm text-center whitespace-nowrap transition-colors ${sf.pay === val ? 'border-[#d9b24c] bg-[#1f1b12] text-[#e3bf5a]' : 'border-[#2a2622] text-[#a8a090] hover:bg-[#1a1816]'}`}>
+                        <input
+                          type="radio"
+                          name="s-pay"
+                          value={val}
+                          checked={sf.pay === val}
+                          onChange={() => setSf((p) => ({ ...p, pay: val, customer: val === 'credit' && !credit[p.customer]?.credit_allowed && isOwner ? '' : p.customer }))}
+                          className="sr-only"
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+                <div className="w-44">
+                  <label htmlFor="s-date" className="cs-label">Date</label>
+                  <input id="s-date" type="date" value={sf.date} onChange={(e) => setSf((p) => ({ ...p, date: e.target.value }))} required className="cs-input px-3 py-2" />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="s-customer" className="cs-label">Customer{sIsCredit ? '' : ' (optional)'}</label>
+                  <select id="s-customer" value={sf.customer} onChange={(e) => setSf((p) => ({ ...p, customer: e.target.value }))} className="cs-input px-3 py-2">
+                    <option value="">{sIsCredit ? 'Select customer...' : 'Walk-in customer'}</option>
+                    {customerOptions.map((c) => (
+                      <option key={c.id} value={c.id}>{c.name}</option>
+                    ))}
+                  </select>
+                  {sIsCredit && isOwner && customerOptions.length === 0 && (
+                    <p className="text-[11px] text-[#e5a93d] mt-1">No customer is allowed credit yet. Turn it on in Customers.</p>
+                  )}
+                </div>
+                <div>
+                  <label htmlFor="s-find" className="cs-label">Perfume and size</label>
+                  <div className="relative">
+                    <Search className="w-4 h-4 text-[#a8a090] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" aria-hidden="true" />
+                    <input id="s-find" type="search" value={sQuery} onChange={(e) => setSQuery(e.target.value)} placeholder="Search perfume" className="cs-input pl-9 pr-3 py-2" />
+                  </div>
+                </div>
+              </div>
+
+              {/* Compact tiles: a tile is only as big as the sizes the perfume really has.
+                  The list only scrolls if the catalogue is longer than the window. */}
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(10.5rem,1fr))] gap-2 content-start max-h-80 overflow-y-auto pr-1 lg:max-h-none lg:flex-1 lg:min-h-0">
+                {shownPerfumes.map((g) => (
+                  <div key={g.id} className="rounded-lg border border-[#2a2622] bg-[#14120f] p-2">
+                    <div className="text-xs font-medium truncate mb-1.5" title={g.name}>{g.name}</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {g.sizes.map((s) => {
+                        const have = onHand[s.id] || 0;
+                        const noPrice = !(Number(s.price) > 0);
+                        const inSale = needBySize[s.id] || 0;
+                        const off = noPrice || have <= 0; // greyed out and not tappable, whatever the payment type
+                        const stockTone = have <= 0 ? 'text-[#e5736d]' : have <= 5 ? 'text-[#e5a93d]' : 'text-[#a8a090]';
+                        return (
+                          <button
+                            key={s.id}
+                            type="button"
+                            disabled={off}
+                            title={noPrice ? 'No price set' : have <= 0 ? 'Out of stock' : undefined}
+                            onClick={() => tapSize(s)}
+                            aria-label={`Add ${g.name} ${qty(s.size_ml)} ml${noPrice ? ', no price set' : `, ${peso(s.price)}, ${qty(have)} in stock`}`}
+                            className={`relative rounded-md border px-2 py-1 text-center leading-tight transition-colors cursor-pointer disabled:cursor-not-allowed ${inSale > 0 ? 'border-[#d9b24c] bg-[#1f1b12]' : off ? 'border-dashed border-[#2a2622] bg-[#14120f] opacity-45 grayscale' : 'border-[#2a2622] bg-[#181613] hover:border-[#d9b24c]'}`}
+                          >
+                            {inSale > 0 && (
+                              <span className="absolute -top-2 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-[#d9b24c] text-[#0e0d0c] text-[10px] font-semibold flex items-center justify-center">{inSale}</span>
+                            )}
+                            <span className="block text-xs font-medium whitespace-nowrap">
+                              {qty(s.size_ml)} ml <span className="font-mono text-[#e3bf5a]">{noPrice ? '-' : peso(s.price)}</span>
+                            </span>
+                            <span className={`block text-[10px] ${noPrice ? 'text-[#a8a090]' : stockTone}`}>{noPrice ? 'no price set' : have <= 0 ? 'out of stock' : `${qty(have)} left`}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+                {shownPerfumes.length === 0 && (
+                  <p className="col-span-full text-xs text-[#a8a090] text-center py-4">{perfumeGroups.length === 0 ? 'No perfume is ready to sell yet.' : 'No perfume matches that search.'}</p>
+                )}
+              </div>
+            </div>
+
+            {/* ---------- RIGHT: the sale, the total and the save buttons ---------- */}
+            <div className="flex flex-col gap-3 lg:min-h-0 lg:border-l lg:border-[#2a2622] lg:pl-6">
+              <div className="flex flex-col lg:flex-1 lg:min-h-0">
+                <div className="cs-label">Items in this sale{sf.lines.length > 0 ? ` (${sf.lines.length})` : ''}</div>
+                <div className="lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
+                  {sf.lines.length === 0 ? (
+                    <p className="text-xs text-[#a8a090] rounded-xl border border-dashed border-[#2a2622] px-4 py-5 text-center">Tap a size on the left to add it to the sale.</p>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {sf.lines.map((l, n) => {
+                        const list = listOf(l);
+                        const price = linePrice(l);
+                        const q = parseInt(l.qty, 10) || 0;
+                        const atStock = !sIsCredit && (needBySize[l.size] || 0) >= (onHand[l.size] || 0);
+                        return (
+                          <div key={l.key} className="rounded-lg border border-[#2a2622] bg-[#14120f] px-2 py-1.5">
+                            <div className="flex items-center gap-2">
+                              <div className="flex-1 min-w-0 text-xs leading-tight">{sizeName(l.size)}</div>
+                              <div className="flex items-center rounded-md border border-[#2a2622] shrink-0">
+                                <button type="button" onClick={() => stepLine(l, -1)} className="w-6 h-8 flex items-center justify-center text-[#e3bf5a] cursor-pointer" aria-label={`Decrease quantity for item ${n + 1}`}>
+                                  <Minus className="w-3 h-3" aria-hidden="true" />
+                                </button>
+                                <label htmlFor={`sq-${l.key}`} className="sr-only">Quantity for item {n + 1}</label>
+                                <input id={`sq-${l.key}`} type="number" min="1" step="1" value={l.qty} onChange={(e) => setLine(l.key, { qty: e.target.value })} className="w-8 bg-transparent text-center text-xs outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none" />
+                                <button type="button" disabled={atStock} onClick={() => stepLine(l, 1)} className="w-6 h-8 flex items-center justify-center text-[#e3bf5a] cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed" aria-label={`Increase quantity for item ${n + 1}`}>
+                                  <Plus className="w-3 h-3" aria-hidden="true" />
+                                </button>
+                              </div>
+                              <div className="w-[4.5rem] shrink-0">
+                                <label htmlFor={`sp-${l.key}`} className="sr-only">Price for item {n + 1}</label>
+                                <input id={`sp-${l.key}`} type="number" min="0.01" step="0.01" placeholder="Price" value={l.price} onChange={(e) => setLine(l.key, { price: e.target.value })} className="cs-input px-2 py-1.5 text-xs text-right" />
+                              </div>
+                              <div className="w-[4.5rem] shrink-0 text-right font-mono text-xs">{peso(q * price)}</div>
+                              <button type="button" onClick={() => setSf((p) => ({ ...p, lines: p.lines.filter((x) => x.key !== l.key) }))} className="text-[#a8a090] hover:text-[#e5736d] cursor-pointer shrink-0" aria-label={`Remove item ${n + 1}`}>
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                            {l.size && list > 0 && price > 0 && price !== list && (
+                              <div className={`mt-1 text-[10px] ${price < list ? 'text-[#e5a93d]' : 'text-[#a8a090]'}`}>
+                                {price < list
+                                  ? `Discount of ${peso(list - price)} per piece (${(((list - price) / list) * 100).toFixed(1)}% off the collection price of ${peso(list)})`
+                                  : `${peso(price - list)} above the collection price of ${peso(list)}`}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-2.5 text-sm space-y-1.5">
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Total bottles</span>
+                  <span className="font-mono text-base">{sf.lines.reduce((n, l) => n + (parseInt(l.qty, 10) || 0), 0)}</span>
+                </div>
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Total</span>
+                  <span className="font-mono text-xl text-[#e3bf5a]">{peso(sTotal)}</span>
+                </div>
+                {sDiscount > 0 && (
+                  <div className="flex items-baseline justify-between gap-3">
+                    <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Discount given</span>
+                    <span className="font-mono text-[#e5a93d]">{peso(sDiscount)}</span>
+                  </div>
+                )}
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Stock effect</span>
+                  <span className="text-xs">{sIsCredit ? 'None until approved' : 'Leaves stock now'}</span>
+                </div>
+                {sShort.length > 0 && (
+                  <ul className={`text-xs space-y-1 border-t border-[#2a2622] pt-2 ${sIsCredit ? 'text-[#e5a93d]' : 'text-[#e5736d]'}`} role="alert">
+                    {sShort.map((m) => <li key={m}>Not enough stock - {m}</li>)}
+                    <li className="text-[#a8a090]">{sIsCredit ? 'Credit sales do not reserve stock, so this must be in stock when the owner approves.' : 'Lower the quantity to continue.'}</li>
+                  </ul>
+                )}
+              </div>
+
+              <LateEntryNotice date={sf.date} reason={sf.lateReason} onReason={(v) => setSf((p) => ({ ...p, lateReason: v }))} id="s-late" />
+
+              <div>
+                <label htmlFor="s-notes" className="sr-only">Notes (optional)</label>
+                <input id="s-notes" value={sf.notes} onChange={(e) => setSf((p) => ({ ...p, notes: e.target.value }))} placeholder="Notes (optional)" className="cs-input px-3 py-2" />
+              </div>
+
+              <p className="text-[11px] leading-snug text-[#a8a090]">
+                {sIsCredit
+                  ? 'Goes to the owner for approval. The invoice, stock movement and receivable are created only then. The due date counts from the sale date using the customer\u2019s credit terms.'
+                  : 'The invoice is issued now and the stock leaves Finished Goods. Prices start at the collection price; change a line\u2019s price for a discount.'}
+              </p>
+
+              <div className="sticky bottom-0 z-20 -mx-6 -mb-5 px-6 pt-3 pb-4 bg-[#12100e] border-t border-[#2a2622] space-y-3 lg:static lg:mx-0 lg:mb-0 lg:px-0 lg:pb-0 lg:bg-transparent lg:border-t-0 lg:pt-0">
+                <ErrorNote>{sError}</ErrorNote>
+                <div className="flex gap-3">
+                  <button type="button" onClick={() => setSOpen(false)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
+                  <button type="submit" disabled={saving || sBlocked} className="cs-btn cs-btn-gold flex-1 px-5 py-2.5 disabled:opacity-50 disabled:cursor-not-allowed">
+                    {saving ? 'Saving...' : sIsCredit ? 'Submit for Approval' : 'Post Sale'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {/* ---------- New return / exchange ---------- */}
+      {rOpen && (
+        <Modal title="Return / Exchange" onClose={() => setROpen(false)} dirty={rf.lines.length > 0} xl>
+          <form onSubmit={saveReturn} className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,28rem)] gap-6 lg:flex-1 lg:min-h-0">
+            {/* ---------- LEFT: encode the transaction ---------- */}
+            <div className="flex flex-col gap-4 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
+              <div>
+                <label htmlFor="r-find" className="cs-label">Original invoice</label>
+                {rSale ? (
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-[#d9b24c]/40 bg-[#1f1b12] px-3.5 py-2.5">
+                    <div className="min-w-0 text-sm">
+                      <div className="font-medium truncate">
+                        <span className="font-mono text-xs text-[#e3bf5a]">INV-{pad(rSale.invoice_no)}</span> · {rSale.customers?.name || 'Walk-in customer'}
+                      </div>
+                      <div className="text-[11px] text-[#a8a090]">paid by {PAY[rSale.payment_type]} · {fmtDate(rSale.invoice_date)} · {peso(rSale.total)}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRf((p) => ({ ...p, sale: '', lines: [] }));
+                        setRQuery('');
+                        setRActive(0);
+                      }}
+                      className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs shrink-0"
+                    >
+                      Change
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <div className="relative">
+                      <Search className="w-4 h-4 text-[#a8a090] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" aria-hidden="true" />
+                      <input
+                        id="r-find"
+                        type="search"
+                        autoFocus
+                        autoComplete="off"
+                        role="combobox"
+                        aria-expanded="true"
+                        aria-controls="r-find-list"
+                        aria-activedescendant={rMatches.length > 0 ? `r-opt-${Math.min(rActive, rMatches.length - 1)}` : undefined}
+                        value={rQuery}
+                        onChange={(e) => {
+                          setRQuery(e.target.value);
+                          setRActive(0);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'ArrowDown') {
+                            e.preventDefault();
+                            setRActive((i) => Math.min(i + 1, Math.min(rMatches.length, 50) - 1));
+                          } else if (e.key === 'ArrowUp') {
+                            e.preventDefault();
+                            setRActive((i) => Math.max(i - 1, 0));
+                          } else if (e.key === 'Enter') {
+                            e.preventDefault(); // never submits the form from here
+                            const hit = rMatches[Math.min(rActive, rMatches.length - 1)];
+                            if (hit) pickSale(hit);
+                          }
+                        }}
+                        placeholder="Type a customer name or invoice number"
+                        className="cs-input pl-9 pr-3 py-2.5"
+                      />
+                    </div>
+                    <ul id="r-find-list" role="listbox" aria-label="Matching invoices" className="mt-2 max-h-64 overflow-y-auto rounded-xl border border-[#2a2622] divide-y divide-[#24201c]">
+                      {rMatches.length === 0 ? (
+                        <li className="px-4 py-3 text-xs text-[#a8a090]">No invoice matches &ldquo;{rQuery}&rdquo;.</li>
+                      ) : (
+                        rMatches.slice(0, 50).map((s, i) => (
+                          <li
+                            key={s.id}
+                            id={`r-opt-${i}`}
+                            role="option"
+                            aria-selected={i === rActive}
+                            ref={(el) => {
+                              if (el && i === rActive) el.scrollIntoView?.({ block: 'nearest' });
+                            }}
+                            onMouseEnter={() => setRActive(i)}
+                            onClick={() => pickSale(s)}
+                            className={`px-4 py-2 cursor-pointer transition-colors ${i === rActive ? 'bg-[#1f1b12]' : 'hover:bg-[#1a1816]'}`}
+                          >
+                            <div className="flex items-baseline justify-between gap-3 text-sm">
+                              <span className="truncate">{s.customers?.name || 'Walk-in customer'}</span>
+                              <span className="font-mono text-xs shrink-0">{peso(s.total)}</span>
+                            </div>
+                            <div className="text-[11px] text-[#a8a090]">
+                              <span className="font-mono text-[#e3bf5a]">INV-{pad(s.invoice_no)}</span> · {fmtDate(s.invoice_date)} · {PAY[s.payment_type]}
+                            </div>
+                          </li>
+                        ))
+                      )}
+                    </ul>
+                    {rMatches.length > 50 && <p className="text-[11px] text-[#a8a090] mt-1">Showing the latest 50 of {rMatches.length}. Type more to narrow it down.</p>}
+                  </div>
+                )}
+              </div>
+
+              <fieldset>
+                <legend className="cs-label">Why is it coming back?</legend>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {[['wrong_item', 'Wrong item / swap'], ['damaged', 'Damaged'], ['returned', 'Returned, not damaged']].map(([val, label]) => (
+                    <label key={val} className={`cursor-pointer rounded-xl border px-3 py-2.5 text-sm text-center transition-colors ${rf.reason === val ? 'border-[#d9b24c] bg-[#1f1b12] text-[#e3bf5a]' : 'border-[#2a2622] text-[#a8a090] hover:bg-[#1a1816]'}`}>
+                      <input type="radio" name="r-reason" value={val} checked={rf.reason === val} onChange={() => setRf((p) => ({ ...p, reason: val, resolution: val === 'wrong_item' ? 'exchange' : 'refund' }))} className="sr-only" />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
+              {rf.reason === 'damaged' && (
+                <fieldset>
+                  <legend className="cs-label">What does the customer get?</legend>
+                  <div className="grid grid-cols-2 gap-3">
+                    {[['refund', 'Refund'], ['replace', 'Replacement']].map(([val, label]) => (
+                      <label key={val} className={`cursor-pointer rounded-xl border px-4 py-2.5 text-sm text-center transition-colors ${rf.resolution === val ? 'border-[#d9b24c] bg-[#1f1b12] text-[#e3bf5a]' : 'border-[#2a2622] text-[#a8a090] hover:bg-[#1a1816]'}`}>
+                        <input type="radio" name="r-res" value={val} checked={rf.resolution === val} onChange={() => setRf((p) => ({ ...p, resolution: val }))} className="sr-only" />
+                        {label}
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+              )}
+
+              <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 text-xs text-[#a8a090] leading-relaxed">
+                {rf.resolution === 'exchange' && 'Swap: each returned piece goes back into Finished Goods and the replacement comes out. Cash, receivables and sales are not affected, and the original invoice stays as it is.'}
+                {rf.resolution === 'replace' && 'Damaged replacement: each replacement comes out of Finished Goods and is charged to Damaged Returns Loss. Cash, receivables and sales are not affected.'}
+                {rf.resolution === 'refund' && rf.reason === 'damaged' && `Damaged refund: Finished Goods are not affected. What the customer paid for each piece is refunded${rSale?.payment_type === 'credit' ? ' by lowering what the customer still owes on the invoice; any part the customer has already paid is paid back in cash or by bank transfer (the owner chooses on approval)' : rSale?.payment_type === 'bank' ? ' by bank transfer' : rSale ? ' in cash' : ''}, and each piece\u2019s cost is booked as a loss.`}
+                {rf.reason === 'returned' && `Returned, not damaged: each piece goes back into Finished Goods at its original cost, and what the customer paid for it is refunded${rSale?.payment_type === 'credit' ? ' by lowering what the customer still owes on the invoice; any part the customer has already paid is paid back in cash or by bank transfer (the owner chooses on approval)' : rSale?.payment_type === 'bank' ? ' by bank transfer' : rSale ? ' in cash' : ''}. The sale and its cost of goods sold are reduced.`}
+              </div>
+
+              <div>
+                <div className="cs-label">Items on this invoice</div>
+                {!rf.sale ? (
+                  <p className="text-xs text-[#a8a090] rounded-xl border border-dashed border-[#2a2622] px-4 py-5 text-center">Choose the invoice first.</p>
+                ) : rItems.length === 0 ? (
+                  <p className="text-xs text-[#e5a93d] rounded-xl border border-dashed border-[#2a2622] px-4 py-5 text-center">Everything on this invoice has already been returned.</p>
+                ) : (
+                  <>
+                    <p className="text-[11px] text-[#a8a090] mb-2">Tap an item to add one piece to the return. You can add different perfumes, and change the reason above between taps.</p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {rItems.map((i) => {
+                        const added = rPlanned[i.key] || 0;
+                        const full = added >= i.left;
+                        return (
+                          <button
+                            key={i.key}
+                            type="button"
+                            disabled={full}
+                            onClick={() => tapReturnItem(i)}
+                            aria-label={`Add ${sizeName(i.size_id)}${srcTag(i)} to the return, ${i.left - added} of ${i.left} still returnable`}
+                            className={`relative rounded-lg border px-3 py-2 text-left leading-tight transition-colors cursor-pointer disabled:cursor-not-allowed ${added > 0 ? 'border-[#d9b24c] bg-[#1f1b12]' : 'border-[#2a2622] bg-[#14120f] hover:border-[#d9b24c]'} ${full ? 'opacity-60' : ''}`}
+                          >
+                            {added > 0 && (
+                              <span className="absolute -top-2 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-[#d9b24c] text-[#0e0d0c] text-[10px] font-semibold flex items-center justify-center">{added}</span>
+                            )}
+                            <span className="block text-sm">{sizeName(i.size_id)}{i.swapNo && <span className="ml-1.5 text-[10px] text-[#e5a93d]">swapped in on RT-{String(i.swapNo).padStart(4, '0')}</span>}</span>
+                            <span className="block text-[11px] text-[#a8a090] mt-0.5">
+                              {i.left - added} of {i.left} returnable · paid <span className="font-mono text-[#e3bf5a]">{peso(i.paid)}</span> each
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div className="sm:col-span-2">
+                  <label htmlFor="r-notes" className="cs-label">Notes (optional)</label>
+                  <input id="r-notes" value={rf.notes} onChange={(e) => setRf((p) => ({ ...p, notes: e.target.value }))} className="cs-input px-3 py-2.5" />
+                </div>
+                <div>
+                  <label htmlFor="r-date" className="cs-label">Date</label>
+                  <input id="r-date" type="date" value={rf.date} onChange={(e) => setRf((p) => ({ ...p, date: e.target.value }))} required className="cs-input px-3 py-2.5" />
+                </div>
+              </div>
+            </div>
+
+            {/* ---------- RIGHT: the list, the effect and the submit buttons ---------- */}
+            <div className="flex flex-col gap-3 lg:min-h-0 lg:border-l lg:border-[#2a2622] lg:pl-6">
+              <div className="flex flex-col lg:flex-1 lg:min-h-0">
+                <div className="cs-label">Items coming back{rf.lines.length > 0 ? ` (${rf.lines.length})` : ''}</div>
+                <div className="lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
+                  {rf.lines.length === 0 ? (
+                    <p className="text-xs text-[#a8a090] rounded-xl border border-dashed border-[#2a2622] px-4 py-5 text-center">Tap an item on the left to add it to this return.</p>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {rf.lines.map((l, n) => {
+                        const item = rItemByKey[l.item];
+                        const q = parseInt(l.qty, 10) || 0;
+                        const swap = l.resolution !== 'refund';
+                        const replId = l.repl || l.size;
+                        const short = swap && (rReplNeed[replId] || 0) > (onHand[replId] || 0);
+                        const atLimit = (rPlanned[l.item] || 0) >= (item?.left || 0);
+                        return (
+                          <div key={l.key} className="rounded-lg border border-[#2a2622] bg-[#14120f] px-2 py-1.5">
+                            <div className="flex items-center gap-2">
+                              <div className="flex-1 min-w-0 text-xs leading-tight">
+                                <div>{sizeName(l.size)}{srcTag(item)}</div>
+                                <div className="text-[10px] text-[#a8a090]">{kindOf(l)}</div>
+                              </div>
+                              <div className="flex items-center rounded-md border border-[#2a2622] shrink-0">
+                                <button type="button" onClick={() => stepRLine(l, -1)} className="w-6 h-8 flex items-center justify-center text-[#e3bf5a] cursor-pointer" aria-label={`Decrease pieces for item ${n + 1}`}>
+                                  <Minus className="w-3 h-3" aria-hidden="true" />
+                                </button>
+                                <label htmlFor={`rq-${l.key}`} className="sr-only">Pieces for item {n + 1}</label>
+                                <input id={`rq-${l.key}`} type="number" min="1" step="1" value={l.qty} onChange={(e) => setRLine(l.key, { qty: e.target.value })} className="w-8 bg-transparent text-center text-xs outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none" />
+                                <button type="button" disabled={atLimit} onClick={() => stepRLine(l, 1)} className="w-6 h-8 flex items-center justify-center text-[#e3bf5a] cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed" aria-label={`Increase pieces for item ${n + 1}`}>
+                                  <Plus className="w-3 h-3" aria-hidden="true" />
+                                </button>
+                              </div>
+                              <button type="button" onClick={() => setRf((p) => ({ ...p, lines: p.lines.filter((x) => x.key !== l.key) }))} className="text-[#a8a090] hover:text-[#e5736d] cursor-pointer shrink-0" aria-label={`Remove item ${n + 1}`}>
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                            {swap ? (
+                              <div className="mt-1.5">
+                                <label htmlFor={`rr-${l.key}`} className="block text-[10px] uppercase tracking-wider text-[#a8a090] mb-0.5">{l.resolution === 'replace' ? 'Replace with' : 'Swap with'} (same price)</label>
+                                <select id={`rr-${l.key}`} value={replId} onChange={(e) => setRLine(l.key, { repl: e.target.value })} className="cs-input px-2 py-1.5 text-xs">
+                                  {replOptionsFor(l.item).map((s) => (
+                                    <option key={s.id} value={s.id}>{s.perfumes.name} · {qty(s.size_ml)} ml - {qty(onHand[s.id] || 0)} in stock</option>
+                                  ))}
+                                </select>
+                                {short && <p className="text-[10px] text-[#e5a93d] mt-1">Not enough in stock for the replacement.</p>}
+                              </div>
+                            ) : (
+                              <div className="mt-1 text-[11px] text-[#a8a090]">
+                                Refund <span className="font-mono text-[#e3bf5a]">{peso(q * (item?.paid || 0))}</span> ({peso(item?.paid || 0)} each)
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-2.5 text-sm space-y-1.5">
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Pieces coming back</span>
+                  <span className="font-mono text-base">{rPieces}</span>
+                </div>
+                {rGiven > 0 && (
+                  <div className="flex items-baseline justify-between gap-3">
+                    <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Pieces given out</span>
+                    <span className="font-mono">{rGiven}</span>
+                  </div>
+                )}
+                {rRefund > 0 && (
+                  <div className="flex items-baseline justify-between gap-3">
+                    <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Total refund</span>
+                    <span className="font-mono text-xl text-[#e3bf5a]">{peso(rRefund)}</span>
+                  </div>
+                )}
+                {rShort.length > 0 && (
+                  <ul className="text-xs space-y-1 border-t border-[#2a2622] pt-2 text-[#e5a93d]" role="alert">
+                    {rShort.map((m) => <li key={m}>Not enough stock - {m}</li>)}
+                    <li className="text-[#a8a090]">The owner can only approve these once the replacements are available.</li>
+                  </ul>
+                )}
+              </div>
+
+              <p className="text-[11px] leading-snug text-[#a8a090]">Nothing changes in stock or the books until the owner approves. All the items in this request share one slip (RT), and the owner approves them together.</p>
+
+              <div className="sticky bottom-0 z-20 -mx-6 -mb-5 px-6 pt-3 pb-4 bg-[#12100e] border-t border-[#2a2622] space-y-3 lg:static lg:mx-0 lg:mb-0 lg:px-0 lg:pb-0 lg:bg-transparent lg:border-t-0 lg:pt-0">
+                <ErrorNote>{rError}</ErrorNote>
+                <div className="flex gap-3">
+                  <button type="button" onClick={() => setROpen(false)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
+                  <button type="submit" disabled={saving || rf.lines.length === 0} className="cs-btn cs-btn-gold flex-1 px-5 py-2.5 disabled:opacity-50 disabled:cursor-not-allowed">
+                    {saving ? 'Saving...' : 'Submit for Approval'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {/* ---------- Approve / reject ---------- */}
+      {deciding && (
+        <Modal title={deciding.kind === 'sale' ? `Review SL-${pad(deciding.row.sale_no)}` : `Review RT-${pad(deciding.row.return_no)}`} onClose={() => setDeciding(null)}>
+          <div className="space-y-4">
+            {deciding.kind === 'sale' ? (
+              (() => {
+                const s = deciding.row;
+                const cc = credit[s.customer_id];
+                const bal = arBal[s.customer_id] || 0;
+                const over = cc && Number(cc.credit_limit) > 0 && bal + Number(s.total) > Number(cc.credit_limit);
+                // Counted from the sale date (not today), the same way the database sets it when approved.
+                const due = cc && s.sale_date ? (() => { const d = new Date(`${s.sale_date}T00:00:00`); d.setDate(d.getDate() + Number(cc.credit_days || 0)); return d.toLocaleDateString('en-CA'); })() : null;
+                return (
+                  <>
+                    <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 grid grid-cols-2 gap-3 text-sm">
+                      <Stat label="Customer" value={s.customers?.name} />
+                      <Stat label="Sale total" value={peso(s.total)} tone="text-[#e3bf5a]" />
+                      <Stat label="Owes now" value={peso(bal)} />
+                      <Stat label="After approval" value={peso(bal + Number(s.total))} tone={over ? 'text-[#e5736d]' : ''} />
+                      <Stat label="Credit limit" value={cc && Number(cc.credit_limit) > 0 ? peso(cc.credit_limit) : 'No limit set'} />
+                      <Stat label={cc ? `Due date (${cc.credit_days} days from sale)` : 'Due date if approved'} value={due ? fmtDate(due) : '-'} />
+                    </div>
+                    <ul className="text-sm divide-y divide-[#24201c] rounded-xl border border-[#2a2622]">
+                      {linesOf(s).map((l) => {
+                        const short = l.qty > (onHand[l.size_id] || 0);
+                        return (
+                          <li key={l.id} className="flex justify-between gap-3 px-4 py-2.5">
+                            <span>{sizeName(l.size_id)} × {l.qty}</span>
+                            <span className={`font-mono text-xs ${short ? 'text-[#e5736d]' : 'text-[#3ecf8e]'}`}>{qty(onHand[l.size_id] || 0)} in stock</span>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                    {over && <p className="text-xs text-[#e5736d]">This would go over the customer&rsquo;s credit limit, so approval will be refused. Raise the limit in Customers first, or reject the sale.</p>}
+                    <p className="text-xs text-[#a8a090]">Approving takes the stock out, books the receivable and issues the invoice.</p>
+                  </>
+                );
+              })()
+            ) : (
+              (() => {
+                const q = deciding.row;
+                const sps = splitsOf(q);
+                const creditSale = q.sales?.payment_type === 'credit';
+                const refundTotal = q.lines.reduce((t, l) => t + (l.resolution === 'refund' ? Number(l.refund_amount || 0) : 0), 0);
+                const arTotal = sps.reduce((t, x) => t + x.ar, 0);
+                const paidTotal = sps.reduce((t, x) => t + x.paid, 0);
+                const pieces = q.lines.reduce((n, l) => n + l.qty, 0);
+                const need = {};
+                q.lines.forEach((l) => {
+                  if (l.repl_size_id) need[l.repl_size_id] = (need[l.repl_size_id] || 0) + l.qty;
+                });
+                const short = Object.entries(need).filter(([id, n]) => n > (onHand[id] || 0));
+                return (
+                  <>
+                    <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 grid grid-cols-2 gap-3 text-sm">
+                      <Stat label="Invoice" value={`INV-${pad(q.sales?.invoice_no)}`} />
+                      <Stat label="Customer" value={q.sales?.customers?.name || 'Walk-in'} />
+                      <Stat label="Items" value={`${q.lines.length} item${q.lines.length === 1 ? '' : 's'} · ${pieces} piece${pieces === 1 ? '' : 's'}`} />
+                      {refundTotal > 0 && <Stat label="Total refund" value={peso(refundTotal)} tone="text-[#e3bf5a]" />}
+                      {creditSale && refundTotal > 0 && <Stat label="Lowers balance owed" value={peso(arTotal)} />}
+                      {creditSale && refundTotal > 0 && <Stat label="Already paid, to pay back" value={peso(paidTotal)} tone={paidTotal > 0 ? 'text-[#e5a93d]' : ''} />}
+                    </div>
+                    <ul className="text-sm divide-y divide-[#24201c] rounded-xl border border-[#2a2622]">
+                      {q.lines.map((r, i) => (
+                        <li key={r.id} className="px-4 py-2.5">
+                          <div className="flex justify-between gap-3">
+                            <span>{sizeName(r.size_id)} × {r.qty}</span>
+                            <span className="text-xs text-[#a8a090] text-right">{kindOf(r)}</span>
+                          </div>
+                          {r.repl_size_id && <div className="text-xs text-[#a8a090]">Given: {sizeName(r.repl_size_id)} × {r.qty}</div>}
+                          <div className="text-[11px] text-[#a8a090] mt-0.5">{slipOutcome(r, sps[i])}</div>
+                        </li>
+                      ))}
+                    </ul>
+                    {q.notes && <p className="text-xs text-[#a8a090]">Notes: {q.notes}</p>}
+                    <p className="text-xs text-[#a8a090]">
+                      Approving or rejecting applies to the whole request. {q.lines.length > 1 ? 'One journal entry is booked for all the items.' : ''}
+                    </p>
+                    {creditSale && paidTotal > 0 && (
+                      <fieldset>
+                        <legend className="cs-label">Pay back {peso(paidTotal)} to the customer by</legend>
+                        <div className="grid grid-cols-2 gap-3">
+                          {[['bank', 'Bank transfer'], ['cash', 'Cash']].map(([val, label]) => (
+                            <label key={val} className={`cursor-pointer rounded-xl border px-4 py-2.5 text-sm text-center transition-colors ${refundMethod === val ? 'border-[#d9b24c] bg-[#1f1b12] text-[#e3bf5a]' : 'border-[#2a2622] text-[#a8a090] hover:bg-[#1a1816]'}`}>
+                              <input type="radio" name="r-refund-method" value={val} checked={refundMethod === val} onChange={() => setRefundMethod(val)} className="sr-only" />
+                              {label}
+                            </label>
+                          ))}
+                        </div>
+                        <p className="text-[11px] text-[#a8a090] mt-1">A balance is never left as customer credit. Use bank transfer when the customer paid by bank, so the audit trail matches.</p>
+                      </fieldset>
+                    )}
+                    {short.length > 0 && (
+                      <p className="text-xs text-[#e5736d]">
+                        Not enough stock for the replacements ({short.map(([id, n]) => `${sizeName(id)}: need ${n}, have ${qty(onHand[id] || 0)}`).join('; ')}), so approval will be refused.
+                      </p>
+                    )}
+                  </>
+                );
+              })()
+            )}
+            <div>
+              <label htmlFor="dec-reason" className="cs-label">Reason (needed only to reject)</label>
+              <input id="dec-reason" value={reason} onChange={(e) => setReason(e.target.value)} className="cs-input px-3.5 py-2.5" />
+            </div>
+            <ModalActions error={decError}>
+              <button type="button" disabled={saving} onClick={() => decide(false)} className="cs-btn cs-btn-ghost px-4 py-2.5">Reject</button>
+              <button type="button" disabled={saving} onClick={() => decide(true)} className="cs-btn cs-btn-gold px-5 py-2.5">{saving ? 'Working...' : 'Approve'}</button>
+            </ModalActions>
+          </div>
+        </Modal>
+      )}
+
+      {/* ---------- Void ---------- */}
+      {voiding && (
+        <Modal title={`Void INV-${pad(voiding.invoice_no)}`} onClose={() => setVoiding(null)}>
+          <form onSubmit={doVoid} className="space-y-4">
+            <p className="text-sm text-[#a8a090]">This puts the stock back, reverses the journal entry and cancels the invoice. It only works if no return or exchange was recorded on it and no customer payment was received for it.</p>
+            <div>
+              <label htmlFor="sv-reason" className="cs-label">Reason</label>
+              <input id="sv-reason" value={voidReason} onChange={(e) => setVoidReason(e.target.value)} placeholder="e.g. Entered twice" required autoFocus className="cs-input px-3.5 py-2.5" />
+            </div>
+            <ModalActions error={voidError}>
+              <button type="button" onClick={() => setVoiding(null)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
+              <button type="submit" disabled={saving} className="cs-btn cs-btn-gold px-5 py-2.5">{saving ? 'Voiding...' : 'Void'}</button>
+            </ModalActions>
+          </form>
+        </Modal>
+      )}
+
+      {/* ---------- Void return / exchange ---------- */}
+      {voidingRet && (
+        <Modal title={`Void RT-${pad(voidingRet.return_no)}`} onClose={() => setVoidingRet(null)}>
+          <form onSubmit={doVoidReturn} className="space-y-4">
+            <p className="text-sm text-[#a8a090]">
+              This cancels the whole slip ({voidingRet.lines.length} {voidingRet.lines.length === 1 ? 'item' : 'items'} on INV-{pad(voidingRet.sales?.invoice_no)}). Replacement pieces go back into Finished Goods, pieces that came back are taken out again, the journal entry is reversed, and any refund is undone (what the customer owes on the invoice comes back). The slip stays in the list as Voided.
+            </p>
+            <p className="text-sm text-[#a8a090]">It is refused if a swapped-in piece was returned again on a later slip, or if a piece that came back was already sold again.</p>
+            <div>
+              <label htmlFor="rv-reason" className="cs-label">Reason</label>
+              <input id="rv-reason" value={voidReason} onChange={(e) => setVoidReason(e.target.value)} placeholder="e.g. Wrong items entered" required autoFocus className="cs-input px-3.5 py-2.5" />
+            </div>
+            <ModalActions error={voidError}>
+              <button type="button" onClick={() => setVoidingRet(null)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
+              <button type="submit" disabled={saving} className="cs-btn cs-btn-gold px-5 py-2.5">{saving ? 'Voiding...' : 'Void'}</button>
+            </ModalActions>
+          </form>
+        </Modal>
+      )}
+
+      {/* ---------- Invoice ---------- */}
+      {invoice && invoice.invoice_no && (
+        <Modal title={`Invoice INV-${pad(invoice.invoice_no)}`} onClose={() => setInvoiceId(null)}>
+          <div className="space-y-4 text-sm">
+            <div className="flex justify-between gap-4">
+              <div>
+                <div className="font-medium">{invoice.customers?.name || 'Walk-in customer'}</div>
+                {invoice.customers?.address && <div className="text-xs text-[#a8a090]">{invoice.customers.address}</div>}
+                <div className="text-xs text-[#a8a090] mt-1">Payment: {PAY[invoice.payment_type]}</div>
+              </div>
+              <div className="text-right text-xs text-[#a8a090]">
+                <div>Date: {fmtDate(invoice.invoice_date)}</div>
+                <div>Sale ref: SL-{pad(invoice.sale_no)}</div>
+                {invoice.payment_type === 'credit' && <div className="text-[#e3bf5a] font-medium mt-1">Due: {fmtDate(invoice.due_date)}</div>}
+              </div>
+            </div>
+            <ul className="divide-y divide-[#24201c] rounded-xl border border-[#2a2622]">
+              {linesOf(invoice).map((l) => (
+                <li key={l.id} className="flex justify-between gap-3 px-4 py-2.5">
+                  <span>{sizeName(l.size_id)} × {l.qty} <span className="text-xs text-[#a8a090]">@ {peso(l.unit_price)}</span></span>
+                  <span className="font-mono">{peso(l.amount)}</span>
+                </li>
+              ))}
+            </ul>
+            <div className="flex justify-between font-medium text-base">
+              <span>Total</span>
+              <span className="font-mono text-[#e3bf5a]">{peso(invoice.total)}</span>
+            </div>
+            {(() => {
+              const st = statementOf(invoice);
+              const asOf = fmtDate(todayLocal());
+              const line = (label, value, tone = '', strong = false) => (
+                <div className={`flex justify-between gap-3 ${strong ? 'font-medium border-t border-[#2a2622] pt-1.5' : ''}`}>
+                  <span className={strong ? '' : 'text-[#a8a090]'}>{label}</span>
+                  <span className={`font-mono ${tone}`}>{value}</span>
+                </div>
+              );
+              return (
+                <>
+                  {st.qs.length > 0 && (
+                    <div className="space-y-2">
+                      <div>
+                        <div className="cs-label">Returns and exchanges after invoicing</div>
+                        <p className="text-[11px] text-[#a8a090]">The invoice above is unchanged. Later returns and exchanges are listed here.</p>
+                      </div>
+                      {st.qs.map((q) => (
+                        <div key={q.key} className="rounded-xl border border-[#2a2622]">
+                          <div className="flex items-center justify-between gap-3 px-4 py-2 bg-[#14120f] rounded-t-xl text-xs">
+                            <span>
+                              <button type="button" onClick={() => { setInvoiceId(null); setSlipId(q.key); }} className="font-mono text-[#e3bf5a] underline underline-offset-2 cursor-pointer" aria-label={`Open slip RT-${pad(q.return_no)}`}>RT-{pad(q.return_no)}</button>
+                              <span className="text-[#a8a090]"> · {fmtDate(q.return_date)}</span>
+                            </span>
+                            <Badge tone={RET_TONE[q.status]}>{RET_TEXT[q.status] || q.status}</Badge>
+                          </div>
+                          <ul className="divide-y divide-[#24201c]">
+                            {q.lines.map((r) => {
+                              const t = lineText(r);
+                              return (
+                                <li key={r.id} className="flex justify-between gap-3 px-4 py-2 text-xs">
+                                  <span>{t.what}</span>
+                                  <span className="text-[#a8a090] text-right">{t.result}</span>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                          <div className="px-4 py-2 border-t border-[#24201c] text-[11px] text-[#a8a090]">{decisionText(q)}</div>
+                        </div>
+                      ))}
+                      {st.pending.length > 0 && <p className="text-[11px] text-[#e5a93d]">Requests waiting for approval are not counted in the amounts or the items below.</p>}
+                    </div>
+                  )}
+                  {(st.done.length > 0 || st.bal) && (
+                    <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 text-sm space-y-1.5">
+                      {line('Invoice total', peso(invoice.total))}
+                      {st.refunds > 0 && line('Less: refunds', `(${peso(st.refunds)})`)}
+                      {st.done.length > 0 && line('Net amount', peso(st.net), '', true)}
+                      {st.bal && line(`Less: payments received (up to ${asOf})`, `(${peso(st.bal.paid)})`)}
+                      {st.bal && st.paidBack > 0 && line('Add: refunds already paid back to the customer', peso(st.paidBack))}
+                      {st.bal && line(`Balance as of ${asOf}`, peso(st.bal.balance), st.bal.balance > 0 ? 'text-[#e3bf5a]' : 'text-[#3ecf8e]', true)}
+                    </div>
+                  )}
+                  {st.done.length > 0 && (
+                    <div>
+                      <div className="cs-label">Items the customer holds now</div>
+                      <p className="text-xs">{st.holds.length ? st.holds.map((x) => `${x.name} × ${x.n}`).join('; ') : 'None'}</p>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+            <ModalActions>
+              <button type="button" onClick={() => setInvoiceId(null)} className="cs-btn cs-btn-ghost px-4 py-2.5">Close</button>
+              <button type="button" onClick={() => printInvoice(invoice, true)} className="cs-btn cs-btn-ghost px-4 py-2.5">
+                <Printer className="w-4 h-4 text-[#d9b24c]" aria-hidden="true" />
+                <span>Internal copy</span>
+              </button>
+              <button type="button" onClick={() => printInvoice(invoice)} className="cs-btn cs-btn-gold px-5 py-2.5">
+                <Printer className="w-4 h-4" aria-hidden="true" />
+                <span>Customer copy</span>
+              </button>
+            </ModalActions>
+          </div>
+        </Modal>
+      )}
+
+      {/* ---------- Return / exchange slip ---------- */}
+      {slip && (() => {
+        const sps = splitsOf(slip);
+        const refundTotal = slip.lines.reduce((t, l) => t + (l.resolution === 'refund' ? Number(l.refund_amount || 0) : 0), 0);
+        return (
+          <Modal title={`Slip RT-${pad(slip.return_no)}`} onClose={() => setSlipId(null)}>
+            <div className="space-y-4 text-sm">
+              <div className="flex justify-between gap-4">
+                <div>
+                  <div className="font-medium">{slip.sales?.customers?.name || 'Walk-in customer'}</div>
+                  <div className="text-xs text-[#a8a090]">
+                    Original invoice:{' '}
+                    {saleById[slip.sale_id]?.invoice_no ? (
+                      <button type="button" onClick={() => { setSlipId(null); setInvoiceId(slip.sale_id); }} className="font-mono text-[#e3bf5a] underline underline-offset-2 cursor-pointer" aria-label={`Open invoice INV-${pad(slip.sales?.invoice_no)}`}>INV-{pad(slip.sales?.invoice_no)}</button>
+                    ) : (
+                      <>INV-{pad(slip.sales?.invoice_no)}</>
+                    )}
+                  </div>
+                </div>
+                <div className="text-right text-xs text-[#a8a090]">
+                  <div>Date: {fmtDate(slip.return_date)}</div>
+                  <Badge tone={RET_TONE[slip.status]}>{RET_TEXT[slip.status] || slip.status}</Badge>
+                </div>
+              </div>
+              <div className="rounded-xl border border-[#2a2622] divide-y divide-[#24201c]">
+                {slip.lines.map((r, i) => (
+                  <div key={r.id} className="px-4 py-2.5 space-y-0.5">
+                    <div className="flex justify-between gap-3">
+                      <span>{sizeName(r.size_id)} × {r.qty}</span>
+                      <span className="text-xs text-[#a8a090] text-right">{kindOf(r)}</span>
+                    </div>
+                    {r.repl_size_id && <div className="text-xs text-[#a8a090]">Given: {sizeName(r.repl_size_id)} × {r.qty}</div>}
+                    <div className="text-[11px] text-[#a8a090]">{slipOutcome(r, sps[i])}</div>
+                  </div>
+                ))}
+                {refundTotal > 0 && (
+                  <div className="flex justify-between gap-3 px-4 py-2.5"><span className="text-[#a8a090]">Total refund</span><span className="font-mono text-[#e3bf5a]">{peso(refundTotal)}</span></div>
+                )}
+                {slip.notes && <div className="flex justify-between gap-3 px-4 py-2.5"><span className="text-[#a8a090]">Notes</span><span className="text-right">{slip.notes}</span></div>}
+              </div>
+              <div className="rounded-xl border border-dashed border-[#2a2622] px-4 py-2.5">
+                <div className="text-[10px] uppercase tracking-wider text-[#a8a090]">Internal record</div>
+                <div className="text-xs mt-0.5">{decisionText(slip)}</div>
+              </div>
+              <ModalActions>
+                <button type="button" onClick={() => setSlipId(null)} className="cs-btn cs-btn-ghost px-4 py-2.5">Close</button>
+                <button type="button" onClick={() => printSlip(slip, true)} className="cs-btn cs-btn-ghost px-4 py-2.5">
+                  <Printer className="w-4 h-4 text-[#d9b24c]" aria-hidden="true" />
+                  <span>Internal copy</span>
+                </button>
+                <button type="button" onClick={() => printSlip(slip)} className="cs-btn cs-btn-gold px-5 py-2.5">
+                  <Printer className="w-4 h-4" aria-hidden="true" />
+                  <span>Customer copy</span>
+                </button>
+              </ModalActions>
+            </div>
+          </Modal>
+        );
+      })()}
+    </div>
+  );
+}

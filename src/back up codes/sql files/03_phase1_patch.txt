@@ -1,0 +1,69 @@
+-- =====================================================================
+-- Chinito Scento - Phase 1 patch (run ONCE, after 02_phase1_ledger_masters.sql)
+--   1. Credit terms move to an owner-only table (staff cannot even read them)
+--   2. Perfumes get bottle/lettering/liquid fields and your status names
+--   3. Perfume sizes: any number of sizes per perfume, each with its own price
+-- Safe only while customers and perfumes are still empty (they are new).
+-- =====================================================================
+
+-- ---------- 1. Owner-only customer credit ----------------------------
+create table if not exists public.customer_credit (
+  customer_id    uuid primary key references public.customers(id) on delete cascade,
+  credit_allowed boolean not null default false,
+  credit_limit   numeric(14,2) not null default 0 check (credit_limit >= 0),
+  credit_days    int not null default 0 check (credit_days >= 0),
+  updated_by     uuid references auth.users(id) default auth.uid(),
+  updated_at     timestamptz not null default now()
+);
+
+alter table public.customers
+  drop column if exists credit_allowed,
+  drop column if exists credit_limit,
+  drop column if exists credit_days;
+
+alter table public.customer_credit enable row level security;
+
+create policy customer_credit_owner on public.customer_credit
+  for all using (public.is_owner()) with check (public.is_owner());
+
+-- ---------- 2. Perfumes ----------------------------------------------
+create sequence if not exists public.perfume_sku_seq;
+
+alter table public.perfumes
+  alter column sku set default ('CS-' || lpad(nextval('public.perfume_sku_seq')::text, 3, '0'));
+
+alter table public.perfumes
+  drop column if exists bottle_size_ml,
+  drop column if exists selling_price,
+  add column if not exists bottle_style   text,
+  add column if not exists lettering_color text,
+  add column if not exists liquid_color    text;
+
+alter table public.perfumes drop constraint if exists perfumes_status_check;
+alter table public.perfumes
+  add constraint perfumes_status_check
+  check (status in ('Active Stock','In Production','Formulation','Discontinued'));
+alter table public.perfumes alter column status set default 'Active Stock';
+
+-- ---------- 3. Perfume sizes -----------------------------------------
+create table if not exists public.perfume_sizes (
+  id          uuid primary key default gen_random_uuid(),
+  perfume_id  uuid not null references public.perfumes(id) on delete cascade,
+  size_ml     numeric(8,2) not null check (size_ml > 0),
+  price       numeric(14,2) not null default 0 check (price >= 0),
+  is_active   boolean not null default true,
+  created_at  timestamptz not null default now(),
+  unique (perfume_id, size_ml)
+);
+
+alter table public.perfume_sizes enable row level security;
+
+create policy perfume_sizes_read   on public.perfume_sizes for select using (public.is_active_user());
+create policy perfume_sizes_insert on public.perfume_sizes for insert with check (public.is_active_user());
+create policy perfume_sizes_update on public.perfume_sizes for update using (public.is_active_user()) with check (public.is_active_user());
+create policy perfume_sizes_delete on public.perfume_sizes for delete using (public.is_owner());
+
+-- Checks (run one at a time):
+-- select column_name from information_schema.columns where table_name = 'customers';   -- no credit_* columns
+-- select * from public.customer_credit;                                                  -- empty
+-- select column_name from information_schema.columns where table_name = 'perfumes';    -- has bottle_style

@@ -1,0 +1,254 @@
+import React, { useEffect, useState } from 'react';
+import { Shield, UserCheck, UserX, AlertCircle, UserPlus } from 'lucide-react';
+import { supabase } from '../supabaseClient';
+
+const STATUS_STYLE = {
+  Active: 'bg-[#3ecf8e]/10 border-[#3ecf8e]/30 text-[#3ecf8e]',
+  Pending: 'bg-[#e5a93d]/10 border-[#e5a93d]/30 text-[#e5a93d]',
+  Revoked: 'bg-[#f0716b]/10 border-[#f0716b]/30 text-[#f0908b]',
+};
+
+const today = () => new Date().toISOString().split('T')[0];
+
+export default function UserManagement() {
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [successMsg, setSuccessMsg] = useState('');
+
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState('user');
+  const [joinedDate, setJoinedDate] = useState(today());
+
+  // Only the first load shows the full-page loader, so the form doesn't flash after changes
+  const fetchUsers = async () => {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .order('date_joined', { ascending: false });
+
+    if (error) setError(error.message);
+    else setUsers(data || []);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    fetchUsers();
+  }, []);
+
+  const handleAddUser = async (e) => {
+    e.preventDefault();
+    setError('');
+    setSuccessMsg('');
+
+    if (!username || !password) {
+      setError('Please provide both username and password.');
+      return;
+    }
+
+    try {
+      const { error: insertError } = await supabase.from('profiles').insert([
+        {
+          username: username.trim(),
+          password: password,
+          role: role,
+          status: 'Active',
+          date_joined: joinedDate,
+        },
+      ]);
+
+      if (insertError) throw insertError;
+
+      setSuccessMsg(`User "${username}" created successfully!`);
+      setUsername('');
+      setPassword('');
+      setRole('user');
+      setJoinedDate(today());
+      fetchUsers();
+    } catch (err) {
+      setError(err.message || 'Failed to create user account.');
+    }
+  };
+
+  const handleUpdateStatus = async (userId, newStatus) => {
+    setError('');
+    setSuccessMsg('');
+    const { error } = await supabase.from('profiles').update({ status: newStatus }).eq('id', userId);
+
+    if (error) setError(error.message);
+    else fetchUsers();
+  };
+
+  if (loading) {
+    return <div className="p-6 text-[#a8a090] text-sm">Loading user directory...</div>;
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="pb-5 border-b border-[#2a2622]">
+        <h2 className="font-serif text-3xl font-semibold">User Management &amp; Access Control</h2>
+        <p className="text-sm text-[#a8a090] mt-0.5">
+          Register new personnel, review registrations, and control permissions.
+        </p>
+      </div>
+
+      {error && (
+        <div role="alert" className="p-3.5 rounded-xl bg-[#f0716b]/10 border border-[#f0716b]/30 text-[#f0908b] text-xs flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {successMsg && (
+        <div role="status" className="p-3.5 rounded-xl bg-[#3ecf8e]/10 border border-[#3ecf8e]/30 text-[#3ecf8e] text-xs flex items-center gap-2">
+          <UserCheck className="w-4 h-4 shrink-0" aria-hidden="true" />
+          <span>{successMsg}</span>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Add user */}
+        <div className="cs-card p-6 h-fit">
+          <h3 className="font-serif text-xl font-semibold text-[#e3bf5a] flex items-center gap-2 mb-5">
+            <UserPlus className="w-4 h-4" aria-hidden="true" />
+            <span>Add New User Account</span>
+          </h3>
+          <form onSubmit={handleAddUser} className="space-y-4">
+            <div>
+              <label htmlFor="um-username" className="cs-label">Username</label>
+              <input
+                id="um-username"
+                type="text"
+                autoComplete="off"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="e.g. Romel"
+                required
+                className="cs-input px-3.5 py-2.5"
+              />
+            </div>
+            <div>
+              <label htmlFor="um-password" className="cs-label">Password</label>
+              <input
+                id="um-password"
+                type="password"
+                autoComplete="new-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                required
+                className="cs-input px-3.5 py-2.5"
+              />
+            </div>
+            <div>
+              <label htmlFor="um-role" className="cs-label">Role assignment</label>
+              <select id="um-role" value={role} onChange={(e) => setRole(e.target.value)} className="cs-input px-3.5 py-2.5">
+                <option value="user">Staff</option>
+                <option value="owner">Owner</option>
+              </select>
+            </div>
+            <div>
+              <label htmlFor="um-date" className="cs-label">Date joined</label>
+              <input
+                id="um-date"
+                type="date"
+                value={joinedDate}
+                onChange={(e) => setJoinedDate(e.target.value)}
+                required
+                className="cs-input px-3.5 py-2.5"
+              />
+            </div>
+            <button type="submit" className="cs-btn cs-btn-gold w-full justify-center py-3">
+              Create &amp; Authorize User
+            </button>
+          </form>
+        </div>
+
+        {/* Directory */}
+        <div className="cs-card lg:col-span-2 overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-[#2a2622] bg-[#1a1816] text-[11px] uppercase tracking-wider text-[#a8a090]">
+                  <th className="p-4 font-medium">Username</th>
+                  <th className="p-4 font-medium">Role</th>
+                  <th className="p-4 font-medium">Status</th>
+                  <th className="p-4 font-medium">Joined</th>
+                  <th className="p-4 font-medium text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#24201c] text-sm">
+                {users.length === 0 ? (
+                  <tr>
+                    <td colSpan="5" className="p-8 text-center text-[#a8a090]">
+                      No user accounts found in directory.
+                    </td>
+                  </tr>
+                ) : (
+                  users.map((u) => (
+                    <tr key={u.id} className="hover:bg-[#1c1916] transition-colors">
+                      <td className="p-4 font-medium">
+                        <div className="flex items-center gap-2">
+                          <Shield
+                            className={`w-3.5 h-3.5 ${u.role === 'owner' ? 'text-[#d9b24c]' : 'text-[#7a7364]'}`}
+                            aria-hidden="true"
+                          />
+                          <span>{u.username}</span>
+                        </div>
+                      </td>
+                      <td className="p-4 capitalize text-[#cfc8b8]">{u.role}</td>
+                      <td className="p-4">
+                        <span
+                          className={`inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-medium border ${
+                            STATUS_STYLE[u.status] || STATUS_STYLE.Revoked
+                          }`}
+                        >
+                          {u.status}
+                        </span>
+                      </td>
+                      <td className="p-4 text-[#a8a090]">
+                        {u.date_joined
+                          ? new Date(u.date_joined).toLocaleDateString('en-US', {
+                              month: 'short',
+                              day: 'numeric',
+                              year: 'numeric',
+                              timeZone: 'UTC',
+                            })
+                          : 'N/A'}
+                      </td>
+                      <td className="p-4 text-right whitespace-nowrap space-x-2">
+                        {u.role !== 'owner' && (
+                          <>
+                            {u.status !== 'Active' && (
+                              <button
+                                onClick={() => handleUpdateStatus(u.id, 'Active')}
+                                className="px-3 py-1.5 rounded-lg text-xs bg-[#3ecf8e]/15 hover:bg-[#3ecf8e]/25 text-[#3ecf8e] border border-[#3ecf8e]/30 transition-colors cursor-pointer inline-flex items-center gap-1"
+                              >
+                                <UserCheck className="w-3 h-3" aria-hidden="true" />
+                                <span>Approve</span>
+                              </button>
+                            )}
+                            {u.status !== 'Revoked' && (
+                              <button
+                                onClick={() => handleUpdateStatus(u.id, 'Revoked')}
+                                className="px-3 py-1.5 rounded-lg text-xs bg-[#f0716b]/15 hover:bg-[#f0716b]/25 text-[#f0908b] border border-[#f0716b]/30 transition-colors cursor-pointer inline-flex items-center gap-1"
+                              >
+                                <UserX className="w-3 h-3" aria-hidden="true" />
+                                <span>Revoke</span>
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,911 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { ShoppingCart, PlusCircle, Trash2, ChevronDown, ChevronRight, Wallet, Ban, Receipt } from 'lucide-react';
+import { supabase } from '../supabaseClient';
+import { EmptyState, PageHeader, ErrorNote, Modal, nz, peso, fmtDate } from './ui';
+import { MATERIAL_CATEGORIES } from './materialCategories';
+
+const todayLocal = () => new Date().toLocaleDateString('en-CA');
+const pad = (n) => String(n).padStart(4, '0');
+const purLabel = (n) => `PUR-${pad(n)}`;
+const payLabel = (n) => `PAY-${pad(n)}`;
+const cents = (v) => Math.round((Number(v) || 0) * 100);
+const qty = (v) => Number(v || 0).toLocaleString('en-PH', { maximumFractionDigits: 3 });
+
+const PAYMENT_LABEL = { cash: 'Cash', bank: 'Bank', credit: 'On credit' };
+const ASSET_ACCOUNTS = [
+  { code: '1500', name: 'Equipment' },
+  { code: '1400', name: 'Prepaid Expenses' },
+];
+
+let keySeed = 0;
+const newLine = () => ({ key: `p${++keySeed}`, line_type: 'material', material_id: '', account_code: '', description: '', qty: '', unit_cost: '' });
+
+const lineAmount = (l) => cents((Number(l.qty) || 0) * (Number(l.unit_cost) || 0)) ;
+
+// Add months to a yyyy-mm-dd date, always counting from the original day (Jan 31 + 1 month = Feb 28),
+// the same way the database does it.
+const addMonths = (iso, k) => {
+  const [y, m, d] = iso.split('-').map(Number);
+  const t = m - 1 + k;
+  const yy = y + Math.floor(t / 12);
+  const mm = ((t % 12) + 12) % 12;
+  const last = new Date(Date.UTC(yy, mm + 1, 0)).getUTCDate();
+  return `${yy}-${String(mm + 1).padStart(2, '0')}-${String(Math.min(d, last)).padStart(2, '0')}`;
+};
+
+function Badge({ tone, children }) {
+  const tones = {
+    green: 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30',
+    amber: 'bg-[#e5a93d]/10 text-[#e5a93d] border-[#e5a93d]/30',
+    red: 'bg-[#e5736d]/10 text-[#e5736d] border-[#e5736d]/30',
+    gray: 'bg-[#1c1916] text-[#a8a090] border-[#2a2622]',
+  };
+  return <span className={`inline-flex px-2.5 py-0.5 rounded-full text-[10px] font-medium border ${tones[tone]}`}>{children}</span>;
+}
+
+function Tabs({ tabs, value, onChange }) {
+  return (
+    <div className="flex gap-2 mb-5 border-b border-[#2a2622]" role="tablist">
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          role="tab"
+          aria-selected={value === t.id}
+          onClick={() => onChange(t.id)}
+          className={`px-4 py-2.5 text-sm cursor-pointer border-b-2 -mb-px transition-colors ${
+            value === t.id ? 'border-[#d9b24c] text-[#e3bf5a]' : 'border-transparent text-[#a8a090] hover:text-[#ece6d8]'
+          }`}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export default function Procurement({ user, onChanged }) {
+  const isOwner = user?.role === 'owner';
+  const [tab, setTab] = useState('purchases');
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+
+  const [suppliers, setSuppliers] = useState([]);
+  const [materials, setMaterials] = useState([]);
+  const [expenseAccounts, setExpenseAccounts] = useState([]);
+  const [purchases, setPurchases] = useState([]);
+  const [payables, setPayables] = useState([]);
+  const [payments, setPayments] = useState([]);
+  const [installmentRows, setInstallmentRows] = useState([]);
+  const [openId, setOpenId] = useState(null);
+
+  // new purchase
+  const [formOpen, setFormOpen] = useState(false);
+  const [date, setDate] = useState(todayLocal());
+  const [supplier, setSupplier] = useState('');
+  const [reference, setReference] = useState('');
+  const [payment, setPayment] = useState('cash');
+  const [due, setDue] = useState('');
+  const [notes, setNotes] = useState('');
+  const [lines, setLines] = useState([newLine()]);
+  const [terms, setTerms] = useState('full'); // 'full' = one due date, 'installment' = monthly installments
+  const [instCount, setInstCount] = useState('6');
+  const [firstDue, setFirstDue] = useState('');
+  const [interestMode, setInterestMode] = useState('none'); // 'none' | 'rate' | 'amount'
+  const [interestValue, setInterestValue] = useState('');
+  const [formError, setFormError] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  // pay supplier
+  const [paying, setPaying] = useState(null); // { supplier_id, supplier_name, items }
+  const [payDate, setPayDate] = useState(todayLocal());
+  const [payMethod, setPayMethod] = useState('cash');
+  const [payRef, setPayRef] = useState('');
+  const [payAmounts, setPayAmounts] = useState({});
+  const [payError, setPayError] = useState('');
+
+  // void
+  const [voiding, setVoiding] = useState(null); // { kind: 'purchase'|'payment', row }
+  const [reason, setReason] = useState('');
+  const [voidError, setVoidError] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError('');
+    // Post any month-end interest that is due on installment plans (does nothing when there is none)
+    await supabase.rpc('accrue_installment_interest');
+    const [sup, mat, acc, pur, pay, pmt, ins] = await Promise.all([
+      supabase.from('suppliers').select('id, name, payment_terms_days').eq('status', 'Active').order('name'),
+      supabase.from('materials').select('id, name, category, unit').eq('is_active', true).order('name'),
+      supabase.from('accounts').select('code, name').eq('type', 'expense').eq('is_active', true).eq('is_system', false).order('code'),
+      supabase.from('purchases').select('*, suppliers(name), purchase_lines(*)').order('purchase_no', { ascending: false }).limit(200),
+      supabase.from('payables_open').select('*').order('due_date', { ascending: true }),
+      supabase.from('supplier_payments').select('*, suppliers(name)').order('pay_no', { ascending: false }).limit(200),
+      supabase.from('installments_status').select('*').order('seq', { ascending: true }),
+    ]);
+    const err = [sup, mat, acc, pur, pay, pmt, ins].find((r) => r.error);
+    if (err) setLoadError(err.error.message);
+    setSuppliers(sup.data || []);
+    setMaterials(mat.data || []);
+    setExpenseAccounts((acc.data || []).filter((a) => !['6060', '6080'].includes(a.code)));
+    setPurchases(pur.data || []);
+    setPayables(pay.data || []);
+    setPayments(pmt.data || []);
+    setInstallmentRows(ins.data || []);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const afterChange = async () => {
+    await load();
+    onChanged && onChanged();
+  };
+
+  // ---------- new purchase ----------
+  const openForm = () => {
+    setDate(todayLocal());
+    setSupplier('');
+    setReference('');
+    setPayment('cash');
+    setDue('');
+    setNotes('');
+    setLines([newLine()]);
+    setTerms('full');
+    setInstCount('6');
+    setFirstDue('');
+    setInterestMode('none');
+    setInterestValue('');
+    setFormError('');
+    setFormOpen(true);
+  };
+
+  const updateLine = (key, patch) => setLines((prev) => prev.map((l) => (l.key === key ? { ...l, ...patch } : l)));
+  const total = lines.reduce((s, l) => s + lineAmount(l), 0);
+
+  // Installment preview: same split as the database (equal parts, last one takes the rounding)
+  const plan = useMemo(() => {
+    if (payment !== 'credit' || terms !== 'installment') return null;
+    const n = Math.floor(Number(instCount));
+    if (!(n >= 2 && n <= 60) || total <= 0) return { n, valid: false, rows: [], interestCents: 0, first: '' };
+    const first = firstDue || addMonths(date || todayLocal(), 1);
+    const interestCents =
+      interestMode === 'rate'
+        ? Math.round((total * (Number(interestValue) || 0) * n) / 100)
+        : interestMode === 'amount'
+        ? cents(interestValue)
+        : 0;
+    const pp = Math.floor(total / n);
+    const ii = Math.floor(interestCents / n);
+    const rows = Array.from({ length: n }, (_, k) => ({
+      seq: k + 1,
+      due: addMonths(first, k),
+      principal: k === n - 1 ? total - pp * (n - 1) : pp,
+      interest: k === n - 1 ? interestCents - ii * (n - 1) : ii,
+    }));
+    return { n, valid: true, rows, interestCents, first };
+  }, [payment, terms, instCount, firstDue, interestMode, interestValue, total, date]);
+
+  const savePurchase = async (e) => {
+    e.preventDefault();
+    if (payment === 'credit' && !supplier) return setFormError('Choose a supplier for a purchase on credit.');
+    if (plan) {
+      if (!(plan.n >= 2 && plan.n <= 60)) return setFormError('Choose between 2 and 60 installments.');
+      if (firstDue && firstDue < date) return setFormError('The first due date cannot be before the purchase date.');
+      if (interestMode !== 'none' && !(Number(interestValue) > 0)) return setFormError('Enter the interest, or choose no interest.');
+    }
+    const used = lines.filter((l) => l.material_id || l.description || Number(l.qty) || Number(l.unit_cost));
+    if (used.length === 0) return setFormError('Add at least one line.');
+    for (const [i, l] of used.entries()) {
+      const n = i + 1;
+      if (!(Number(l.qty) > 0)) return setFormError(`Line ${n}: enter a quantity.`);
+      if (!(Number(l.unit_cost) >= 0) || l.unit_cost === '') return setFormError(`Line ${n}: enter the cost.`);
+      if (l.line_type === 'material' && !l.material_id) return setFormError(`Line ${n}: choose a material.`);
+      if (l.line_type !== 'material' && !l.account_code) return setFormError(`Line ${n}: choose an account.`);
+      if (l.line_type !== 'material' && !l.description.trim()) return setFormError(`Line ${n}: describe the item.`);
+    }
+    setSaving(true);
+    setFormError('');
+    const { error } = await supabase.rpc('record_purchase', {
+      p_date: date || todayLocal(),
+      p_supplier: supplier || null,
+      p_reference: nz(reference),
+      p_payment: payment,
+      p_due: payment === 'credit' && terms === 'full' && due ? due : null,
+      p_installments: plan ? plan.n : null,
+      p_first_due: plan && firstDue ? firstDue : null,
+      p_interest: plan ? plan.interestCents / 100 : 0,
+      p_interest_rate: plan && interestMode === 'rate' ? Number(interestValue) : null,
+      p_notes: nz(notes),
+      p_lines: used.map((l) => ({
+        line_type: l.line_type,
+        material_id: l.line_type === 'material' ? l.material_id : null,
+        account_code: l.line_type === 'material' ? null : l.account_code,
+        description: l.line_type === 'material' ? null : l.description.trim(),
+        qty: Number(l.qty),
+        unit_cost: Number(l.unit_cost),
+      })),
+    });
+    setSaving(false);
+    if (error) return setFormError(error.message);
+    setFormOpen(false);
+    await afterChange();
+  };
+
+  // ---------- pay supplier ----------
+  const openPay = (group) => {
+    setPaying(group);
+    setPayDate(todayLocal());
+    setPayMethod('cash');
+    setPayRef('');
+    setPayError('');
+    setPayAmounts(Object.fromEntries(group.items.map((i) => [i.purchase_id, String(Number(i.is_installment ? i.next_due_balance : i.balance))])));
+  };
+
+  const payTotal = paying ? paying.items.reduce((s, i) => s + cents(payAmounts[i.purchase_id]), 0) : 0;
+
+  const savePayment = async (e) => {
+    e.preventDefault();
+    const allocations = paying.items
+      .map((i) => ({ purchase_id: i.purchase_id, amount: cents(payAmounts[i.purchase_id]) / 100 }))
+      .filter((a) => a.amount > 0);
+    if (allocations.length === 0) return setPayError('Enter an amount to pay.');
+    const tooMuch = paying.items.find((i) => cents(payAmounts[i.purchase_id]) > cents(i.balance));
+    if (tooMuch) return setPayError(`${purLabel(tooMuch.purchase_no)} has only ${peso(tooMuch.balance)} left to pay.`);
+    setSaving(true);
+    setPayError('');
+    const { error } = await supabase.rpc('record_supplier_payment', {
+      p_date: payDate || todayLocal(),
+      p_supplier: paying.supplier_id,
+      p_method: payMethod,
+      p_reference: nz(payRef),
+      p_notes: null,
+      p_allocations: allocations,
+    });
+    setSaving(false);
+    if (error) return setPayError(error.message);
+    setPaying(null);
+    await afterChange();
+  };
+
+  // ---------- void ----------
+  const openVoid = (kind, row) => {
+    setVoiding({ kind, row });
+    setReason('');
+    setVoidError('');
+  };
+
+  const doVoid = async (e) => {
+    e.preventDefault();
+    if (!reason.trim()) return setVoidError('Please give a reason.');
+    setSaving(true);
+    setVoidError('');
+    const { error } =
+      voiding.kind === 'purchase'
+        ? await supabase.rpc('void_purchase', { p_id: voiding.row.id, p_reason: reason.trim() })
+        : await supabase.rpc('void_supplier_payment', { p_id: voiding.row.id, p_reason: reason.trim() });
+    setSaving(false);
+    if (error) return setVoidError(error.message);
+    setVoiding(null);
+    await afterChange();
+  };
+
+  // ---------- derived ----------
+  const groups = useMemo(() => {
+    const map = new Map();
+    payables.forEach((p) => {
+      if (!map.has(p.supplier_id)) map.set(p.supplier_id, { supplier_id: p.supplier_id, supplier_name: p.supplier_name, items: [] });
+      map.get(p.supplier_id).items.push(p);
+    });
+    return [...map.values()].sort((a, b) => a.supplier_name.localeCompare(b.supplier_name));
+  }, [payables]);
+  const scheduleByPurchase = useMemo(() => {
+    const map = new Map();
+    installmentRows.forEach((r) => {
+      if (!map.has(r.purchase_id)) map.set(r.purchase_id, []);
+      map.get(r.purchase_id).push(r);
+    });
+    return map;
+  }, [installmentRows]);
+  const totalOwed = payables.reduce((s, p) => s + Number(p.balance), 0);
+  const overdueOwed = payables.filter((p) => Number(p.days_overdue) > 0).reduce((s, p) => s + Number(p.balance), 0);
+
+  const lineLabel = (l) => (l.line_type === 'material' ? l.description : `${l.description} (${l.account_code})`);
+
+  return (
+    <div>
+      <PageHeader title="Procurement" subtitle="Purchases of materials, assets and expenses, and payments to suppliers">
+        <button onClick={openForm} className="cs-btn cs-btn-gold px-4 py-2.5">
+          <PlusCircle className="w-4 h-4" aria-hidden="true" />
+          <span>Record Purchase</span>
+        </button>
+      </PageHeader>
+
+      <ErrorNote>{loadError}</ErrorNote>
+
+      <Tabs
+        value={tab}
+        onChange={setTab}
+        tabs={[
+          { id: 'purchases', label: 'Purchases' },
+          { id: 'payables', label: `Payables${payables.length ? ` (${payables.length})` : ''}` },
+          { id: 'payments', label: 'Supplier payments' },
+        ]}
+      />
+
+      {loading ? (
+        <p className="text-sm text-[#a8a090]">Loading...</p>
+      ) : tab === 'purchases' ? (
+        <div className="cs-card overflow-hidden">
+          {purchases.length === 0 ? (
+            <EmptyState
+              icon={ShoppingCart}
+              title="No purchases yet"
+              text="Record your first purchase to bring materials into stock."
+              actionLabel="Record Purchase"
+              onAction={openForm}
+            />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-[#1a1816] text-xs uppercase tracking-wider text-[#a8a090] border-b border-[#2a2622]">
+                  <tr>
+                    <th className="px-4 py-3 w-8"><span className="sr-only">Details</span></th>
+                    <th className="px-4 py-3 font-medium">Purchase</th>
+                    <th className="px-4 py-3 font-medium">Date</th>
+                    <th className="px-4 py-3 font-medium">Supplier</th>
+                    <th className="px-4 py-3 font-medium">Paid by</th>
+                    <th className="px-4 py-3 font-medium">Status</th>
+                    <th className="px-4 py-3 font-medium text-right">Total</th>
+                    {isOwner && <th className="px-4 py-3"><span className="sr-only">Actions</span></th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#24201c]">
+                  {purchases.map((p) => {
+                    const isOpen = openId === p.id;
+                    return (
+                      <React.Fragment key={p.id}>
+                        <tr className="hover:bg-[#1c1916] transition-colors">
+                          <td className="px-4 py-3">
+                            <button
+                              onClick={() => setOpenId(isOpen ? null : p.id)}
+                              aria-expanded={isOpen}
+                              aria-label={`${isOpen ? 'Hide' : 'Show'} lines of ${purLabel(p.purchase_no)}`}
+                              className="text-[#a8a090] hover:text-[#e3bf5a] cursor-pointer"
+                            >
+                              {isOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                            </button>
+                          </td>
+                          <td className="px-4 py-3 font-mono text-xs text-[#e3bf5a]">
+                            {purLabel(p.purchase_no)}
+                            {p.reference && <div className="text-[#a8a090]">{p.reference}</div>}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-[#a8a090] whitespace-nowrap">{fmtDate(p.purchase_date)}</td>
+                          <td className="px-4 py-3">{p.suppliers?.name || <span className="text-[#a8a090]">-</span>}</td>
+                          <td className="px-4 py-3"><Badge tone={p.payment_type === 'credit' ? 'amber' : 'gray'}>{PAYMENT_LABEL[p.payment_type]}</Badge></td>
+                          <td className="px-4 py-3"><Badge tone={p.status === 'Posted' ? 'green' : 'red'}>{p.status}</Badge></td>
+                          <td className="px-4 py-3 text-right font-mono">{peso(p.total)}</td>
+                          {isOwner && (
+                            <td className="px-4 py-3 text-right">
+                              {p.status === 'Posted' && (
+                                <button onClick={() => openVoid('purchase', p)} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs" aria-label={`Void ${purLabel(p.purchase_no)}`}>
+                                  <Ban className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+                                  <span>Void</span>
+                                </button>
+                              )}
+                            </td>
+                          )}
+                        </tr>
+                        {isOpen && (
+                          <tr className="bg-[#14120f]">
+                            <td />
+                            <td colSpan={isOwner ? 7 : 6} className="px-4 pb-4">
+                              <table className="w-full text-xs">
+                                <thead className="text-[#a8a090]">
+                                  <tr>
+                                    <th className="text-left font-medium py-2">Item</th>
+                                    <th className="text-right font-medium py-2">Qty</th>
+                                    <th className="text-right font-medium py-2">Unit cost</th>
+                                    <th className="text-right font-medium py-2">Amount</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {[...(p.purchase_lines || [])].sort((a, b) => a.line_no - b.line_no).map((l) => (
+                                    <tr key={l.id} className="border-t border-[#24201c]">
+                                      <td className="py-2">{lineLabel(l)}</td>
+                                      <td className="py-2 text-right font-mono">{qty(l.qty)}</td>
+                                      <td className="py-2 text-right font-mono">{peso(l.unit_cost)}</td>
+                                      <td className="py-2 text-right font-mono">{peso(l.amount)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                              {p.payment_type === 'credit' && p.due_date && !(scheduleByPurchase.get(p.id) || []).length && (
+                                <p className="text-[11px] text-[#a8a090] mt-2">Due {fmtDate(p.due_date)}</p>
+                              )}
+                              {(scheduleByPurchase.get(p.id) || []).length > 0 && (
+                                <div className="mt-3">
+                                  <div className="text-[10px] uppercase tracking-wider text-[#a8a090] mb-1">Installment schedule</div>
+                                  <table className="w-full text-xs">
+                                    <thead className="text-[#a8a090]">
+                                      <tr>
+                                        <th className="text-left font-medium py-1.5">#</th>
+                                        <th className="text-left font-medium py-1.5">Due</th>
+                                        <th className="text-right font-medium py-1.5">Principal</th>
+                                        <th className="text-right font-medium py-1.5">Interest</th>
+                                        <th className="text-right font-medium py-1.5">Balance</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {scheduleByPurchase.get(p.id).map((r) => (
+                                        <tr key={r.installment_id} className="border-t border-[#24201c]">
+                                          <td className="py-1.5">{r.seq}</td>
+                                          <td className="py-1.5">{fmtDate(r.due_date)}</td>
+                                          <td className="py-1.5 text-right font-mono">{peso(r.principal_due)}</td>
+                                          <td className="py-1.5 text-right font-mono">{peso(r.interest_due)}</td>
+                                          <td className={`py-1.5 text-right font-mono ${Number(r.balance) <= 0 ? 'text-[#3ecf8e]' : ''}`}>
+                                            {Number(r.balance) <= 0 ? 'Paid' : peso(r.balance)}
+                                          </td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                  <p className="text-[10px] text-[#a8a090] mt-2">
+                                    Interest is booked as an expense month by month as it accrues, not when the purchase is posted.
+                                  </p>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      ) : tab === 'payables' ? (
+        <div>
+          <div className="grid grid-cols-2 gap-4 mb-5">
+            <div className="cs-card p-4">
+              <div className="text-[10px] uppercase tracking-wider text-[#a8a090]">Total owed to suppliers</div>
+              <div className="font-serif text-2xl mt-1">{peso(totalOwed)}</div>
+            </div>
+            <div className="cs-card p-4">
+              <div className="text-[10px] uppercase tracking-wider text-[#a8a090]">Overdue</div>
+              <div className={`font-serif text-2xl mt-1 ${overdueOwed > 0 ? 'text-[#e5736d]' : 'text-[#3ecf8e]'}`}>{peso(overdueOwed)}</div>
+            </div>
+          </div>
+          {groups.length === 0 ? (
+            <div className="cs-card">
+              <EmptyState icon={Wallet} title="Nothing owed" text="Purchases made on credit appear here until they are paid." />
+            </div>
+          ) : (
+            groups.map((g) => {
+              const owed = g.items.reduce((s, i) => s + Number(i.balance), 0);
+              return (
+                <div key={g.supplier_id} className="cs-card overflow-hidden mb-4">
+                  <div className="p-4 border-b border-[#2a2622] flex items-center justify-between gap-3">
+                    <div>
+                      <div className="font-serif text-lg">{g.supplier_name}</div>
+                      <div className="text-xs text-[#a8a090]">{g.items.length} open purchase{g.items.length > 1 ? 's' : ''} · {peso(owed)} owed</div>
+                    </div>
+                    {isOwner && (
+                      <button onClick={() => openPay(g)} className="cs-btn cs-btn-gold px-4 py-2 text-xs">
+                        <Wallet className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>Pay supplier</span>
+                      </button>
+                    )}
+                  </div>
+                  <table className="w-full text-left text-sm">
+                    <thead className="text-xs uppercase tracking-wider text-[#a8a090]">
+                      <tr>
+                        <th className="px-4 py-2 font-medium">Purchase</th>
+                        <th className="px-4 py-2 font-medium">Due</th>
+                        <th className="px-4 py-2 font-medium text-right">Total</th>
+                        <th className="px-4 py-2 font-medium text-right">Paid</th>
+                        <th className="px-4 py-2 font-medium text-right">Balance</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#24201c]">
+                      {g.items.map((i) => (
+                        <tr key={i.purchase_id}>
+                          <td className="px-4 py-2 font-mono text-xs text-[#e3bf5a]">
+                            {purLabel(i.purchase_no)}
+                            {i.reference && <span className="text-[#a8a090]"> · {i.reference}</span>}
+                            {i.is_installment && (
+                              <div className="text-[10px] text-[#a8a090] font-sans">
+                                {i.installments} installments · includes {peso(i.interest_total)} interest · next due {peso(i.next_due_balance)}
+                              </div>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 text-xs whitespace-nowrap">
+                            {i.due_date ? fmtDate(i.due_date) : '-'}
+                            {Number(i.days_overdue) > 0 && <span className="ml-2 text-[#e5736d]">{i.days_overdue} days overdue</span>}
+                          </td>
+                          <td className="px-4 py-2 text-right font-mono">{peso(i.total)}</td>
+                          <td className="px-4 py-2 text-right font-mono">{peso(i.paid)}</td>
+                          <td className="px-4 py-2 text-right font-mono font-medium">{peso(i.balance)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            })
+          )}
+          {!isOwner && <p className="text-[11px] text-[#a8a090]">Only the owner can record payments to suppliers.</p>}
+        </div>
+      ) : (
+        <div className="cs-card overflow-hidden">
+          {payments.length === 0 ? (
+            <EmptyState icon={Receipt} title="No supplier payments yet" text="Payments you make against credit purchases will be listed here." />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-[#1a1816] text-xs uppercase tracking-wider text-[#a8a090] border-b border-[#2a2622]">
+                  <tr>
+                    <th className="px-4 py-3 font-medium">Payment</th>
+                    <th className="px-4 py-3 font-medium">Date</th>
+                    <th className="px-4 py-3 font-medium">Supplier</th>
+                    <th className="px-4 py-3 font-medium">Method</th>
+                    <th className="px-4 py-3 font-medium">Status</th>
+                    <th className="px-4 py-3 font-medium text-right">Amount</th>
+                    {isOwner && <th className="px-4 py-3"><span className="sr-only">Actions</span></th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#24201c]">
+                  {payments.map((p) => (
+                    <tr key={p.id} className="hover:bg-[#1c1916] transition-colors">
+                      <td className="px-4 py-3 font-mono text-xs text-[#e3bf5a]">
+                        {payLabel(p.pay_no)}
+                        {p.reference && <div className="text-[#a8a090]">{p.reference}</div>}
+                      </td>
+                      <td className="px-4 py-3 text-xs text-[#a8a090] whitespace-nowrap">{fmtDate(p.pay_date)}</td>
+                      <td className="px-4 py-3">{p.suppliers?.name}</td>
+                      <td className="px-4 py-3 text-xs">{p.method === 'cash' ? 'Cash' : 'Bank'}</td>
+                      <td className="px-4 py-3"><Badge tone={p.status === 'Posted' ? 'green' : 'red'}>{p.status}</Badge></td>
+                      <td className="px-4 py-3 text-right font-mono">{peso(p.amount)}</td>
+                      {isOwner && (
+                        <td className="px-4 py-3 text-right">
+                          {p.status === 'Posted' && (
+                            <button onClick={() => openVoid('payment', p)} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs">
+                              <Ban className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+                              <span>Void</span>
+                            </button>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------- Record purchase ---------- */}
+      {formOpen && (
+        <Modal title="Record Purchase" onClose={() => setFormOpen(false)} wide>
+          <form onSubmit={savePurchase} className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+              <div>
+                <label htmlFor="pu-date" className="cs-label">Date</label>
+                <input id="pu-date" type="date" value={date} onChange={(e) => setDate(e.target.value)} required className="cs-input px-3 py-2.5" />
+              </div>
+              <div className="sm:col-span-2">
+                <label htmlFor="pu-sup" className="cs-label">Supplier {payment === 'credit' ? '' : '(optional)'}</label>
+                <select id="pu-sup" value={supplier} onChange={(e) => setSupplier(e.target.value)} className="cs-input px-3 py-2.5">
+                  <option value="">No supplier</option>
+                  {suppliers.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="pu-ref" className="cs-label">Invoice / receipt no.</label>
+                <input id="pu-ref" value={reference} onChange={(e) => setReference(e.target.value)} className="cs-input px-3 py-2.5" />
+              </div>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+              <div>
+                <label htmlFor="pu-pay" className="cs-label">Paid by</label>
+                <select id="pu-pay" value={payment} onChange={(e) => setPayment(e.target.value)} className="cs-input px-3 py-2.5">
+                  <option value="cash">Cash on hand</option>
+                  <option value="bank">Bank</option>
+                  <option value="credit">On credit (pay later)</option>
+                </select>
+              </div>
+              {payment === 'credit' && terms === 'full' && (
+                <div>
+                  <label htmlFor="pu-due" className="cs-label">Due date</label>
+                  <input id="pu-due" type="date" value={due} onChange={(e) => setDue(e.target.value)} className="cs-input px-3 py-2.5" />
+                  <p className="text-[10px] text-[#a8a090] mt-1">Blank = supplier&rsquo;s payment terms</p>
+                </div>
+              )}
+              <div className={payment === 'credit' && terms === 'full' ? 'sm:col-span-2' : 'sm:col-span-3'}>
+                <label htmlFor="pu-notes" className="cs-label">Notes (optional)</label>
+                <input id="pu-notes" value={notes} onChange={(e) => setNotes(e.target.value)} className="cs-input px-3 py-2.5" />
+              </div>
+            </div>
+
+            {payment === 'credit' && (
+              <div className="rounded-xl border border-[#2a2622] p-4 space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                  <div className="sm:col-span-2">
+                    <label htmlFor="pu-terms" className="cs-label">Payment terms</label>
+                    <select id="pu-terms" value={terms} onChange={(e) => setTerms(e.target.value)} className="cs-input px-3 py-2.5">
+                      <option value="full">Pay in full on one due date</option>
+                      <option value="installment">Monthly installments</option>
+                    </select>
+                  </div>
+                  {terms === 'installment' && (
+                    <>
+                      <div>
+                        <label htmlFor="pu-n" className="cs-label">Installments</label>
+                        <input id="pu-n" type="number" min="2" max="60" step="1" value={instCount} onChange={(e) => setInstCount(e.target.value)} className="cs-input px-3 py-2.5 text-right" />
+                      </div>
+                      <div>
+                        <label htmlFor="pu-first" className="cs-label">First due date</label>
+                        <input id="pu-first" type="date" value={firstDue} onChange={(e) => setFirstDue(e.target.value)} className="cs-input px-3 py-2.5" />
+                        <p className="text-[10px] text-[#a8a090] mt-1">Blank = one month after purchase</p>
+                      </div>
+                    </>
+                  )}
+                </div>
+                {terms === 'installment' && (
+                  <>
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                      <div className="sm:col-span-2">
+                        <label htmlFor="pu-imode" className="cs-label">Interest charged by the supplier</label>
+                        <select id="pu-imode" value={interestMode} onChange={(e) => { setInterestMode(e.target.value); setInterestValue(''); }} className="cs-input px-3 py-2.5">
+                          <option value="none">No interest</option>
+                          <option value="rate">Rate per month (flat, on the original amount)</option>
+                          <option value="amount">Total interest amount</option>
+                        </select>
+                      </div>
+                      {interestMode !== 'none' && (
+                        <div className="sm:col-span-2">
+                          <label htmlFor="pu-ival" className="cs-label">{interestMode === 'rate' ? 'Interest rate (% per month)' : 'Total interest (\u20B1)'}</label>
+                          <input id="pu-ival" type="number" min="0" step="any" value={interestValue} onChange={(e) => setInterestValue(e.target.value)} className="cs-input px-3 py-2.5 text-right" />
+                        </div>
+                      )}
+                    </div>
+                    {plan && plan.valid ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead className="text-[#a8a090]">
+                            <tr>
+                              <th className="text-left font-medium py-1.5">#</th>
+                              <th className="text-left font-medium py-1.5">Due</th>
+                              <th className="text-right font-medium py-1.5">Principal</th>
+                              <th className="text-right font-medium py-1.5">Interest</th>
+                              <th className="text-right font-medium py-1.5">Installment</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {plan.rows.map((r) => (
+                              <tr key={r.seq} className="border-t border-[#24201c]">
+                                <td className="py-1.5">{r.seq}</td>
+                                <td className="py-1.5">{fmtDate(r.due)}</td>
+                                <td className="py-1.5 text-right font-mono">{peso(r.principal / 100)}</td>
+                                <td className="py-1.5 text-right font-mono">{peso(r.interest / 100)}</td>
+                                <td className="py-1.5 text-right font-mono">{peso((r.principal + r.interest) / 100)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                          <tfoot>
+                            <tr className="border-t border-[#2a2622] font-medium">
+                              <td className="py-1.5" colSpan={2}>Total to pay</td>
+                              <td className="py-1.5 text-right font-mono">{peso(total / 100)}</td>
+                              <td className="py-1.5 text-right font-mono">{peso(plan.interestCents / 100)}</td>
+                              <td className="py-1.5 text-right font-mono">{peso((total + plan.interestCents) / 100)}</td>
+                            </tr>
+                          </tfoot>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="text-[11px] text-[#a8a090]">Add the purchase lines and the number of installments (2 to 60) to see the schedule.</p>
+                    )}
+                    <p className="text-[11px] text-[#a8a090]">
+                      The purchase is recorded at its price and owed to the supplier. Interest is not added to the cost of the materials: it is recorded as
+                      Interest Expense month by month as it accrues, and owed as Interest Payable until you pay it.
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="space-y-3">
+              <div className="hidden sm:grid grid-cols-12 gap-3 text-xs uppercase tracking-wider text-[#a8a090]">
+                <span className="col-span-2">Type</span>
+                <span className="col-span-4">Item</span>
+                <span className="col-span-2 text-right">Qty</span>
+                <span className="col-span-2 text-right">Unit cost</span>
+                <span className="col-span-1 text-right">Amount</span>
+                <span className="col-span-1" />
+              </div>
+              {lines.map((l, i) => (
+                <div key={l.key} className="grid grid-cols-12 gap-3 items-start rounded-xl sm:rounded-none border sm:border-0 border-[#2a2622] p-3 sm:p-0">
+                  <div className="col-span-12 sm:col-span-2">
+                    <label htmlFor={`lt-${l.key}`} className="sr-only">Type for line {i + 1}</label>
+                    <select
+                      id={`lt-${l.key}`}
+                      value={l.line_type}
+                      onChange={(e) => updateLine(l.key, { line_type: e.target.value, material_id: '', account_code: '', description: '' })}
+                      className="cs-input px-3 py-2.5"
+                    >
+                      <option value="material">Material</option>
+                      <option value="asset">Asset</option>
+                      <option value="expense">Expense</option>
+                    </select>
+                  </div>
+                  <div className="col-span-12 sm:col-span-4 space-y-2">
+                    {l.line_type === 'material' ? (
+                      <>
+                        <label htmlFor={`mt-${l.key}`} className="sr-only">Material for line {i + 1}</label>
+                        <select id={`mt-${l.key}`} value={l.material_id} onChange={(e) => updateLine(l.key, { material_id: e.target.value })} className="cs-input px-3 py-2.5">
+                          <option value="">Select material...</option>
+                          {MATERIAL_CATEGORIES.map((c) => {
+                            const list = materials.filter((m) => m.category === c.id);
+                            return list.length ? (
+                              <optgroup key={c.id} label={c.label}>
+                                {list.map((m) => (
+                                  <option key={m.id} value={m.id}>{m.name} ({m.unit})</option>
+                                ))}
+                              </optgroup>
+                            ) : null;
+                          })}
+                        </select>
+                        {materials.length === 0 && (
+                          <p className="text-[10px] text-[#e5a93d]">No materials yet. Add them first under Raw Materials.</p>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <label htmlFor={`ac-${l.key}`} className="sr-only">Account for line {i + 1}</label>
+                        <select id={`ac-${l.key}`} value={l.account_code} onChange={(e) => updateLine(l.key, { account_code: e.target.value })} className="cs-input px-3 py-2.5">
+                          <option value="">Select account...</option>
+                          {(l.line_type === 'asset' ? ASSET_ACCOUNTS : expenseAccounts).map((a) => (
+                            <option key={a.code} value={a.code}>{a.code} · {a.name}</option>
+                          ))}
+                        </select>
+                        <label htmlFor={`ds-${l.key}`} className="sr-only">Description for line {i + 1}</label>
+                        <input id={`ds-${l.key}`} value={l.description} onChange={(e) => updateLine(l.key, { description: e.target.value })} placeholder="Describe the item" className="cs-input px-3 py-2.5" />
+                      </>
+                    )}
+                  </div>
+                  <div className="col-span-4 sm:col-span-2">
+                    <label htmlFor={`q-${l.key}`} className="sr-only">Quantity for line {i + 1}</label>
+                    <input id={`q-${l.key}`} type="number" min="0" step="any" placeholder="Qty" value={l.qty} onChange={(e) => updateLine(l.key, { qty: e.target.value })} className="cs-input px-3 py-2.5 text-right" />
+                  </div>
+                  <div className="col-span-4 sm:col-span-2">
+                    <label htmlFor={`uc-${l.key}`} className="sr-only">Unit cost for line {i + 1}</label>
+                    <input id={`uc-${l.key}`} type="number" min="0" step="any" placeholder="0.00" value={l.unit_cost} onChange={(e) => updateLine(l.key, { unit_cost: e.target.value })} className="cs-input px-3 py-2.5 text-right" />
+                  </div>
+                  <div className="col-span-3 sm:col-span-1 text-right font-mono text-xs pt-3">{peso(lineAmount(l) / 100)}</div>
+                  <div className="col-span-1 flex justify-end pt-2.5">
+                    {lines.length > 1 && (
+                      <button type="button" onClick={() => setLines((prev) => prev.filter((x) => x.key !== l.key))} className="text-[#a8a090] hover:text-[#e5736d] cursor-pointer" aria-label={`Remove line ${i + 1}`}>
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+              <button type="button" onClick={() => setLines((prev) => [...prev, newLine()])} className="cs-btn cs-btn-ghost px-3 py-2 text-xs">
+                <PlusCircle className="w-3.5 h-3.5 text-[#d9b24c]" aria-hidden="true" />
+                <span>Add line</span>
+              </button>
+            </div>
+
+            <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 flex items-center justify-between text-sm">
+              <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Purchase total</span>
+              <span className="font-mono text-lg">{peso(total / 100)}</span>
+            </div>
+            <p className="text-[11px] text-[#a8a090]">
+              Materials go into stock at this cost (oldest stock is used first). Oils and solvent are priced per ml, so enter the cost of one ml.
+              Assets and expenses go straight to the books. {payment === 'credit' ? 'This will be added to what you owe the supplier.' : ''}
+            </p>
+
+            <ErrorNote>{formError}</ErrorNote>
+            <div className="pt-2 flex justify-end gap-3">
+              <button type="button" onClick={() => setFormOpen(false)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
+              <button type="submit" disabled={saving || total <= 0} className="cs-btn cs-btn-gold px-5 py-2.5 disabled:opacity-50">
+                {saving ? 'Posting...' : 'Post Purchase'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {/* ---------- Pay supplier ---------- */}
+      {paying && (
+        <Modal title={`Pay ${paying.supplier_name}`} onClose={() => setPaying(null)}>
+          <form onSubmit={savePayment} className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="py-date" className="cs-label">Date</label>
+                <input id="py-date" type="date" value={payDate} onChange={(e) => setPayDate(e.target.value)} required className="cs-input px-3 py-2.5" />
+              </div>
+              <div>
+                <label htmlFor="py-method" className="cs-label">Paid from</label>
+                <select id="py-method" value={payMethod} onChange={(e) => setPayMethod(e.target.value)} className="cs-input px-3 py-2.5">
+                  <option value="cash">Cash on hand</option>
+                  <option value="bank">Bank</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label htmlFor="py-ref" className="cs-label">Reference (optional)</label>
+              <input id="py-ref" value={payRef} onChange={(e) => setPayRef(e.target.value)} placeholder="e.g. check or transfer no." className="cs-input px-3 py-2.5" />
+            </div>
+            <div className="space-y-2">
+              {paying.items.map((i) => (
+                <div key={i.purchase_id} className="grid grid-cols-12 gap-3 items-center">
+                  <div className="col-span-7 text-xs">
+                    <span className="font-mono text-[#e3bf5a]">{purLabel(i.purchase_no)}</span>
+                    <span className="text-[#a8a090]"> · balance {peso(i.balance)}</span>
+                    {i.is_installment && <span className="block text-[10px] text-[#a8a090]">Next installment {peso(i.next_due_balance)} (interest is paid first)</span>}
+                  </div>
+                  <div className="col-span-5">
+                    <label htmlFor={`pa-${i.purchase_id}`} className="sr-only">Amount for {purLabel(i.purchase_no)}</label>
+                    <input
+                      id={`pa-${i.purchase_id}`}
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={payAmounts[i.purchase_id] ?? ''}
+                      onChange={(e) => setPayAmounts((p) => ({ ...p, [i.purchase_id]: e.target.value }))}
+                      className="cs-input px-3 py-2 text-right"
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 flex items-center justify-between text-sm">
+              <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Total payment</span>
+              <span className="font-mono text-lg">{peso(payTotal / 100)}</span>
+            </div>
+            <ErrorNote>{payError}</ErrorNote>
+            <div className="pt-2 flex justify-end gap-3">
+              <button type="button" onClick={() => setPaying(null)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
+              <button type="submit" disabled={saving || payTotal <= 0} className="cs-btn cs-btn-gold px-5 py-2.5 disabled:opacity-50">
+                {saving ? 'Posting...' : 'Post Payment'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {/* ---------- Void ---------- */}
+      {voiding && (
+        <Modal
+          title={`Void ${voiding.kind === 'purchase' ? purLabel(voiding.row.purchase_no) : payLabel(voiding.row.pay_no)}`}
+          onClose={() => setVoiding(null)}
+        >
+          <form onSubmit={doVoid} className="space-y-4">
+            <p className="text-sm text-[#a8a090]">
+              {voiding.kind === 'purchase'
+                ? 'This reverses the purchase in the books and removes its materials from stock. It only works if nothing was paid and none of the materials were used yet.'
+                : 'This reverses the payment in the books and puts the amount back on the supplier\u2019s balance.'}
+            </p>
+            <div>
+              <label htmlFor="void-reason" className="cs-label">Reason</label>
+              <input id="void-reason" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Entered twice" required autoFocus className="cs-input px-3.5 py-2.5" />
+            </div>
+            <ErrorNote>{voidError}</ErrorNote>
+            <div className="pt-2 flex justify-end gap-3">
+              <button type="button" onClick={() => setVoiding(null)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
+              <button type="submit" disabled={saving} className="cs-btn cs-btn-gold px-5 py-2.5">{saving ? 'Voiding...' : 'Void'}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}

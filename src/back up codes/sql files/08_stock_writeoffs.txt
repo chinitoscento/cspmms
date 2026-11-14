@@ -1,0 +1,163 @@
+-- =====================================================================
+-- Chinito Scento - stock write-offs for raw materials that are spilled,
+-- broken, expired or contaminated BEFORE they are used in production.
+-- Run after 07_void_production.sql. Safe to re-run.
+--
+-- A write-off takes the quantity out of stock oldest-layer-first (exact cost) and posts:
+--   Dr 5120 Inventory Write-off (Spillage/Damage)
+--   Cr 1200 Oils | 1210 Solvent | 1220 Packaging materials  (by material category)
+-- Spoilage during bottling/packaging (5110) and maceration loss (5100) are unchanged.
+-- =====================================================================
+
+-- ---------- 0. Guard: journal source check ------------------------------
+-- If journal_entries limits which "source" values are allowed, 'writeoff' must be on the list.
+do $$
+declare
+  c record;
+begin
+  for c in
+    select conname, pg_get_constraintdef(oid) as def
+    from pg_constraint
+    where conrelid = 'public.journal_entries'::regclass and contype = 'c'
+      and pg_get_constraintdef(oid) ilike '%source%'
+  loop
+    if c.def not ilike '%writeoff%' then
+      raise exception 'journal_entries has a rule on its source column (%: %). Send me this text so I can extend it to allow writeoff, then re-run.', c.conname, c.def;
+    end if;
+  end loop;
+end $$;
+
+-- ---------- 1. Account -------------------------------------------------
+do $$
+begin
+  if exists (select 1 from public.accounts where code = '5120' and name <> 'Inventory Write-off (Spillage/Damage)') then
+    raise exception 'Account code 5120 is already used for something else. Pick another code and change it in this file.';
+  end if;
+end $$;
+
+insert into public.accounts (code, name, type, normal_side, cash_class, is_system) values
+  ('5120', 'Inventory Write-off (Spillage/Damage)', 'expense', 'debit', 'operating', true)
+on conflict (code) do nothing;
+
+-- ---------- 2. Table ---------------------------------------------------
+create sequence if not exists public.writeoff_no_seq;
+
+create table if not exists public.stock_writeoffs (
+  id               uuid primary key default gen_random_uuid(),
+  writeoff_no      bigint not null unique default nextval('public.writeoff_no_seq'),
+  writeoff_date    date not null,
+  material_id      uuid not null references public.materials(id),
+  qty              numeric(14,3) not null check (qty > 0),
+  cost             numeric(14,2) not null check (cost >= 0),
+  reason           text not null check (reason in ('spilled','broken','expired','contaminated','other')),
+  notes            text,
+  status           text not null default 'Posted' check (status in ('Posted','Voided')),
+  journal_entry_id uuid references public.journal_entries(id),
+  void_entry_id    uuid references public.journal_entries(id),
+  void_reason      text,
+  voided_at        timestamptz,
+  voided_by        uuid references auth.users(id),
+  created_by       uuid references auth.users(id) default auth.uid(),
+  created_at       timestamptz not null default now()
+);
+create index if not exists stock_writeoffs_material_idx on public.stock_writeoffs (material_id);
+
+-- ---------- 3. Record a write-off -------------------------------------
+create or replace function public.record_stock_writeoff(
+  p_date date, p_material uuid, p_qty numeric, p_reason text, p_notes text
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_mat public.materials;
+  v_cost numeric(14,2);
+  v_acct text;
+  v_label text;
+  v_je uuid;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_qty is null or p_qty <= 0 then raise exception 'Enter the quantity lost.'; end if;
+  if p_reason is null or p_reason not in ('spilled','broken','expired','contaminated','other') then
+    raise exception 'Choose what happened.';
+  end if;
+  if p_reason = 'other' and coalesce(trim(p_notes), '') = '' then
+    raise exception 'Describe what happened.';
+  end if;
+
+  select * into v_mat from public.materials where id = p_material and is_active;
+  if not found then raise exception 'Choose a material.'; end if;
+
+  v_acct := case v_mat.category when 'oil' then '1200' when 'solvent' then '1210' else '1220' end;
+  v_no := nextval('public.writeoff_no_seq');
+  v_label := 'WO-' || lpad(v_no::text, 8, '0');
+
+  -- raises "Not enough ... in stock" if the quantity is more than what is on hand
+  v_cost := public.stock_out('material', v_mat.id, p_qty, v_date, 'writeoff', v_id);
+  if v_cost <= 0 then
+    raise exception 'This material has no recorded cost, so there is nothing to write off.';
+  end if;
+
+  v_je := public.post_module_entry(
+    v_date, v_label,
+    'Stock write-off ' || v_label || ' - ' || v_mat.name || ' (' || p_reason || ')',
+    jsonb_build_array(
+      jsonb_build_object('account_code', '5120', 'debit',  v_cost, 'memo', v_mat.name || ' ' || p_reason),
+      jsonb_build_object('account_code', v_acct, 'credit', v_cost, 'memo', v_mat.name)
+    ),
+    'writeoff', v_id);
+
+  insert into public.stock_writeoffs
+    (id, writeoff_no, writeoff_date, material_id, qty, cost, reason, notes, journal_entry_id)
+  values
+    (v_id, v_no, v_date, v_mat.id, p_qty, v_cost, p_reason, nullif(trim(coalesce(p_notes, '')), ''), v_je);
+
+  return v_id;
+end;
+$$;
+
+-- ---------- 4. Void a write-off (owner only) ---------------------------
+create or replace function public.void_stock_writeoff(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  r public.stock_writeoffs;
+  v_rev uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can void a write-off.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+
+  select * into r from public.stock_writeoffs where id = p_id for update;
+  if not found then raise exception 'Write-off not found.'; end if;
+  if r.status <> 'Posted' then raise exception 'This write-off is already voided.'; end if;
+
+  if public.restore_stock_for('writeoff', p_id, 'writeoff_void') = 0 then
+    raise exception 'The stock taken by this write-off could not be found, so it cannot be voided safely.';
+  end if;
+
+  v_rev := public.reverse_module_entry(r.journal_entry_id, p_reason, 'writeoff', p_id);
+
+  update public.stock_writeoffs
+     set status = 'Voided', void_entry_id = v_rev, void_reason = trim(p_reason),
+         voided_at = now(), voided_by = auth.uid()
+   where id = p_id;
+end;
+$$;
+
+-- ---------- 5. Security -----------------------------------------------
+alter table public.stock_writeoffs enable row level security;
+drop policy if exists writeoffs_read on public.stock_writeoffs;
+create policy writeoffs_read on public.stock_writeoffs for select using (public.is_active_user());
+revoke insert, update, delete on public.stock_writeoffs from anon, authenticated;
+
+revoke all on function public.record_stock_writeoff(date,uuid,numeric,text,text) from public, anon;
+revoke all on function public.void_stock_writeoff(uuid,text) from public, anon;
+grant execute on function public.record_stock_writeoff(date,uuid,numeric,text,text) to authenticated;
+grant execute on function public.void_stock_writeoff(uuid,text) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- 6. Checks (run one at a time) ------------------------------
+-- select code, name, type from public.accounts where code = '5120';
+-- select * from public.stock_writeoffs;

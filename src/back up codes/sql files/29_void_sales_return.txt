@@ -1,0 +1,175 @@
+-- =====================================================================
+-- Chinito Scento - VOID an approved return / exchange slip (RT).
+-- Run in the Supabase SQL Editor AFTER files 24, 25, 26, 27 and 28. Safe to re-run.
+-- BACKUP FIRST: this file adds one status value and four columns to sales_returns.
+--
+-- HOW IT WORKS (same idea as void_sale, void_bottling and void_stock_writeoff)
+--   * Owner only. A reason is required. Only APPROVED slips can be voided
+--     (a pending one is rejected instead).
+--   * The whole slip is voided at once: every item that shares the RT number on that invoice.
+--     (File 26 posts ONE journal entry per slip, so it cannot be undone item by item.)
+--   * Stock goes back exactly as approval moved it, at the same cost:
+--       - the replacement piece that went out returns to the same FIFO layers it came from
+--       - the piece that came back (exchange, or "returned, not damaged") is taken out of
+--         Finished Goods again, through the movement log (move_type 'void', ref_type 'sales_return_void')
+--   * The slip's journal entry is reversed (a reversing entry, nothing is deleted). This also puts back
+--     the receivable and removes the cash / bank refund that approval booked.
+--   * The slip stays in the list, marked Voided, with who voided it, when and why.
+--   * What the customer still owes on the invoice comes back by itself, because the invoice balance and
+--     the customer ledger only count APPROVED returns.
+--   * The pieces become returnable again on the invoice (pending and approved requests are what use them up).
+--
+-- IT REFUSES (nothing is changed) when
+--   * a piece swapped in on this slip was later returned on another slip (pending or approved).
+--     Void or reject that later slip first.
+--   * a piece that came back on this slip was already sold or given out again (its stock is no longer
+--     all on the shelf), so taking it out would push Finished Goods negative.
+--   * the stock record of the slip cannot be found (the same safety stop the other voids have).
+--
+-- NOT TOUCHED: approve_sales_return, reject_sales_return, void_sale, the customer ledger view, file 27.
+-- =====================================================================
+
+-- ---------- 1. Columns ------------------------------------------------------
+alter table public.sales_returns
+  add column if not exists void_reason   text,
+  add column if not exists void_entry_id uuid references public.journal_entries(id),
+  add column if not exists voided_at     timestamptz,
+  add column if not exists voided_by     uuid references auth.users(id);
+
+-- ---------- 2. Allow the new status ---------------------------------------
+do $$
+declare
+  c record;
+begin
+  for c in
+    select conname from pg_constraint
+     where conrelid = 'public.sales_returns'::regclass and contype = 'c'
+       and pg_get_constraintdef(oid) ilike '%Rejected%'
+  loop
+    execute format('alter table public.sales_returns drop constraint %I', c.conname);
+  end loop;
+end $$;
+
+alter table public.sales_returns
+  add constraint sales_returns_status_check check (status in ('Pending','Approved','Rejected','Voided'));
+
+-- ---------- 3. Void a whole slip (owner only) -------------------------------
+-- p_id: any item of the slip (the app passes the first one, like approve / reject).
+create or replace function public.void_sales_return(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  r0 public.sales_returns;
+  r  public.sales_returns;
+  s  public.sales;
+  v_ids uuid[];
+  v_label text;
+  v_later text;
+  v_je uuid;
+  v_rev uuid;
+  v_first_rev uuid;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can void a return or exchange.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+
+  select * into r0 from public.sales_returns where id = p_id;
+  if not found then raise exception 'Return not found.'; end if;
+  if r0.status = 'Voided' then raise exception 'This return was already voided.'; end if;
+  if r0.status <> 'Approved' then
+    raise exception 'Only an approved return can be voided. A pending request is rejected instead.';
+  end if;
+
+  v_label := 'RT-' || lpad(r0.return_no::text, 4, '0');
+
+  -- lock the invoice first (same order as requests and approvals), then the slip
+  select * into s from public.sales where id = r0.sale_id for update;
+  perform 1 from public.sales_returns
+   where return_no = r0.return_no and sale_id = r0.sale_id and status = 'Approved' for update;
+
+  select array_agg(id order by created_at, id) into v_ids
+    from public.sales_returns
+   where return_no = r0.return_no and sale_id = r0.sale_id and status = 'Approved';
+  if v_ids is null then raise exception 'This return was already voided.'; end if;
+
+  -- a swapped-in piece of this slip that was returned again on a later slip
+  select 'RT-' || lpad(c.return_no::text, 4, '0') into v_later
+    from public.sales_returns c
+   where c.source_return_id = any (v_ids) and c.status in ('Pending','Approved')
+   order by c.return_no limit 1;
+  if v_later is not null then
+    raise exception 'A piece swapped in on % was later returned on %. Void or reject % first.', v_label, v_later, v_later;
+  end if;
+
+  -- the pieces that came back must all still be on the shelf
+  perform 1 from public.stock_layers where source = 'sales_return' and source_id = any (v_ids) for update;
+  if exists (
+    select 1 from public.stock_layers
+     where source = 'sales_return' and source_id = any (v_ids) and qty_remaining <> qty_in
+  ) then
+    raise exception 'Some of the pieces that came back on % were already sold or given out again, so it cannot be voided.', v_label;
+  end if;
+
+  -- the stock records of every item must exist (otherwise we cannot undo them safely)
+  for r in select * from public.sales_returns where id = any (v_ids) order by created_at, id loop
+    if r.resolution = 'exchange' or (r.resolution = 'refund' and r.reason = 'returned') then
+      if not exists (select 1 from public.stock_layers where source = 'sales_return' and source_id = r.id) then
+        raise exception 'The stock record of a piece that came back on % was not found, so it cannot be voided safely.', v_label;
+      end if;
+    end if;
+    if r.resolution in ('exchange','replace') then
+      if not exists (select 1 from public.stock_movements
+                      where ref_type = 'sales_return' and ref_id = r.id and move_type = 'out') then
+        raise exception 'The stock taken by the replacement on % could not be found, so it cannot be voided safely.', v_label;
+      end if;
+    end if;
+  end loop;
+
+  -- 1) take the pieces that came back out of Finished Goods (log first, then the layers)
+  insert into public.stock_movements (layer_id, move_date, move_type, qty, cost, ref_type, ref_id)
+  select id, current_date, 'void', -qty_remaining, -cost_remaining, 'sales_return_void', source_id
+    from public.stock_layers
+   where source = 'sales_return' and source_id = any (v_ids) and qty_remaining > 0;
+
+  update public.stock_layers set qty_remaining = 0, cost_remaining = 0
+   where source = 'sales_return' and source_id = any (v_ids);
+
+  -- 2) give the replacement pieces back to the layers they came from
+  for r in select * from public.sales_returns where id = any (v_ids) and resolution in ('exchange','replace') order by created_at, id loop
+    perform public.restore_stock_for('sales_return', r.id, 'sales_return_void');
+  end loop;
+
+  -- 3) reverse the journal entry (one per slip; older slips may have one per item)
+  for v_je in
+    select distinct journal_entry_id from public.sales_returns
+     where id = any (v_ids) and journal_entry_id is not null
+  loop
+    v_rev := public.reverse_module_entry(v_je, p_reason, 'sales_return', r0.id);
+    v_first_rev := coalesce(v_first_rev, v_rev);
+  end loop;
+
+  -- 4) keep the slip, marked Voided
+  update public.sales_returns
+     set status = 'Voided', void_reason = trim(p_reason), void_entry_id = v_first_rev,
+         voided_at = now(), voided_by = auth.uid()
+   where id = any (v_ids);
+end;
+$$;
+
+-- ---------- 4. Permissions ----------------------------------------------------
+revoke all on function public.void_sales_return(uuid, text) from public, anon;
+grant execute on function public.void_sales_return(uuid, text) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- Checks (run one at a time) ------------------------------------------
+-- 1) The status rule now allows Voided (expect one row that lists 'Voided'):
+-- select conname, pg_get_constraintdef(oid) from pg_constraint
+--  where conrelid = 'public.sales_returns'::regclass and conname = 'sales_returns_status_check';
+-- 2) After voiding a TEST slip from the app (signed in as the owner):
+--    - its rows show status Voided with the reason:
+-- select return_no, status, resolution, size_id, qty, void_reason, voided_at from public.sales_returns
+--  order by created_at desc limit 10;
+--    - the movement log has matching 'void' rows:
+-- select move_type, ref_type, qty, cost from public.stock_movements
+--  where ref_type = 'sales_return_void' order by created_at desc limit 10;
+--    - open the Audit page: no new exceptions (stock vs ledger and layer vs log should still match).

@@ -1,0 +1,102 @@
+-- =====================================================================
+-- Chinito Scento - Phase 1b: entry history + reports
+-- Run once in the Supabase SQL Editor, after 03_phase1_patch.sql.
+--   1. journal_feed view: entries with who posted them, total, and reversal info
+--   2. Report functions (owner only): account ledger, opening balance, period movement
+-- =====================================================================
+
+-- ---------- 1. Journal feed (shows "posted by" to every active user) ---
+create or replace view public.journal_feed as
+select
+  e.id,
+  e.entry_no,
+  e.entry_date,
+  e.reference,
+  e.description,
+  e.source,
+  e.reverses_id,
+  e.created_at,
+  e.created_by,
+  nullif(trim(coalesce(p.first_name, '') || ' ' || coalesce(p.last_name, '')), '') as posted_by_name,
+  p.username as posted_by_username,
+  (select coalesce(sum(l.debit), 0) from public.journal_lines l where l.entry_id = e.id) as total,
+  (select r.entry_no from public.journal_entries r where r.reverses_id = e.id limit 1) as reversed_by_no
+from public.journal_entries e
+left join public.profiles p on p.id = e.created_by
+where public.is_active_user();
+
+revoke all on public.journal_feed from public, anon;
+grant select on public.journal_feed to authenticated;
+
+-- ---------- 2. Report functions (owner only) -------------------------
+
+-- Balance of one account before a date, in the account's normal direction
+create or replace function public.account_opening(p_code text, p_from date)
+returns numeric
+language sql stable security invoker set search_path = public as $$
+  select case
+    when not public.is_owner() or p_from is null then 0
+    else coalesce((
+      select sum(case when a.normal_side = 'debit' then l.debit - l.credit else l.credit - l.debit end)
+      from public.accounts a
+      join public.journal_lines l on l.account_id = a.id
+      join public.journal_entries e on e.id = l.entry_id
+      where a.code = p_code and e.entry_date < p_from
+    ), 0)
+  end;
+$$;
+
+-- General ledger of one account with a running balance
+create or replace function public.account_ledger(p_code text, p_from date, p_to date)
+returns table (
+  line_date date, entry_id uuid, entry_no bigint, reference text, description text,
+  memo text, debit numeric, credit numeric, balance numeric
+)
+language sql stable security invoker set search_path = public as $$
+  with acc as (
+    select id, normal_side from public.accounts where code = p_code
+  ),
+  moves as (
+    select e.entry_date as dt, e.id as eid, e.entry_no as eno, e.reference as ref,
+           e.description as descr, l.memo as m, l.debit as d, l.credit as c, l.line_no as ln,
+           case when a.normal_side = 'debit' then l.debit - l.credit else l.credit - l.debit end as delta
+    from acc a
+    join public.journal_lines l on l.account_id = a.id
+    join public.journal_entries e on e.id = l.entry_id
+    where (p_from is null or e.entry_date >= p_from)
+      and (p_to is null or e.entry_date <= p_to)
+      and public.is_owner()
+  )
+  select mv.dt, mv.eid, mv.eno, mv.ref, mv.descr, mv.m, mv.d, mv.c,
+         public.account_opening(p_code, p_from) + sum(mv.delta) over (order by mv.dt, mv.eno, mv.ln)
+  from moves mv
+  order by mv.dt, mv.eno, mv.ln;
+$$;
+
+-- Revenue and expense movement within a period (for the income statement)
+create or replace function public.period_movement(p_from date, p_to date)
+returns table (code text, name text, type text, debit numeric, credit numeric)
+language sql stable security invoker set search_path = public as $$
+  select a.code, a.name, a.type, coalesce(sum(l.debit), 0), coalesce(sum(l.credit), 0)
+  from public.accounts a
+  join public.journal_lines l on l.account_id = a.id
+  join public.journal_entries e on e.id = l.entry_id
+   and (p_from is null or e.entry_date >= p_from)
+   and (p_to is null or e.entry_date <= p_to)
+  where a.type in ('revenue', 'expense') and public.is_owner()
+  group by a.code, a.name, a.type
+  order by a.code;
+$$;
+
+revoke all on function public.account_opening(text, date) from public, anon;
+revoke all on function public.account_ledger(text, date, date) from public, anon;
+revoke all on function public.period_movement(date, date) from public, anon;
+grant execute on function public.account_opening(text, date) to authenticated;
+grant execute on function public.account_ledger(text, date, date) to authenticated;
+grant execute on function public.period_movement(date, date) to authenticated;
+
+-- Make the new objects visible to the app right away
+notify pgrst, 'reload schema';
+
+-- Checks (run one at a time):
+-- select count(*) from public.journal_feed;        -- shows entries (run from the app session; the SQL editor has no signed-in user)
