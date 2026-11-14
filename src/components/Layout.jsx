@@ -29,6 +29,9 @@ import {
 import logoImage from '../logo.png';
 import CommandPalette from './CommandPalette';
 
+// true: white page background around the dark cards. false: the original all-dark look.
+const WHITE_OUTER = true;
+
 const NAV_ITEMS = [
   { id: 'dashboard', name: 'Executive Dashboard', icon: LayoutDashboard },
   { id: 'customers', name: 'Customers', icon: Users },
@@ -69,7 +72,24 @@ function getGreeting(hour) {
 }
 
 export default function Layout({ children, activeTab, setActiveTab, onSignOut, user, badges = {} }) {
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false); // phone: the slide-over menu
+  // Computer screens: the menu can be hidden to give the page more room. The choice is remembered on this computer.
+  const [menuShown, setMenuShown] = useState(() => {
+    try {
+      return localStorage.getItem('cs-menu-shown') !== '0';
+    } catch {
+      return true;
+    }
+  });
+  const toggleMenu = () =>
+    setMenuShown((v) => {
+      try {
+        localStorage.setItem('cs-menu-shown', v ? '0' : '1');
+      } catch {
+        /* the choice just is not remembered */
+      }
+      return !v;
+    });
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [now, setNow] = useState(new Date());
 
@@ -145,7 +165,11 @@ export default function Layout({ children, activeTab, setActiveTab, onSignOut, u
   
 
   return (
-    <div className="min-h-screen flex bg-[#0e0d0c] text-[#ece6d8]">
+    <div
+      className={`min-h-screen flex ${WHITE_OUTER ? 'bg-white text-[#1c1916]' : 'bg-[#0e0d0c] text-[#ece6d8]'}`}
+      style={WHITE_OUTER ? { '--cs-outer': '#ffffff', '--cs-outer-line': '#e4dfd3', '--cs-outer-muted': '#6b6456' } : undefined}
+    >
+      {WHITE_OUTER && <style>{`.cs-card { color: #ece6d8; }`}</style>}
       {/* Mobile sidebar overlay */}
       {sidebarOpen && (
         <div
@@ -157,8 +181,9 @@ export default function Layout({ children, activeTab, setActiveTab, onSignOut, u
       {/* Sidebar */}
       <aside
         className={`
-          fixed inset-y-0 left-0 z-50 w-64 bg-[#0b0a09] border-r border-[#24201c] p-5 flex flex-col justify-between
-          transform transition-transform duration-300 ease-in-out lg:translate-x-0 lg:sticky lg:top-0 lg:h-screen
+          fixed inset-y-0 left-0 z-50 w-64 shrink-0 bg-[#0b0a09] text-[#ece6d8] border-r border-[#24201c] p-5 flex flex-col justify-between
+          transform transition-transform duration-300 ease-in-out
+          ${menuShown ? 'lg:translate-x-0 lg:sticky lg:top-0 lg:h-screen' : 'lg:hidden'}
           ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
         `}
       >
@@ -177,6 +202,14 @@ export default function Layout({ children, activeTab, setActiveTab, onSignOut, u
                 <p className="text-[9px] uppercase tracking-[0.2em] text-[#a8a090]">CSPMMS Enterprise</p>
               </div>
             </div>
+            <button
+              onClick={toggleMenu}
+              className="hidden lg:inline-flex w-9 h-9 items-center justify-center rounded-[10px] border border-[#2a2622] bg-[#161412] hover:border-[#d9b24c] cursor-pointer shrink-0"
+              aria-label="Hide menu"
+              title="Hide menu"
+            >
+              <Menu className="w-[18px] h-[18px] text-[#d9b24c]" aria-hidden="true" />
+            </button>
             <button
               onClick={() => setSidebarOpen(false)}
               className="lg:hidden text-[#a8a090] hover:text-white cursor-pointer"
@@ -266,7 +299,7 @@ export default function Layout({ children, activeTab, setActiveTab, onSignOut, u
 
       {/* Main column */}
       <div className="flex-1 flex flex-col min-w-0">
-        <header className="h-20 bg-[#0e0d0c]/85 backdrop-blur-xl border-b border-[#24201c] px-6 lg:px-10 flex items-center justify-between sticky top-0 z-30">
+        <header className={`h-20 backdrop-blur-xl border-b px-6 lg:px-10 flex items-center justify-between sticky top-0 z-30 ${WHITE_OUTER ? 'bg-white/90 border-[#e4dfd3]' : 'bg-[#0e0d0c]/85 border-[#24201c]'}`}>
           <div className="flex items-center gap-4">
             <button
               onClick={() => setSidebarOpen(true)}
@@ -275,11 +308,21 @@ export default function Layout({ children, activeTab, setActiveTab, onSignOut, u
             >
               <Menu className="w-5 h-5" />
             </button>
+            {!menuShown && (
+              <button
+                onClick={toggleMenu}
+                className="hidden lg:inline-flex w-10 h-10 items-center justify-center rounded-xl border border-[#2a2622] bg-[#161412] hover:border-[#d9b24c] cursor-pointer"
+                aria-label="Show menu"
+                title="Show menu"
+              >
+                <Menu className="w-[18px] h-[18px] text-[#d9b24c]" aria-hidden="true" />
+              </button>
+            )}
             <div>
               <h2 className="font-serif text-2xl font-semibold leading-tight">
                 {getGreeting(now.getHours())}, {name}
               </h2>
-              <p className="text-xs text-[#a8a090]">{dateLine}</p>
+              <p className={`text-xs ${WHITE_OUTER ? 'text-[#6b6456]' : 'text-[#a8a090]'}`}>{dateLine}</p>
             </div>
           </div>
 
@@ -314,7 +357,9 @@ export default function Layout({ children, activeTab, setActiveTab, onSignOut, u
         </main>
       </div>
 
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={paletteItems} />
+      <div className="text-[#ece6d8]">
+        <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={paletteItems} />
+      </div>
     </div>
   );
 }

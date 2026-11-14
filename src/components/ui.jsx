@@ -27,10 +27,10 @@ export function EmptyState({ icon: Icon, title, text, actionLabel, onAction }) {
 
 export function PageHeader({ title, subtitle, children }) {
   return (
-    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-5 mb-6 border-b border-[#2a2622] sm:sticky sm:top-20 sm:z-20 bg-[#0e0d0c] pt-4 -mt-4">
+    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-5 mb-6 border-b border-[var(--cs-outer-line,#2a2622)] sm:sticky sm:top-20 sm:z-20 bg-[var(--cs-outer,#0e0d0c)] pt-4 -mt-4">
       <div>
         <h2 className="font-serif text-3xl font-semibold">{title}</h2>
-        <p className="text-sm text-[#a8a090] mt-0.5">{subtitle}</p>
+        <p className="text-sm text-[var(--cs-outer-muted,#a8a090)] mt-0.5">{subtitle}</p>
       </div>
       {children}
     </div>

@@ -331,7 +331,7 @@ export default function App() {
                 <span>Chinito Scento Architecture</span>
               </div>
               <h1 className="font-serif text-4xl lg:text-5xl font-semibold leading-[1.1] mb-4">
-                Perfumery Manufacturing &amp; Management System
+                Perfume Manufacturing &amp; Management System
               </h1>
               <p className="text-[#a8a090] text-base leading-relaxed max-w-xl">
                 From oils to finished goods to sales. Follow every batch through maceration, bottling and packaging, and see at a glance what is ready to sell, what customers owe you and what you owe suppliers.
