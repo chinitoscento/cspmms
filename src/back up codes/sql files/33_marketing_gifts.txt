@@ -1,169 +1,36 @@
 -- =====================================================================
--- Chinito Scento - MARKETING GIFTS (finished perfumes given away, e.g. to influencers)
--- Run in the Supabase SQL Editor AFTER files 04 to 30. Safe to re-run.
+-- Chinito Scento - MARKETING GIFTS: several perfumes in one go.
+-- Run in the Supabase SQL Editor AFTER 31_marketing_gifts.sql. Safe to re-run.
 --
--- What a gift does when it is saved
---   * takes the pieces out of finished goods at their real cost, oldest stock first
---   * books Debit 6030 Marketing and Advertising / Credit 1330 Finished Goods
---   * never touches Sales, Accounts Receivable or any customer balance
---   * gets its own number (GF-00000001) and can be voided by the owner
---
--- It also teaches the Audit page what a gift document is, so the stock movement is not
--- reported as "has no document". No existing table is altered.
+-- Records one gift per perfume line (each gets its own GF number and can be voided on its own),
+-- all inside ONE transaction: if any line fails (for example not enough stock), nothing is saved.
+-- Nothing existing is changed.
 -- =====================================================================
 
--- ---------- 1. Table ----------
-create sequence if not exists public.gift_no_seq;
-
-create table if not exists public.marketing_gifts (
-  id               uuid primary key default gen_random_uuid(),
-  gift_no          bigint not null unique,
-  gift_date        date not null,
-  size_id          uuid not null references public.perfume_sizes(id),
-  qty              integer not null check (qty > 0),
-  cost             numeric(14,2) not null check (cost >= 0),
-  recipient        text not null,
-  notes            text,
-  status           text not null default 'Posted' check (status in ('Posted', 'Voided')),
-  journal_entry_id uuid references public.journal_entries(id),
-  void_entry_id    uuid references public.journal_entries(id),
-  void_reason      text,
-  voided_at        timestamptz,
-  voided_by        uuid references auth.users(id),
-  created_by       uuid references auth.users(id) default auth.uid(),
-  created_at       timestamptz not null default now()
-);
-
-alter table public.marketing_gifts enable row level security;
-drop policy if exists marketing_gifts_read on public.marketing_gifts;
-create policy marketing_gifts_read on public.marketing_gifts
-  for select to authenticated using (public.is_active_user());
-grant select on public.marketing_gifts to authenticated;
-
--- ---------- 2. Record a gift ----------
-create or replace function public.record_marketing_gift(
-  p_date date, p_size uuid, p_qty integer, p_recipient text, p_notes text
-) returns uuid
+create or replace function public.record_marketing_gifts(
+  p_date date, p_recipient text, p_notes text, p_lines jsonb
+) returns integer
 language plpgsql security definer set search_path = public as $$
 declare
-  v_id    uuid := gen_random_uuid();
-  v_no    bigint;
-  v_date  date := coalesce(p_date, current_date);
-  v_name  text;
-  v_cost  numeric(14,2);
-  v_label text;
-  v_je    uuid;
+  l jsonb;
+  n integer := 0;
 begin
   if not public.is_active_user() then raise exception 'Not allowed.'; end if;
-  if p_qty is null or p_qty <= 0 then raise exception 'Enter how many pieces were given.'; end if;
-  if coalesce(trim(p_recipient), '') = '' then raise exception 'Enter who received the gift.'; end if;
-
-  select pf.name || ' ' || trim_scale(ps.size_ml)::text || ' ml' into v_name
-    from public.perfume_sizes ps
-    join public.perfumes pf on pf.id = ps.perfume_id
-   where ps.id = p_size;
-  if v_name is null then raise exception 'Choose a perfume.'; end if;
-
-  v_no    := nextval('public.gift_no_seq');
-  v_label := 'GF-' || lpad(v_no::text, 8, '0');
-
-  -- raises "Not enough finished goods in stock" when the quantity is more than what is on hand
-  v_cost := public.stock_out('finished', p_size, p_qty, v_date, 'gift', v_id);
-  if v_cost <= 0 then
-    raise exception 'This perfume has no recorded cost, so there is nothing to book.';
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 1 then
+    raise exception 'Add at least one perfume.';
   end if;
 
-  v_je := public.post_module_entry(
-    v_date, v_label,
-    'Marketing gift ' || v_label || ' - ' || v_name || ' x ' || p_qty || ' to ' || trim(p_recipient),
-    jsonb_build_array(
-      jsonb_build_object('account_code', '6030', 'debit',  v_cost, 'memo', v_name || ' to ' || trim(p_recipient)),
-      jsonb_build_object('account_code', '1330', 'credit', v_cost, 'memo', 'Finished goods given ' || v_label)
-    ),
-    'gift', v_id);
+  for l in select * from jsonb_array_elements(p_lines) loop
+    perform public.record_marketing_gift(
+      p_date, (l->>'size_id')::uuid, (l->>'qty')::integer, p_recipient, p_notes);
+    n := n + 1;
+  end loop;
 
-  insert into public.marketing_gifts
-    (id, gift_no, gift_date, size_id, qty, cost, recipient, notes, journal_entry_id, created_by)
-  values
-    (v_id, v_no, v_date, p_size, p_qty, v_cost, trim(p_recipient),
-     nullif(trim(coalesce(p_notes, '')), ''), v_je, auth.uid());
-
-  return v_id;
+  return n;
 end;
 $$;
 
--- ---------- 3. Void a gift (owner only) ----------
-create or replace function public.void_marketing_gift(p_id uuid, p_reason text)
-returns void
-language plpgsql security definer set search_path = public as $$
-declare
-  r     public.marketing_gifts;
-  v_rev uuid;
-begin
-  if not public.is_owner() then raise exception 'Only the owner can void a gift.'; end if;
-  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
-
-  select * into r from public.marketing_gifts where id = p_id for update;
-  if not found then raise exception 'Gift not found.'; end if;
-  if r.status <> 'Posted' then raise exception 'This gift is already voided.'; end if;
-
-  if public.restore_stock_for('gift', p_id, 'gift_void') = 0 then
-    raise exception 'The stock taken by this gift could not be found, so it cannot be voided safely.';
-  end if;
-
-  v_rev := public.reverse_module_entry(r.journal_entry_id, p_reason, 'gift', p_id);
-
-  update public.marketing_gifts
-     set status = 'Voided', void_entry_id = v_rev, void_reason = trim(p_reason),
-         voided_at = now(), voided_by = auth.uid()
-   where id = p_id;
-end;
-$$;
-
-revoke all on function public.record_marketing_gift(date, uuid, integer, text, text) from public, anon;
-revoke all on function public.void_marketing_gift(uuid, text) from public, anon;
-grant execute on function public.record_marketing_gift(date, uuid, integer, text, text) to authenticated;
-grant execute on function public.void_marketing_gift(uuid, text) to authenticated;
-
--- ---------- 4. Audit page: recognise gifts as a document ----------
--- Same two helpers as in file 27, with one extra line for 'gift'. Nothing else changes.
-create or replace function public.audit_doc_label(p_ref_type text, p_ref_id uuid)
-returns text
-language sql stable security definer set search_path = public as $$
-  select case regexp_replace(coalesce(p_ref_type, ''), '_void$', '')
-    when 'purchase'     then (select 'PUR-' || lpad(x.purchase_no::text, 4, '0') from public.purchases x where x.id = p_ref_id)
-    when 'maceration'   then (select 'MB-'  || lpad(x.batch_no::text, 4, '0')    from public.maceration_batches x where x.id = p_ref_id)
-    when 'bottling'     then (select 'BT-'  || lpad(x.run_no::text, 4, '0')      from public.bottling_runs x where x.id = p_ref_id)
-    when 'packaging'    then (select 'PK-'  || lpad(x.run_no::text, 4, '0')      from public.packaging_runs x where x.id = p_ref_id)
-    when 'writeoff'     then (select 'WO-'  || lpad(x.writeoff_no::text, 8, '0') from public.stock_writeoffs x where x.id = p_ref_id)
-    when 'gift'         then (select 'GF-'  || lpad(x.gift_no::text, 8, '0')     from public.marketing_gifts x where x.id = p_ref_id)
-    when 'sale'         then (select coalesce('INV-' || lpad(x.invoice_no::text, 4, '0'), 'SL-' || lpad(x.sale_no::text, 8, '0')) from public.sales x where x.id = p_ref_id)
-    when 'sales_return' then (select 'RT-'  || lpad(x.return_no::text, 4, '0')   from public.sales_returns x where x.id = p_ref_id)
-    else null
-  end || case when p_ref_type like '%\_void' then ' (void)' else '' end;
-$$;
-
-create or replace function public.audit_doc_exists(p_ref_type text, p_ref_id uuid)
-returns boolean
-language sql stable security definer set search_path = public as $$
-  select case regexp_replace(coalesce(p_ref_type, ''), '_void$', '')
-    when 'purchase'     then exists (select 1 from public.purchases x where x.id = p_ref_id)
-    when 'maceration'   then exists (select 1 from public.maceration_batches x where x.id = p_ref_id)
-    when 'bottling'     then exists (select 1 from public.bottling_runs x where x.id = p_ref_id)
-    when 'packaging'    then exists (select 1 from public.packaging_runs x where x.id = p_ref_id)
-    when 'writeoff'     then exists (select 1 from public.stock_writeoffs x where x.id = p_ref_id)
-    when 'gift'         then exists (select 1 from public.marketing_gifts x where x.id = p_ref_id)
-    when 'sale'         then exists (select 1 from public.sales x where x.id = p_ref_id)
-    when 'sales_return' then exists (select 1 from public.sales_returns x where x.id = p_ref_id)
-    else false
-  end;
-$$;
-
-revoke all on function public.audit_doc_label(text, uuid) from public, anon, authenticated;
-revoke all on function public.audit_doc_exists(text, uuid) from public, anon, authenticated;
+revoke all on function public.record_marketing_gifts(date, text, text, jsonb) from public, anon;
+grant execute on function public.record_marketing_gifts(date, text, text, jsonb) to authenticated;
 
 notify pgrst, 'reload schema';
-
--- ---------- 5. Checks ----------
--- After running this file: open Marketing Gifts in the app, record a gift, then open Audit > Check again.
--- Expected: no exceptions, and the gift's journal entry shows Debit 6030 / Credit 1330.

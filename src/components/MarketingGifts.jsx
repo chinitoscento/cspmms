@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Gift, PlusCircle, Ban } from 'lucide-react';
+import { Gift, PlusCircle, Ban, Trash2 } from 'lucide-react';
 import { supabase } from '../supabaseClient';
 import { EmptyState, PageHeader, ErrorNote, Modal, ModalActions, nz, peso, fmtDate } from './ui';
 import { LateEntryNotice, isLateEntry, withLateNote } from './lateEntry';
@@ -9,6 +9,9 @@ const pad = (n) => String(n).padStart(8, '0');
 const pcs = (v) => Number(v || 0).toLocaleString('en-PH', { maximumFractionDigits: 0 });
 const sizeText = (ml) => Number(ml).toLocaleString('en-PH', { maximumFractionDigits: 2 });
 
+let keySeed = 0;
+const newItem = () => ({ key: `g${++keySeed}`, size: '', qty: '' });
+
 function Badge({ tone, children }) {
   const tones = {
     green: 'bg-[#3ecf8e]/10 text-[#3ecf8e] border-[#3ecf8e]/30',
@@ -17,7 +20,7 @@ function Badge({ tone, children }) {
   return <span className={`inline-flex px-2.5 py-0.5 rounded-full text-[10px] font-medium border ${tones[tone]}`}>{children}</span>;
 }
 
-const emptyForm = () => ({ date: todayLocal(), size: '', qty: '', recipient: '', notes: '' });
+const emptyForm = () => ({ date: todayLocal(), recipient: '', notes: '' });
 
 export default function MarketingGifts({ user, onChanged }) {
   const isOwner = user?.role === 'owner';
@@ -30,6 +33,7 @@ export default function MarketingGifts({ user, onChanged }) {
 
   const [open, setOpen] = useState(false);
   const [f, setF] = useState(emptyForm());
+  const [items, setItems] = useState([newItem()]);
   const [lateReason, setLateReason] = useState('');
   const [formError, setFormError] = useState('');
 
@@ -78,12 +82,28 @@ export default function MarketingGifts({ user, onChanged }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [stock, sizeById]
   );
-  const sel = options.find((o) => o.id === f.size);
-  const q = Number(f.qty) || 0;
-  const estCost = sel && sel.onHand > 0 ? (q * sel.value) / sel.onHand : 0;
+  const optionById = useMemo(() => Object.fromEntries(options.map((o) => [o.id, o])), [options]);
+
+  const updateItem = (key, patch) => setItems((prev) => prev.map((it) => (it.key === key ? { ...it, ...patch } : it)));
+  const removeItem = (key) => setItems((prev) => (prev.length > 1 ? prev.filter((it) => it.key !== key) : prev));
+
+  // Total pieces asked for per perfume (the same perfume may appear on two lines) and a cost estimate
+  const askedBySize = useMemo(() => {
+    const m = {};
+    items.forEach((it) => {
+      if (it.size) m[it.size] = (m[it.size] || 0) + (Number(it.qty) || 0);
+    });
+    return m;
+  }, [items]);
+  const estCost = items.reduce((s, it) => {
+    const o = optionById[it.size];
+    return o && o.onHand > 0 ? s + ((Number(it.qty) || 0) * o.value) / o.onHand : s;
+  }, 0);
+  const totalPieces = items.reduce((s, it) => s + (Number(it.qty) || 0), 0);
 
   const openForm = () => {
     setF(emptyForm());
+    setItems([newItem()]);
     setLateReason('');
     setFormError('');
     setOpen(true);
@@ -91,19 +111,23 @@ export default function MarketingGifts({ user, onChanged }) {
 
   const save = async (e) => {
     e.preventDefault();
-    if (!sel) return setFormError('Choose the perfume.');
-    if (!(q > 0) || !Number.isInteger(q)) return setFormError('Enter a whole number of pieces.');
-    if (q > sel.onHand) return setFormError(`Only ${pcs(sel.onHand)} pcs of ${sel.label} on hand.`);
+    for (let i = 0; i < items.length; i += 1) {
+      const it = items[i];
+      const o = optionById[it.size];
+      const q = Number(it.qty) || 0;
+      if (!o) return setFormError(`Item ${i + 1}: choose the perfume.`);
+      if (!(q > 0) || !Number.isInteger(q)) return setFormError(`Item ${i + 1}: enter a whole number of pieces.`);
+      if (askedBySize[it.size] > o.onHand) return setFormError(`Only ${pcs(o.onHand)} pcs of ${o.label} on hand.`);
+    }
     if (!f.recipient.trim()) return setFormError('Enter who received the gift.');
     if (isLateEntry(f.date) && !lateReason.trim()) return setFormError('This is a late entry. Enter why it was not recorded on the day.');
     setSaving(true);
     setFormError('');
-    const { error } = await supabase.rpc('record_marketing_gift', {
+    const { error } = await supabase.rpc('record_marketing_gifts', {
       p_date: f.date || todayLocal(),
-      p_size: f.size,
-      p_qty: q,
       p_recipient: f.recipient.trim(),
       p_notes: withLateNote(nz(f.notes), f.date, lateReason),
+      p_lines: items.map((it) => ({ size_id: it.size, qty: Number(it.qty) })),
     });
     setSaving(false);
     if (error) return setFormError(error.message);
@@ -202,33 +226,64 @@ export default function MarketingGifts({ user, onChanged }) {
 
       {/* ---------- Record gift ---------- */}
       {open && (
-        <Modal title="Record Marketing Gift" onClose={() => setOpen(false)}>
+        <Modal title="Record Marketing Gift" onClose={() => setOpen(false)} wide>
           <form onSubmit={save} className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="sm:col-span-2">
-                <label htmlFor="gf-size" className="cs-label">Perfume</label>
-                <select id="gf-size" value={f.size} onChange={(e) => setF((p) => ({ ...p, size: e.target.value }))} className="cs-input px-3 py-2.5">
-                  <option value="">Select perfume...</option>
-                  {options.map((o) => (
-                    <option key={o.id} value={o.id}>{o.label} - {pcs(o.onHand)} pcs on hand</option>
-                  ))}
-                </select>
+                <label htmlFor="gf-to" className="cs-label">Given to</label>
+                <input id="gf-to" value={f.recipient} onChange={(e) => setF((p) => ({ ...p, recipient: e.target.value }))} placeholder="e.g. Influencer name" autoFocus className="cs-input px-3 py-2.5" />
               </div>
               <div>
                 <label htmlFor="gf-date" className="cs-label">Date given</label>
                 <input id="gf-date" type="date" value={f.date} onChange={(e) => setF((p) => ({ ...p, date: e.target.value }))} required className="cs-input px-3 py-2.5" />
               </div>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div>
-                <label htmlFor="gf-qty" className="cs-label">Pieces</label>
-                <input id="gf-qty" type="number" min="1" step="1" value={f.qty} onChange={(e) => setF((p) => ({ ...p, qty: e.target.value }))} className="cs-input px-3 py-2.5 text-right" />
-              </div>
-              <div className="sm:col-span-2">
-                <label htmlFor="gf-to" className="cs-label">Given to</label>
-                <input id="gf-to" value={f.recipient} onChange={(e) => setF((p) => ({ ...p, recipient: e.target.value }))} placeholder="e.g. Influencer name" className="cs-input px-3 py-2.5" />
-              </div>
+
+            <div className="rounded-xl border border-[#2a2622] p-4 space-y-3">
+              <div className="text-xs uppercase tracking-wider text-[#a8a090]">Perfumes given</div>
+              {items.map((it, i) => (
+                <div key={it.key} className="grid grid-cols-12 gap-3 items-end">
+                  <div className="col-span-8 sm:col-span-8">
+                    <label htmlFor={`gf-size-${it.key}`} className={i === 0 ? 'cs-label' : 'sr-only'}>Perfume</label>
+                    <select
+                      id={`gf-size-${it.key}`}
+                      value={it.size}
+                      onChange={(e) => updateItem(it.key, { size: e.target.value })}
+                      className="cs-input px-3 py-2.5"
+                    >
+                      <option value="">Select perfume...</option>
+                      {options.map((o) => (
+                        <option key={o.id} value={o.id}>{o.label} - {pcs(o.onHand)} pcs on hand</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="col-span-3 sm:col-span-3">
+                    <label htmlFor={`gf-qty-${it.key}`} className={i === 0 ? 'cs-label' : 'sr-only'}>Pieces</label>
+                    <input
+                      id={`gf-qty-${it.key}`}
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={it.qty}
+                      onChange={(e) => updateItem(it.key, { qty: e.target.value })}
+                      className="cs-input px-3 py-2.5 text-right"
+                    />
+                  </div>
+                  <div className="col-span-1 pb-2.5 text-right">
+                    {items.length > 1 && (
+                      <button type="button" onClick={() => removeItem(it.key)} className="text-[#a8a090] hover:text-[#e5736d] cursor-pointer" aria-label={`Remove perfume ${i + 1}`}>
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+              <button type="button" onClick={() => setItems((prev) => [...prev, newItem()])} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs">
+                <PlusCircle className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Add another perfume</span>
+              </button>
             </div>
+
             <div>
               <label htmlFor="gf-notes" className="cs-label">Notes (optional)</label>
               <input id="gf-notes" value={f.notes} onChange={(e) => setF((p) => ({ ...p, notes: e.target.value }))} placeholder="e.g. Payment for a video review" className="cs-input px-3 py-2.5" />
@@ -236,15 +291,15 @@ export default function MarketingGifts({ user, onChanged }) {
 
             <LateEntryNotice date={f.date} reason={lateReason} onReason={setLateReason} id="gf-late" />
 
-            {sel && q > 0 && (
+            {totalPieces > 0 && (
               <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 text-sm flex items-center justify-between">
-                <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Estimated cost (average)</span>
-                <span className={`font-mono ${q > sel.onHand ? 'text-[#e5736d]' : ''}`}>{peso(estCost)}</span>
+                <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">{pcs(totalPieces)} pcs · estimated cost (average)</span>
+                <span className="font-mono">{peso(estCost)}</span>
               </div>
             )}
             <p className="text-[11px] text-[#a8a090]">
-              The pieces leave finished goods, oldest stock first, and the exact cost is charged to Marketing and Advertising.
-              Nothing is recorded as a sale, and no customer balance changes.
+              Each perfume gets its own gift number. The pieces leave finished goods, oldest stock first, and the exact cost is charged to
+              Marketing and Advertising. Nothing is recorded as a sale, and no customer balance changes. If one line cannot be saved, none are.
             </p>
             <ModalActions error={formError}>
               <button type="button" onClick={() => setOpen(false)} className="cs-btn cs-btn-ghost px-4 py-2.5">Cancel</button>
