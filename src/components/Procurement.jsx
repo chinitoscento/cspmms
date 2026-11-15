@@ -73,6 +73,154 @@ function Tabs({ tabs, value, onChange }) {
   );
 }
 
+// Everything owed to one creditor and everything paid to them: each purchase, its installment schedule,
+// and which payment settled which installment. Built only from rows the page already loads.
+function CreditorStatement({ stmt, purchases, installmentRows, payAllocs, instPays, payments, onClose }) {
+  const today = todayLocal();
+  const payById = new Map(payments.map((p) => [p.id, p]));
+  const byDateNo = (x, y) =>
+    x.pay.pay_date < y.pay.pay_date ? -1 : x.pay.pay_date > y.pay.pay_date ? 1 : x.pay.pay_no - y.pay.pay_no;
+
+  const rows = purchases
+    .filter((p) => p.creditor_id === stmt.creditor_id && p.payment_type === 'credit' && p.status === 'Posted')
+    .sort((a, b) => a.purchase_no - b.purchase_no)
+    .map((p) => {
+      const insts = installmentRows.filter((i) => i.purchase_id === p.id).sort((a, b) => a.seq - b.seq);
+      const interest = insts.length ? insts.reduce((s, i) => s + Number(i.interest_due), 0) : Number(p.interest_total || 0);
+      const total = Number(p.total) + interest;
+      const allocs = payAllocs
+        .filter((a) => a.purchase_id === p.id)
+        .map((a) => ({ a, pay: payById.get(a.payment_id) }))
+        .filter((x) => x.pay)
+        .sort(byDateNo);
+      const paid = allocs.filter((x) => x.pay.status === 'Posted').reduce((s, x) => s + Number(x.a.amount), 0);
+      return { p, insts, total, allocs, paid, balance: total - paid };
+    });
+
+  const sum = (k) => rows.reduce((s, r) => s + r[k], 0);
+  const paidBy = (installmentId) =>
+    instPays
+      .filter((ip) => ip.installment_id === installmentId)
+      .map((ip) => ({ ip, pay: payById.get(ip.payment_id) }))
+      .filter((x) => x.pay && x.pay.status === 'Posted')
+      .sort(byDateNo);
+
+  return (
+    <Modal title={`Statement: ${stmt.creditor_name}`} onClose={onClose} wide>
+      <div className="grid grid-cols-3 gap-3 mb-5">
+        {[
+          ['Billed (with interest)', sum('total'), ''],
+          ['Paid', sum('paid'), 'text-[#3ecf8e]'],
+          ['Balance', sum('balance'), sum('balance') > 0.005 ? 'text-[#e5736d]' : 'text-[#3ecf8e]'],
+        ].map(([label, v, tone]) => (
+          <div key={label} className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3">
+            <div className="text-[10px] uppercase tracking-wider text-[#a8a090]">{label}</div>
+            <div className={`font-mono text-lg mt-0.5 ${tone}`}>{peso(v)}</div>
+          </div>
+        ))}
+      </div>
+
+      {rows.length === 0 && <p className="text-sm text-[#a8a090]">No credit purchases are assigned to this creditor yet.</p>}
+
+      {rows.map(({ p, insts, total, allocs, paid, balance }) => (
+        <div key={p.id} className="mb-6">
+          <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+            <div>
+              <span className="font-mono text-[#d9b24c]">{purLabel(p.purchase_no)}</span>
+              {p.reference && <span className="text-xs text-[#a8a090]"> · {p.reference}</span>}
+              <span className="text-xs text-[#a8a090]"> · {fmtDate(p.purchase_date)}</span>
+            </div>
+            <div className="text-xs text-[#a8a090]">
+              Total {peso(total)} · Paid {peso(paid)} · Balance{' '}
+              <span className={balance > 0.005 ? 'text-[#e5736d]' : 'text-[#3ecf8e]'}>{peso(balance)}</span>
+            </div>
+          </div>
+
+          {insts.length > 0 && (
+            <div className="overflow-x-auto rounded-lg border border-[#2a2622] mb-3">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#1a1816] uppercase tracking-wider text-[#a8a090]">
+                  <tr>
+                    <th className="px-3 py-2 font-medium">#</th>
+                    <th className="px-3 py-2 font-medium">Due</th>
+                    <th className="px-3 py-2 font-medium text-right">Amount</th>
+                    <th className="px-3 py-2 font-medium text-right">Paid</th>
+                    <th className="px-3 py-2 font-medium text-right">Balance</th>
+                    <th className="px-3 py-2 font-medium">Status</th>
+                    <th className="px-3 py-2 font-medium">Paid by</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#24201c]">
+                  {insts.map((i) => {
+                    const amt = Number(i.principal_due) + Number(i.interest_due);
+                    const got = Number(i.paid_principal) + Number(i.paid_interest);
+                    const bal = Number(i.balance);
+                    let status = 'Upcoming';
+                    let tone = 'text-[#a8a090]';
+                    if (bal < 0.005) { status = 'Paid'; tone = 'text-[#3ecf8e]'; }
+                    else if (i.due_date < today) { status = got > 0 ? `Short ${peso(bal)}` : 'Overdue'; tone = 'text-[#e5736d]'; }
+                    else if (got > 0) status = 'Part paid';
+                    const by = paidBy(i.installment_id);
+                    return (
+                      <tr key={i.installment_id} className="bg-[#141210] align-top">
+                        <td className="px-3 py-2">{i.seq}</td>
+                        <td className="px-3 py-2 whitespace-nowrap">{fmtDate(i.due_date)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{peso(amt)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{peso(got)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{peso(bal)}</td>
+                        <td className={`px-3 py-2 whitespace-nowrap ${tone}`}>{status}</td>
+                        <td className="px-3 py-2 text-[#a8a090]">
+                          {by.length === 0 ? '-' : by.map((x) => (
+                            <div key={x.ip.payment_id} className="whitespace-nowrap">
+                              {payLabel(x.pay.pay_no)} · {peso(Number(x.ip.principal_amt) + Number(x.ip.interest_amt))}
+                            </div>
+                          ))}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div className="overflow-x-auto rounded-lg border border-[#2a2622]">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-[#1a1816] uppercase tracking-wider text-[#a8a090]">
+                <tr>
+                  <th className="px-3 py-2 font-medium">Payment</th>
+                  <th className="px-3 py-2 font-medium">Date paid</th>
+                  <th className="px-3 py-2 font-medium">Method</th>
+                  <th className="px-3 py-2 font-medium">Reference</th>
+                  <th className="px-3 py-2 font-medium text-right">Applied here</th>
+                  <th className="px-3 py-2 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#24201c]">
+                {allocs.length === 0 ? (
+                  <tr className="bg-[#141210]"><td colSpan={6} className="px-3 py-2 text-[#a8a090]">No payments recorded for this purchase.</td></tr>
+                ) : allocs.map(({ a, pay }) => (
+                  <tr key={a.payment_id} className={`bg-[#141210] ${pay.status === 'Posted' ? '' : 'opacity-50 line-through'}`}>
+                    <td className="px-3 py-2 font-mono text-[#d9b24c] whitespace-nowrap">{payLabel(pay.pay_no)}</td>
+                    <td className="px-3 py-2 whitespace-nowrap">{fmtDate(pay.pay_date)}</td>
+                    <td className="px-3 py-2">{PAYMENT_LABEL[pay.method] || pay.method}</td>
+                    <td className="px-3 py-2 text-[#a8a090]">{pay.reference || '-'}</td>
+                    <td className="px-3 py-2 text-right font-mono">{peso(a.amount)}</td>
+                    <td className="px-3 py-2">{pay.status}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ))}
+      <p className="text-[10px] text-[#a8a090]">
+        A payment that covers several purchases appears under each one, showing only the part applied there. Voided payments are struck through and not counted.
+      </p>
+    </Modal>
+  );
+}
+
 export default function Procurement({ user, onChanged }) {
   const isOwner = user?.role === 'owner';
   const [tab, setTab] = useState('purchases');
@@ -87,6 +235,9 @@ export default function Procurement({ user, onChanged }) {
   const [payables, setPayables] = useState([]);
   const [payments, setPayments] = useState([]);
   const [installmentRows, setInstallmentRows] = useState([]);
+  const [payAllocs, setPayAllocs] = useState([]); // which payment went to which purchase
+  const [instPays, setInstPays] = useState([]); // which payment went to which installment
+  const [stmt, setStmt] = useState(null); // creditor whose statement is open
   const [openId, setOpenId] = useState(null);
 
   // new purchase
@@ -164,6 +315,13 @@ export default function Procurement({ user, onChanged }) {
     setPayables(pay.data || []);
     setPayments(pmt.data || []);
     setInstallmentRows(ins.data || []);
+    // Payment trace data. Not fatal if it cannot be read: the statement then shows less.
+    const [alc, ipm] = await Promise.all([
+      supabase.from('payment_allocations').select('*'),
+      supabase.from('installment_payments').select('*'),
+    ]);
+    setPayAllocs(alc.data || []);
+    setInstPays(ipm.data || []);
     setLoading(false);
   }, []);
 
@@ -674,6 +832,13 @@ export default function Procurement({ user, onChanged }) {
                       <div className="font-serif text-lg">{g.creditor_name}</div>
                       <div className="text-xs text-[#a8a090]">{g.items.length} open purchase{g.items.length > 1 ? 's' : ''} · {peso(owed)} owed{overdue > 0 && <span className="text-[#e5736d]"> · {peso(overdue)} overdue</span>}</div>
                     </div>
+                    <div className="flex items-center gap-2">
+                    {g.creditor_id && (
+                      <button onClick={() => setStmt({ creditor_id: g.creditor_id, creditor_name: g.creditor_name })} className="cs-btn cs-btn-ghost px-4 py-2 text-xs">
+                        <Receipt className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>Statement</span>
+                      </button>
+                    )}
                     {isOwner && g.creditor_id && (
                       <button onClick={() => openPay(g)} className="cs-btn cs-btn-gold px-4 py-2 text-xs">
                         <Wallet className="w-3.5 h-3.5" aria-hidden="true" />
@@ -686,6 +851,7 @@ export default function Procurement({ user, onChanged }) {
                         <span>Assign creditor</span>
                       </button>
                     )}
+                    </div>
                   </div>
                   <table className="w-full text-left text-sm">
                     <thead className="text-xs uppercase tracking-wider text-[#a8a090]">
@@ -770,6 +936,7 @@ export default function Procurement({ user, onChanged }) {
                     <th className="px-4 py-3 font-medium">Creditor</th>
                     <th className="px-4 py-3 font-medium">Contact</th>
                     <th className="px-4 py-3 font-medium text-right">Owed now</th>
+                    <th className="px-4 py-3 font-medium"><span className="sr-only">Statement</span></th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#24201c]">
@@ -781,6 +948,9 @@ export default function Procurement({ user, onChanged }) {
                       </td>
                       <td className="px-4 py-3 text-xs text-[#a8a090]">{c.contact_number || '-'}</td>
                       <td className="px-4 py-3 text-right font-mono">{peso(owedByCreditor.get(c.id) || 0)}</td>
+                      <td className="px-4 py-3 text-right">
+                        <button onClick={() => setStmt({ creditor_id: c.id, creditor_name: c.name })} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs">Statement</button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -1166,6 +1336,18 @@ export default function Procurement({ user, onChanged }) {
       )}
 
       {/* ---------- Pay supplier ---------- */}
+      {stmt && (
+        <CreditorStatement
+          stmt={stmt}
+          purchases={purchases}
+          installmentRows={installmentRows}
+          payAllocs={payAllocs}
+          instPays={instPays}
+          payments={payments}
+          onClose={() => setStmt(null)}
+        />
+      )}
+
       {paying && (
         <Modal title={`Pay ${paying.creditor_name}`} onClose={() => setPaying(null)}>
           <form onSubmit={savePayment} className="space-y-4">
