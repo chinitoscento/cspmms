@@ -45,6 +45,17 @@ function Delta({ v }) {
   return <span className={up ? 'text-[#e5736d]' : 'text-[#3ecf8e]'}>{up ? '▲' : '▼'} {Math.abs(v * 100).toFixed(1)}%</span>;
 }
 
+// One part of a finished piece: its cost and the material it is. No name = the recipe does not use it.
+function Part({ cost, name }) {
+  if (!name) return <span className="text-[#a8a090]">-</span>;
+  return (
+    <>
+      {cost == null ? <span className="text-[#e5a93d]">no price</span> : money4(cost)}
+      <div className="text-[10px] text-[#a8a090] max-w-[11rem] ml-auto truncate" title={name}>{name}</div>
+    </>
+  );
+}
+
 const change = (latest, avg) => (latest != null && Number(avg) > 0 ? (Number(latest) - Number(avg)) / Number(avg) : null);
 
 export default function Costing({ user }) {
@@ -134,6 +145,11 @@ export default function Costing({ user }) {
         const bm = b.incomePct == null ? Infinity : b.incomePct;
         return am - bm || a.perfume_name.localeCompare(b.perfume_name);
       }),
+    [rows]
+  );
+
+  const buildUp = useMemo(
+    () => [...rows].sort((a, b) => a.perfume_name.localeCompare(b.perfume_name) || Number(a.size_ml) - Number(b.size_ml)),
     [rows]
   );
 
@@ -234,7 +250,7 @@ export default function Costing({ user }) {
                             </td>
                             <td
                               className="px-4 py-3 text-right font-mono text-[#e3bf5a]"
-                              title={r.today != null ? `Juice ${peso(r.parts.juice_cost)} + bottle and sticker ${peso(r.parts.bottle_cost)} + box or pouch and wrap ${peso(r.parts.pack_cost)}` : undefined}
+                              title={r.today != null ? 'See the parts in Cost build-up at today\u2019s prices' : undefined}
                             >
                               {peso(r.current)}
                               <div className="text-[10px] text-[#a8a090]">{r.today != null ? 'today\u2019s prices' : 'last run, not re-priced'}</div>
@@ -264,6 +280,73 @@ export default function Costing({ user }) {
                       <td className={`px-4 py-3 text-right font-mono ${totals.income < 0 ? 'text-[#e5736d]' : 'text-[#e3bf5a]'}`}>{peso(totals.income)}</td>
                     </tr>
                   </tfoot>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <section className="cs-card overflow-hidden">
+            <div className="px-5 pt-5 pb-3">
+              <h3 className="text-[15px] font-semibold">Cost build-up at today&rsquo;s prices</h3>
+              <p className="text-xs text-[#a8a090] mt-1">
+                Every part of one finished piece, from the juice to the last piece of packaging, at the latest price paid for it. The parts are the ones your
+                latest bottling and packaging run of that size used. A dash means that part is not used; &ldquo;no price&rdquo; means it has never been purchased.
+              </p>
+            </div>
+            {nowError ? (
+              <p className="px-5 pb-5 text-xs text-[#e5a93d]">Not available yet. Run 24_costing_current.sql in Supabase, then reload this page.</p>
+            ) : buildUp.length === 0 ? (
+              <EmptyState icon={Calculator} title="Nothing to show yet" text="Parts appear once perfume has been bottled and packaged." />
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-[#1a1816] text-xs uppercase tracking-wider text-[#a8a090] border-y border-[#2a2622]">
+                    <tr>
+                      <Th>Product</Th>
+                      <Th right>Juice</Th>
+                      <Th right>Bottle</Th>
+                      <Th right>Bottle sticker</Th>
+                      <Th right>Box / pouch</Th>
+                      <Th right>Box / pouch sticker</Th>
+                      <Th right>Wrap</Th>
+                      <Th right>Cost of one piece</Th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#24201c]">
+                    {buildUp.map((r) => {
+                      const c = r.parts;
+                      const hasRecipe = c && (c.bottle_name || c.pack_name);
+                      return (
+                        <tr key={r.size_id} className="hover:bg-[#1c1916] transition-colors">
+                          <td className="px-4 py-3">{label(r)}</td>
+                          {!hasRecipe ? (
+                            <td colSpan={7} className="px-4 py-3 text-xs text-[#a8a090]">Not bottled or packaged yet</td>
+                          ) : (
+                            <>
+                              <td className="px-4 py-3 text-right font-mono text-xs">
+                                {c.juice_cost == null ? (
+                                  <span className="text-[#e5a93d]">no batch yet</span>
+                                ) : (
+                                  <>
+                                    {peso(c.juice_cost)}
+                                    <div className="text-[10px] text-[#a8a090]">{qty(r.size_ml)} ml &times; {money4(c.juice_per_ml)}</div>
+                                  </>
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-right font-mono text-xs"><Part cost={c.bottle_cost} name={c.bottle_name} /></td>
+                              <td className="px-4 py-3 text-right font-mono text-xs"><Part cost={c.bottle_sticker_cost} name={c.bottle_sticker_name} /></td>
+                              <td className="px-4 py-3 text-right font-mono text-xs"><Part cost={c.pack_cost} name={c.pack_name} /></td>
+                              <td className="px-4 py-3 text-right font-mono text-xs"><Part cost={c.pack_sticker_cost} name={c.pack_sticker_name} /></td>
+                              <td className="px-4 py-3 text-right font-mono text-xs"><Part cost={c.wrap_cost} name={c.wrap_name} /></td>
+                              <td className="px-4 py-3 text-right font-mono text-[#e3bf5a]">
+                                {r.today != null ? peso(r.today) : <span className="text-xs text-[#a8a090]">incomplete</span>}
+                              </td>
+                            </>
+                          )}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
                 </table>
               </div>
             )}

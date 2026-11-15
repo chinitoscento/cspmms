@@ -1,11 +1,12 @@
 -- =====================================================================
 -- Chinito Scento - Costing at today's prices.
--- Run after 10_costing.sql. Safe to re-run. Owner only (staff get no rows).
+-- Run after 10_costing.sql. Safe to re-run (it replaces the earlier version of
+-- this function, which returned fewer columns). Owner only (staff get no rows).
 --
 -- One read-only function, nothing is posted and no stock moves:
 --   costing_current()   per perfume size: what ONE finished piece would cost
---                       if it were made today, with materials at their latest
---                       purchase price.
+--                       if it were made today, part by part, with materials at
+--                       their latest purchase price.
 --
 -- How the figure is worked out
 --   * Recipe     = what the most recent posted bottling run and the most recent
@@ -18,21 +19,29 @@
 --                  actually recovered. If one of its inputs has no purchase price,
 --                  the batch's own booked cost per ml is used instead.
 --   * Piece      = juice (size ml x juice per ml) + bottle + bottle sticker
---                  + box/pouch + its sticker + wrap. One of each per piece.
+--                  + box or pouch + its sticker + wrap. One of each per piece.
 --
--- complete = false means a figure could not be worked out (no bottling or packaging
+-- A part that the recipe does not use has an empty name and an empty cost.
+-- A part that is used but was never purchased has a name and an empty cost.
+-- complete = false means the total could not be worked out (no bottling or packaging
 -- run yet, no matured batch, or a material that was never purchased). current_cost
 -- is empty in that case, so the page falls back to the last run's cost.
 -- =====================================================================
 
-create or replace function public.costing_current()
+drop function if exists public.costing_current();
+
+create function public.costing_current()
 returns table (
   size_id uuid,
   juice_per_ml numeric,
-  juice_cost numeric,     -- juice in one piece
-  bottle_cost numeric,    -- bottle + bottle sticker
-  pack_cost numeric,      -- box or pouch + its sticker + wrap
-  current_cost numeric,   -- the sum, only when complete
+  juice_cost numeric,            -- juice in one piece (size ml x juice per ml)
+  bottle_name text,         bottle_cost numeric,
+  bottle_sticker_name text, bottle_sticker_cost numeric,
+  pack_type text,                -- 'Box' or 'Pouch'
+  pack_name text,           pack_cost numeric,
+  pack_sticker_name text,   pack_sticker_cost numeric,
+  wrap_name text,           wrap_cost numeric,
+  current_cost numeric,          -- the sum, only when complete
   complete boolean
 )
 language sql stable security definer set search_path = public as $$
@@ -78,9 +87,18 @@ language sql stable security definer set search_path = public as $$
     select ps.id as size_id,
            jc.per_ml,
            round(jc.per_ml * ps.size_ml, 2) as juice_cost,
-           round(coalesce(p_bot.unit_cost, 0) + coalesce(p_stk.unit_cost, 0), 2) as bottle_cost,
-           round(coalesce(p_box.unit_cost, 0) + coalesce(p_bxs.unit_cost, 0) + coalesce(p_wrp.unit_cost, 0)
-               + coalesce(p_pch.unit_cost, 0) + coalesce(p_pcs.unit_cost, 0), 2) as pack_cost,
+           (select m.name from public.materials m where m.id = bt.bottle_material_id)::text as bottle_name,
+           round(p_bot.unit_cost, 4) as bottle_cost,
+           (select m.name from public.materials m where m.id = bt.sticker_material_id)::text as bottle_sticker_name,
+           round(p_stk.unit_cost, 4) as bottle_sticker_cost,
+           (case when pk.pouch_material_id is not null then 'Pouch'
+                 when pk.box_material_id is not null then 'Box' end)::text as pack_type,
+           (select m.name from public.materials m where m.id = coalesce(pk.box_material_id, pk.pouch_material_id))::text as pack_name,
+           round(coalesce(p_box.unit_cost, p_pch.unit_cost), 4) as pack_cost,
+           (select m.name from public.materials m where m.id = coalesce(pk.box_sticker_material_id, pk.pouch_sticker_material_id))::text as pack_sticker_name,
+           round(coalesce(p_bxs.unit_cost, p_pcs.unit_cost), 4) as pack_sticker_cost,
+           (select m.name from public.materials m where m.id = pk.wrap_material_id)::text as wrap_name,
+           round(p_wrp.unit_cost, 4) as wrap_cost,
            (    jc.per_ml is not null
             and bt.size_id is not null and pk.size_id is not null
             and (bt.bottle_material_id is null or p_bot.material_id is not null)
@@ -108,9 +126,14 @@ language sql stable security definer set search_path = public as $$
   select c.size_id,
          c.per_ml::numeric,
          c.juice_cost::numeric,
-         c.bottle_cost::numeric,
-         c.pack_cost::numeric,
-         case when c.complete then (c.juice_cost + c.bottle_cost + c.pack_cost)::numeric end,
+         c.bottle_name,         c.bottle_cost::numeric,
+         c.bottle_sticker_name, c.bottle_sticker_cost::numeric,
+         c.pack_type,
+         c.pack_name,           c.pack_cost::numeric,
+         c.pack_sticker_name,   c.pack_sticker_cost::numeric,
+         c.wrap_name,           c.wrap_cost::numeric,
+         case when c.complete then round(c.juice_cost + coalesce(c.bottle_cost, 0) + coalesce(c.bottle_sticker_cost, 0)
+                                       + coalesce(c.pack_cost, 0) + coalesce(c.pack_sticker_cost, 0) + coalesce(c.wrap_cost, 0), 2)::numeric end,
          coalesce(c.complete, false)
   from calc c;
 $$;
