@@ -90,6 +90,7 @@ export default function App() {
   const [macBatches, setMacBatches] = useState([]); // batches still macerating
   const [pendingSales, setPendingSales] = useState({ sales: 0, returns: 0 }); // waiting for owner approval
   const [prefill, setPrefill] = useState(null); // hand-off between Maceration > Bottling > Packaging
+  const [stockView, setStockView] = useState('all'); // which button of Stock & Alerts opens first
 
   // ───── Auth: load profile, restore session, sign out, idle timeout ─────
   const loadProfile = async (authUserId) => {
@@ -240,6 +241,16 @@ export default function App() {
   }, [loadSummary, loadMac, loadPending]);
 
   // Go to a page, optionally handing it something to pre-fill. A plain tab click clears the hand-off.
+  // Leaving Stock & Alerts resets it, so opening it from the menu later starts on All Inventory
+  useEffect(() => {
+    if (activeTab !== 'stock') setStockView('all');
+  }, [activeTab]);
+  // Open Stock & Alerts on one button: 'buy' (raw materials to purchase), 'low' (finished goods low), 'finished', 'materials' or 'all'
+  const openStock = (view) => {
+    setStockView(view);
+    setActiveTab('stock');
+  };
+
   const navigate = (tab, params) => {
     setPrefill(params || null);
     setActiveTab(tab);
@@ -277,8 +288,8 @@ export default function App() {
       {/* ───────── Dashboard ───────── */}
       {activeTab === 'dashboard' && (
         <div className="space-y-6">
-          <InventoryAlertBanner scope="material" onOpen={() => setActiveTab('stock')} />
-          <InventoryAlertBanner scope="finished" onOpen={() => setActiveTab('stock')} />
+          <InventoryAlertBanner scope="material" onOpen={() => openStock('buy')} />
+          <InventoryAlertBanner scope="finished" onOpen={() => openStock('low')} />
           <FastMoverBanner onOpen={() => navigate(user.role === 'owner' ? 'analytics' : 'stock')} />
           {readyBatches.length > 0 && (
             <button
@@ -379,7 +390,7 @@ export default function App() {
               value={`${summary.fgUnits.toLocaleString('en-PH')} pcs`}
               caption="Packed and available for sale"
               icon={PackageCheck}
-              onClick={() => setActiveTab('stock')}
+              onClick={() => openStock('finished')}
             />
           </section>
 
@@ -462,7 +473,7 @@ export default function App() {
       {activeTab === 'suppliers' && <Suppliers />}
       {activeTab === 'inventory' && <PerfumeCollection />}
       {activeTab === 'materials' && <RawMaterials user={user} onNavigate={navigate} onChanged={refresh} />}
-      {activeTab === 'stock' && <Inventory user={user} onNavigate={navigate} onChanged={refresh} />}
+      {activeTab === 'stock' && <Inventory key={stockView} user={user} onNavigate={navigate} onChanged={refresh} initialView={stockView} />}
       {activeTab === 'procurement' && <Procurement user={user} onChanged={refresh} />}
       {activeTab === 'maceration' && <Maceration user={user} onChanged={refresh} onNavigate={navigate} />}
       {activeTab === 'bottling' && <Bottling user={user} onChanged={refresh} onNavigate={navigate} prefill={prefill} />}

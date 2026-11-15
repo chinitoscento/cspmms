@@ -141,13 +141,13 @@ export function InventoryAlertBanner({ onOpen, scope }) {
   );
 }
 
-export default function Inventory({ user, onNavigate, onChanged }) {
+export default function Inventory({ user, onNavigate, onChanged, initialView }) {
   const isOwner = user?.role === 'owner';
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
 
-  const [view, setView] = useState('all'); // which part of the inventory is shown, so nobody has to scroll
+  const [view, setView] = useState(['all', 'materials', 'buy', 'finished', 'low'].includes(initialView) ? initialView : 'all'); // which part of the inventory is shown, so nobody has to scroll
   const [formOpen, setFormOpen] = useState(false);
   const [f, setF] = useState({ name: '', category: 'oil', unit: 'ml', notes: '' });
   const [formError, setFormError] = useState('');
