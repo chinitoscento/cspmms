@@ -1,0 +1,125 @@
+-- =====================================================================
+-- Chinito Scento - Costing at today's prices.
+-- Run after 10_costing.sql. Safe to re-run. Owner only (staff get no rows).
+--
+-- One read-only function, nothing is posted and no stock moves:
+--   costing_current()   per perfume size: what ONE finished piece would cost
+--                       if it were made today, with materials at their latest
+--                       purchase price.
+--
+-- How the figure is worked out
+--   * Recipe     = what the most recent posted bottling run and the most recent
+--                  posted packaging run of that size used (bottle, bottle sticker,
+--                  box or pouch, its sticker, wrap). Voided runs are left out.
+--   * Price      = latest posted purchase price of each of those materials
+--                  (voided purchases are left out), same rule as costing_materials().
+--   * Juice      = the latest matured batch of the perfume, re-priced: its oils and
+--                  solvent at their latest purchase price, divided by the juice
+--                  actually recovered. If one of its inputs has no purchase price,
+--                  the batch's own booked cost per ml is used instead.
+--   * Piece      = juice (size ml x juice per ml) + bottle + bottle sticker
+--                  + box/pouch + its sticker + wrap. One of each per piece.
+--
+-- complete = false means a figure could not be worked out (no bottling or packaging
+-- run yet, no matured batch, or a material that was never purchased). current_cost
+-- is empty in that case, so the page falls back to the last run's cost.
+-- =====================================================================
+
+create or replace function public.costing_current()
+returns table (
+  size_id uuid,
+  juice_per_ml numeric,
+  juice_cost numeric,     -- juice in one piece
+  bottle_cost numeric,    -- bottle + bottle sticker
+  pack_cost numeric,      -- box or pouch + its sticker + wrap
+  current_cost numeric,   -- the sum, only when complete
+  complete boolean
+)
+language sql stable security definer set search_path = public as $$
+  with lp as (   -- latest posted purchase price of each material
+    select distinct on (pl.material_id) pl.material_id, pl.unit_cost
+    from public.purchase_lines pl
+    join public.purchases p on p.id = pl.purchase_id and p.status = 'Posted'
+    where pl.line_type = 'material' and pl.material_id is not null and pl.qty > 0
+    order by pl.material_id, p.purchase_date desc, p.created_at desc
+  ),
+  bt as (        -- recipe of the latest bottling run of each size
+    select distinct on (br.size_id) br.size_id, br.bottle_material_id, br.sticker_material_id
+    from public.bottling_runs br
+    where br.status = 'Posted'
+    order by br.size_id, br.run_date desc, br.run_no desc
+  ),
+  pk as (        -- recipe of the latest packaging run of each size
+    select distinct on (pr.size_id) pr.size_id, pr.box_material_id, pr.box_sticker_material_id,
+           pr.wrap_material_id, pr.pouch_material_id, pr.pouch_sticker_material_id
+    from public.packaging_runs pr
+    where pr.status = 'Posted'
+    order by pr.size_id, pr.run_date desc, pr.run_no desc
+  ),
+  mb as (        -- latest matured batch of each perfume
+    select distinct on (b.perfume_id) b.id, b.perfume_id, b.actual_yield_ml, b.juice_cost
+    from public.maceration_batches b
+    where b.status = 'Matured' and b.actual_yield_ml > 0 and b.juice_cost is not null
+    order by b.perfume_id, b.matured_date desc, b.batch_no desc
+  ),
+  jc as (        -- that batch re-priced: its inputs at latest purchase price / juice recovered
+    select mb.perfume_id,
+           round(coalesce(
+             (select sum(mi.qty * l.unit_cost) / mb.actual_yield_ml
+                from public.maceration_inputs mi
+                join lp l on l.material_id = mi.material_id
+               where mi.batch_id = mb.id
+              having count(*) = (select count(*) from public.maceration_inputs x where x.batch_id = mb.id)),
+             mb.juice_cost / mb.actual_yield_ml
+           ), 4) as per_ml
+    from mb
+  ),
+  calc as (
+    select ps.id as size_id,
+           jc.per_ml,
+           round(jc.per_ml * ps.size_ml, 2) as juice_cost,
+           round(coalesce(p_bot.unit_cost, 0) + coalesce(p_stk.unit_cost, 0), 2) as bottle_cost,
+           round(coalesce(p_box.unit_cost, 0) + coalesce(p_bxs.unit_cost, 0) + coalesce(p_wrp.unit_cost, 0)
+               + coalesce(p_pch.unit_cost, 0) + coalesce(p_pcs.unit_cost, 0), 2) as pack_cost,
+           (    jc.per_ml is not null
+            and bt.size_id is not null and pk.size_id is not null
+            and (bt.bottle_material_id is null or p_bot.material_id is not null)
+            and (bt.sticker_material_id is null or p_stk.material_id is not null)
+            and (pk.box_material_id is null or p_box.material_id is not null)
+            and (pk.box_sticker_material_id is null or p_bxs.material_id is not null)
+            and (pk.wrap_material_id is null or p_wrp.material_id is not null)
+            and (pk.pouch_material_id is null or p_pch.material_id is not null)
+            and (pk.pouch_sticker_material_id is null or p_pcs.material_id is not null)
+           ) as complete
+    from public.perfume_sizes ps
+    join public.perfumes pf on pf.id = ps.perfume_id
+    left join jc on jc.perfume_id = ps.perfume_id
+    left join bt on bt.size_id = ps.id
+    left join pk on pk.size_id = ps.id
+    left join lp p_bot on p_bot.material_id = bt.bottle_material_id
+    left join lp p_stk on p_stk.material_id = bt.sticker_material_id
+    left join lp p_box on p_box.material_id = pk.box_material_id
+    left join lp p_bxs on p_bxs.material_id = pk.box_sticker_material_id
+    left join lp p_wrp on p_wrp.material_id = pk.wrap_material_id
+    left join lp p_pch on p_pch.material_id = pk.pouch_material_id
+    left join lp p_pcs on p_pcs.material_id = pk.pouch_sticker_material_id
+    where ps.is_active and pf.status <> 'Discontinued' and public.is_owner()
+  )
+  select c.size_id,
+         c.per_ml::numeric,
+         c.juice_cost::numeric,
+         c.bottle_cost::numeric,
+         c.pack_cost::numeric,
+         case when c.complete then (c.juice_cost + c.bottle_cost + c.pack_cost)::numeric end,
+         coalesce(c.complete, false)
+  from calc c;
+$$;
+
+revoke all on function public.costing_current() from public, anon;
+grant execute on function public.costing_current() to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- Check (run signed in as owner, i.e. from the Costing page in the app) ----------
+-- select * from public.costing_current();
+-- Note: in the SQL editor you are not signed in as the owner, so this may return no rows there.

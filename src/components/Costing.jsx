@@ -10,7 +10,7 @@ const money4 = (v) =>
 const num = (v) => (v == null ? null : Number(v));
 const pct = (v) => `${(v * 100).toFixed(1)}%`;
 
-// A piece whose latest cost is this far above its own average is flagged as rising
+// A piece whose cost at today's prices is this far above what its last run cost is flagged as rising
 const RISE_ALERT = 0.05;
 
 const CATEGORY = {
@@ -55,15 +55,18 @@ export default function Costing({ user }) {
   const [materials, setMaterials] = useState([]);
   const [juice, setJuice] = useState([]);
   const [stock, setStock] = useState([]); // finished goods on hand, one row per perfume size
+  const [now, setNow] = useState([]); // cost of one piece at today's material prices
+  const [nowError, setNowError] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
-    const [p, m, j, inv] = await Promise.all([
+    const [p, m, j, inv, cur] = await Promise.all([
       supabase.rpc('costing_products'),
       supabase.rpc('costing_materials'),
       supabase.rpc('costing_juice'),
       supabase.from('inventory_status').select('*').eq('kind', 'finished'),
+      supabase.rpc('costing_current'),
     ]);
     const err = [p, m, j, inv].find((r) => r.error);
     if (err) setError(err.error.message);
@@ -71,6 +74,9 @@ export default function Costing({ user }) {
     setMaterials(m.data || []);
     setJuice(j.data || []);
     setStock(inv.data || []);
+    // Not fatal: without it the page falls back to the cost of the last run
+    setNow(cur.data || []);
+    setNowError(cur.error ? cur.error.message : '');
     setLoading(false);
   }, []);
 
@@ -80,11 +86,15 @@ export default function Costing({ user }) {
 
   const rows = useMemo(() => {
     const stockBySize = Object.fromEntries(stock.map((s) => [s.item_id, s]));
+    const nowBySize = Object.fromEntries(now.map((c) => [c.size_id, c]));
     return products
       .map((r) => {
         const high = num(r.high_unit_cost);
         const price = num(r.price);
-        const current = num(r.last_unit_cost); // what the most recent packaging run cost per piece
+        const lastRun = num(r.last_unit_cost); // what the most recent packaging run cost per piece
+        const parts = nowBySize[r.size_id];
+        const today = parts && parts.complete ? num(parts.current_cost) : null; // the same piece at today's material prices
+        const current = today ?? lastRun; // the cost income is judged on: today's prices when they can be worked out
         const avg = num(r.avg_unit_cost);
         const margin = high != null && price > 0 ? price - high : null;
         const income = current != null && price > 0 ? price - current : null;
@@ -102,7 +112,10 @@ export default function Costing({ user }) {
           marginPct: margin != null ? margin / price : null,
           income,
           incomePct: income != null ? income / price : null,
-          drift: change(current, avg),
+          lastRun,
+          today,
+          parts,
+          drift: change(today, lastRun),
           onHand,
           stockValue,
           sales,
@@ -110,7 +123,7 @@ export default function Costing({ user }) {
         };
       })
       .sort((a, b) => (b.high ?? -1) - (a.high ?? -1) || a.perfume_name.localeCompare(b.perfume_name));
-  }, [products, stock]);
+  }, [products, stock, now]);
 
   // Thinnest margin at the current cost first, so the perfumes needing attention are on top.
   // Sizes with no price or never packaged go last.
@@ -169,7 +182,7 @@ export default function Costing({ user }) {
               label="Needs attention"
               value={String(totals.attention)}
               tone={totals.attention > 0 ? 'text-[#e5a93d]' : ''}
-              sub={`${totals.below} selling below cost · ${totals.rising} with cost up ${Math.round(RISE_ALERT * 100)}%+`}
+              sub={`${totals.below} selling below cost · ${totals.rising} with today\u2019s cost up ${Math.round(RISE_ALERT * 100)}%+`}
             />
           </section>
 
@@ -177,10 +190,15 @@ export default function Costing({ user }) {
             <div className="px-5 pt-5 pb-3">
               <h3 className="text-[15px] font-semibold">Standing at current cost</h3>
               <p className="text-xs text-[#a8a090] mt-1">
-                Current cost is what the most recent packaging run cost per piece. Income per piece is the selling price less that cost. The change against
-                average shows whether cost is moving up or down. Thinnest margins are listed first. Costs follow oldest-stock-first, so they trail
-                purchase prices a little; the material tables below show the price movement itself.
+                Cost at today&rsquo;s prices is what one piece would cost to make now: the bottle, sticker, box and wrap your latest runs used, at their latest
+                purchase prices, plus the juice re-priced the same way. Income per piece is the selling price less that cost. The last run cost is what was
+                booked, which follows oldest-stock-first and trails purchase prices. Thinnest margins are listed first.
               </p>
+              {nowError && (
+                <p className="text-xs text-[#e5a93d] mt-2">
+                  Cost at today&rsquo;s prices is not available yet, so the last run cost is used. Run 24_costing_current.sql in Supabase. ({nowError})
+                </p>
+              )}
             </div>
             {standing.length === 0 ? (
               <EmptyState icon={Calculator} title="Nothing to assess yet" text="Costs appear once perfume has been packaged." />
@@ -191,8 +209,9 @@ export default function Costing({ user }) {
                     <tr>
                       <Th>Product</Th>
                       <Th right>Selling price</Th>
-                      <Th right>Current cost</Th>
-                      <Th right>Change vs average</Th>
+                      <Th right>Last run cost</Th>
+                      <Th right>Cost at today&rsquo;s prices</Th>
+                      <Th right>Today vs last run</Th>
                       <Th right>Income per piece</Th>
                       <Th right>Margin</Th>
                       <Th right>On hand</Th>
@@ -206,17 +225,21 @@ export default function Costing({ user }) {
                         <td className="px-4 py-3">{label(r)}</td>
                         <td className="px-4 py-3 text-right font-mono">{r.price > 0 ? peso(r.price) : <span className="text-[#a8a090]">no price</span>}</td>
                         {r.current == null ? (
-                          <td colSpan={7} className="px-4 py-3 text-xs text-[#a8a090]">Not packaged yet</td>
+                          <td colSpan={8} className="px-4 py-3 text-xs text-[#a8a090]">Not packaged yet</td>
                         ) : (
                           <>
-                            <td className="px-4 py-3 text-right font-mono text-[#e3bf5a]">
-                              {peso(r.current)}
+                            <td className="px-4 py-3 text-right font-mono text-xs">
+                              {r.lastRun != null ? peso(r.lastRun) : '-'}
                               <div className="text-[10px] text-[#a8a090]">{fmtDate(r.last_run_date)}</div>
                             </td>
-                            <td className="px-4 py-3 text-right font-mono text-xs">
-                              <Delta v={r.drift} />
-                              <div className="text-[10px] text-[#a8a090]">avg {peso(r.avg)}</div>
+                            <td
+                              className="px-4 py-3 text-right font-mono text-[#e3bf5a]"
+                              title={r.today != null ? `Juice ${peso(r.parts.juice_cost)} + bottle and sticker ${peso(r.parts.bottle_cost)} + box or pouch and wrap ${peso(r.parts.pack_cost)}` : undefined}
+                            >
+                              {peso(r.current)}
+                              <div className="text-[10px] text-[#a8a090]">{r.today != null ? 'today\u2019s prices' : 'last run, not re-priced'}</div>
                             </td>
+                            <td className="px-4 py-3 text-right font-mono text-xs"><Delta v={r.drift} /></td>
                             <td className={`px-4 py-3 text-right font-mono ${r.income != null && r.income < 0 ? 'text-[#e5736d]' : r.income != null ? 'text-[#3ecf8e]' : ''}`}>
                               {r.income == null ? '-' : peso(r.income)}
                             </td>
@@ -235,7 +258,7 @@ export default function Costing({ user }) {
                   </tbody>
                   <tfoot className="bg-[#14120f] border-t border-[#2a2622] text-xs">
                     <tr>
-                      <td className="px-4 py-3 uppercase tracking-wider text-[#a8a090]" colSpan={6}>Total</td>
+                      <td className="px-4 py-3 uppercase tracking-wider text-[#a8a090]" colSpan={7}>Total</td>
                       <td className="px-4 py-3 text-right font-mono">{qty(rows.reduce((s, r) => s + r.onHand, 0))} pcs</td>
                       <td className="px-4 py-3 text-right font-mono">{peso(totals.stockValue)}</td>
                       <td className={`px-4 py-3 text-right font-mono ${totals.income < 0 ? 'text-[#e5736d]' : 'text-[#e3bf5a]'}`}>{peso(totals.income)}</td>
