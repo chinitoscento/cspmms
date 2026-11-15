@@ -19,6 +19,11 @@ const stampText = (ts) =>
     : '';
 const hasCount = (l) => l.counted_qty !== null && l.counted_qty !== undefined;
 const isOff = (l) => hasCount(l) && Math.abs(Number(l.diff_qty)) > 0.0005;
+// stock groups come from the database as codes such as bottle_sticker; show them as words
+const groupText = (g) => {
+  const t = String(g || 'Other').replace(/_/g, ' ');
+  return t.charAt(0).toUpperCase() + t.slice(1);
+};
 const signed = (v) => `${Number(v) > 0 ? '+' : ''}${qtyText(v)}`;
 
 // items grouped by kind, in the order of kindLabel, each group sorted by item name
@@ -27,9 +32,23 @@ function groupLines(lines, kindLabel) {
     .map((k) => ({
       kind: k,
       label: kindLabel[k],
-      items: lines.filter((l) => l.stock_kind === k).sort((a, b) => String(a.item_name).localeCompare(String(b.item_name), undefined, { numeric: true })),
+      items: lines
+        .filter((l) => l.stock_kind === k)
+        .sort((a, b) =>
+          `${a.group_name || ''}|${a.item_name}`.localeCompare(`${b.group_name || ''}|${b.item_name}`, undefined, { numeric: true })
+        ),
     }))
     .filter((g) => g.items.length > 0);
+}
+
+// "Raw materials (Oil, Solvent); Finished goods (For Men)": what the report covers
+function coverText(lines, kindLabel) {
+  return groupLines(lines, kindLabel)
+    .map((g) => {
+      const groups = [...new Set(g.items.map((l) => l.group_name).filter(Boolean))].map(groupText);
+      return groups.length ? `${g.label} (${groups.join(', ')})` : g.label;
+    })
+    .join('; ');
 }
 
 export function reportFileName(report, ext) {
@@ -175,6 +194,7 @@ export function stockCountXlsx(report, lines, kindLabel) {
     [{ v: 'Count date', s: S.bold }, dateText(report.count_date)],
     [{ v: 'Counted by', s: S.bold }, report.counted_by || ''],
     [{ v: 'Saved', s: S.bold }, `${stampText(report.saved_at)} (system quantities are as of this time)`],
+    [{ v: 'Covers', s: S.bold }, coverText(lines, kindLabel)],
     [{ v: 'Notes', s: S.bold }, report.notes || ''],
     [{ v: 'Items counted', s: S.bold }, `${report.items_counted} of ${report.items_total}`],
     [{ v: 'Differences', s: S.bold }, report.items_off === 0 ? 'none' : Number(report.items_off)],
@@ -187,7 +207,7 @@ export function stockCountXlsx(report, lines, kindLabel) {
       rows.push([
         g.label,
         l.item_name,
-        l.group_name || '',
+        l.group_name ? groupText(l.group_name) : '',
         l.unit || '',
         Number(l.system_qty),
         hasCount(l) ? Number(l.counted_qty) : 'not counted',
@@ -323,6 +343,10 @@ export function stockCountPdf(report, lines, kindLabel) {
   y -= 13;
   text('F1', 9, MARGIN, y, `Saved: ${stampText(report.saved_at)} (system quantities are as of this time)`);
   y -= 13;
+  wrap(`Covers: ${coverText(lines, kindLabel)}`, 100).forEach((ln) => {
+    text('F1', 9, MARGIN, y, ln);
+    y -= 12;
+  });
   if (report.notes) {
     wrap(`Notes: ${report.notes}`, 100).forEach((ln) => {
       text('F1', 9, MARGIN, y, ln);
@@ -355,13 +379,23 @@ export function stockCountPdf(report, lines, kindLabel) {
     text('F2', 10, MARGIN, y, g.label);
     y -= 14;
     tableHead();
+    const hasGroups = new Set(g.items.map((l) => l.group_name || '')).size > 1;
+    let lastGroup = null;
     g.items.forEach((l) => {
       const nameLines = wrap(l.item_name, COLS[0]);
-      if (y - nameLines.length * 11 < 56) {
+      const grp = l.group_name || '';
+      let needsGroup = hasGroups && grp !== lastGroup;
+      if (y - (nameLines.length + (needsGroup ? 1 : 0)) * 11 < 56) {
         newPage();
         text('F2', 10, MARGIN, y, `${g.label} (continued)`);
         y -= 14;
         tableHead();
+        needsGroup = hasGroups;
+      }
+      if (needsGroup) {
+        text('F2', 8, MARGIN, y, groupText(grp));
+        y -= 11;
+        lastGroup = grp;
       }
       const has = hasCount(l);
       const color = !has ? GRAY : isOff(l) ? RED : BLACK;

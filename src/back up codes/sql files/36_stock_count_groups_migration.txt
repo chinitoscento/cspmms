@@ -1,0 +1,116 @@
+-- Stock count reports: save only the groups that were counted (for example just the oils)
+-- Run once in the Supabase SQL editor, after file 33. Safe to re-run.
+--
+-- Before: a report stored every item of each kind of stock that had at least one count,
+--         so counting only the oils made all the bottles and stickers show as "not counted".
+-- Now:    a report stores exactly the items the page sends (the groups that were counted),
+--         and also records which groups it covers.
+-- Nothing else changes: the system quantities are still read here at the moment of saving,
+-- the report still changes no stock or books, and saved reports still cannot be edited.
+
+begin;
+
+alter table public.stock_count_reports
+  add column if not exists groups text[] not null default '{}';
+
+create or replace function public.save_stock_count_report(
+  p_count_date date,
+  p_counted_by text,
+  p_notes text,
+  p_lines jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path to 'public'
+as $function$
+declare
+  v_today date := (now() at time zone 'Asia/Manila')::date;
+  v_id uuid := gen_random_uuid();
+  v_rows jsonb;
+  v_total int;
+  v_counted int;
+  v_off int;
+  v_val numeric(14,2);
+  v_kinds text[];
+  v_groups text[];
+begin
+  if not public.is_owner() then raise exception 'Only the owner can save a stock count report.'; end if;
+  if p_count_date is null then raise exception 'Choose the date of the count.'; end if;
+  if p_count_date > v_today then raise exception 'The count date cannot be in the future.'; end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 1 then
+    raise exception 'Enter at least one counted quantity.';
+  end if;
+  if exists (
+    select 1 from jsonb_array_elements(p_lines) e
+    where nullif(e->>'counted', '') is not null and (e->>'counted')::numeric < 0
+  ) then
+    raise exception 'A counted quantity cannot be negative.';
+  end if;
+
+  -- p_lines: [{ "stock_kind": "material", "item_id": "...", "counted": 12 or null }]
+  -- Every item sent is stored (blank = not counted). The system figures come from here, not the browser.
+  select coalesce(jsonb_agg(jsonb_build_object(
+           'stock_kind', s.stock_kind,
+           'item_id', s.item_id::text,
+           'item_name', s.item_name,
+           'group_name', s.group_name,
+           'unit', s.unit,
+           'system_qty', s.system_qty,
+           'system_value', s.system_value,
+           'counted', t.counted)), '[]'::jsonb)
+    into v_rows
+  from public.audit_count_sheet() s
+  join (
+    select e->>'item_id' as item_id, e->>'stock_kind' as stock_kind, nullif(e->>'counted', '')::numeric as counted
+    from jsonb_array_elements(p_lines) e
+  ) t on t.item_id = s.item_id::text and t.stock_kind = s.stock_kind;
+
+  select count(*),
+         count(*) filter (where (r->>'counted') is not null),
+         count(*) filter (where (r->>'counted') is not null
+                            and abs((r->>'counted')::numeric - (r->>'system_qty')::numeric) > 0.0005),
+         coalesce(sum(case
+           when (r->>'counted') is not null and (r->>'system_qty')::numeric > 0
+             then round(((r->>'counted')::numeric - (r->>'system_qty')::numeric)
+                        * (r->>'system_value')::numeric / (r->>'system_qty')::numeric, 2)
+           else 0 end), 0),
+         array(select distinct r2->>'stock_kind' from jsonb_array_elements(v_rows) r2 order by 1),
+         array(select distinct r3->>'group_name' from jsonb_array_elements(v_rows) r3
+               where r3->>'group_name' is not null order by 1)
+    into v_total, v_counted, v_off, v_val, v_kinds, v_groups
+  from jsonb_array_elements(v_rows) r;
+
+  if v_counted = 0 then raise exception 'Enter at least one counted quantity.'; end if;
+
+  insert into public.stock_count_reports
+    (id, count_date, counted_by, notes, kinds, groups, items_total, items_counted, items_off, value_diff)
+  values
+    (v_id, p_count_date, nullif(trim(coalesce(p_counted_by, '')), ''), nullif(trim(coalesce(p_notes, '')), ''),
+     v_kinds, v_groups, v_total, v_counted, v_off, v_val);
+
+  insert into public.stock_count_report_lines
+    (report_id, stock_kind, item_id, item_name, group_name, unit, system_qty, system_value,
+     counted_qty, diff_qty, value_diff)
+  select v_id, r->>'stock_kind', r->>'item_id', r->>'item_name', r->>'group_name', r->>'unit',
+         (r->>'system_qty')::numeric, round((r->>'system_value')::numeric, 2),
+         (r->>'counted')::numeric,
+         case when (r->>'counted') is not null
+              then (r->>'counted')::numeric - (r->>'system_qty')::numeric end,
+         case when (r->>'counted') is not null and (r->>'system_qty')::numeric > 0
+              then round(((r->>'counted')::numeric - (r->>'system_qty')::numeric)
+                         * (r->>'system_value')::numeric / (r->>'system_qty')::numeric, 2)
+              when (r->>'counted') is not null then 0 end
+  from jsonb_array_elements(v_rows) r;
+
+  return v_id;
+end;
+$function$;
+
+revoke all on function public.save_stock_count_report(date, text, text, jsonb) from public, anon;
+grant execute on function public.save_stock_count_report(date, text, text, jsonb) to authenticated;
+
+commit;
+
+-- make the API pick up the changed table and function
+notify pgrst, 'reload schema';

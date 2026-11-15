@@ -16,6 +16,11 @@ const fmtStamp = (ts) =>
   ts ? new Date(ts).toLocaleString('en-PH', { timeZone: 'Asia/Manila', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '-';
 
 const KIND_LABEL = { material: 'Raw materials', juice: 'Matured juice', bottled: 'Bottled, not packaged', finished: 'Finished goods' };
+// stock groups come from the database as codes such as bottle_sticker; show them as words
+const groupLabel = (g) => {
+  const t = String(g || 'Other').replace(/_/g, ' ');
+  return t.charAt(0).toUpperCase() + t.slice(1);
+};
 const MOVE_LABEL = { in: 'In', out: 'Out', void: 'Put back (void)' };
 
 // Plain-language help for each check: what it means and what to do
@@ -475,6 +480,8 @@ function StockCount({ counts, setCounts, onSaved }) {
   const [sheet, setSheet] = useState([]);
   const [saveOpen, setSaveOpen] = useState(false);
   const [kind, setKind] = useState('finished');
+  const [group, setGroup] = useState(''); // '' = every group of this kind
+  const [find, setFind] = useState('');
   const [err, setErr] = useState('');
   const [onlyDiff, setOnlyDiff] = useState(false);
 
@@ -498,9 +505,14 @@ function StockCount({ counts, setCounts, onSaved }) {
       const unitCost = Number(r.system_qty) > 0 ? Number(r.system_value) / Number(r.system_qty) : null;
       return { ...r, typed, has, diff, valueDiff: has && unitCost != null ? diff * unitCost : null };
     });
-  const shown = onlyDiff ? rows.filter((r) => r.has && Math.abs(r.diff) > 0.0005) : rows;
-  const counted = rows.filter((r) => r.has).length;
-  const off = rows.filter((r) => r.has && Math.abs(r.diff) > 0.0005);
+  // Count one group at a time (oil, solvent, bottle...): the chips show how far along each group is
+  const groupKeys = [...new Set(rows.map((r) => r.group_name || ''))].sort((a, b) => a.localeCompare(b));
+  const inGroup = group === '' ? rows : rows.filter((r) => (r.group_name || '') === group);
+  const needle = find.trim().toLowerCase();
+  const viewRows = needle ? inGroup.filter((r) => `${r.item_name} ${r.group_name || ''}`.toLowerCase().includes(needle)) : inGroup;
+  const shown = onlyDiff ? viewRows.filter((r) => r.has && Math.abs(r.diff) > 0.0005) : viewRows;
+  const counted = viewRows.filter((r) => r.has).length;
+  const off = viewRows.filter((r) => r.has && Math.abs(r.diff) > 0.0005);
   const decimals = kind === 'finished' || kind === 'bottled' ? 0 : 3;
   const totalTyped = Object.values(counts).filter((v) => v !== undefined && v !== '').length;
 
@@ -514,9 +526,13 @@ function StockCount({ counts, setCounts, onSaved }) {
       <div className="flex flex-wrap items-end gap-3">
         <div>
           <label htmlFor="c-kind" className="cs-label">Count</label>
-          <select id="c-kind" value={kind} onChange={(e) => setKind(e.target.value)} className="cs-input px-3 py-2">
+          <select id="c-kind" value={kind} onChange={(e) => { setKind(e.target.value); setGroup(''); setFind(''); }} className="cs-input px-3 py-2">
             {Object.entries(KIND_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
           </select>
+        </div>
+        <div className="relative w-56">
+          <Search className="w-4 h-4 text-[#a8a090] absolute left-3 top-1/2 -translate-y-1/2" aria-hidden="true" />
+          <input type="search" value={find} onChange={(e) => setFind(e.target.value)} placeholder="Find an item" className="cs-input pl-9 pr-3 py-2" aria-label="Find an item to count" />
         </div>
         <label className="flex items-center gap-2 text-sm pb-2 cursor-pointer">
           <input type="checkbox" checked={onlyDiff} onChange={(e) => setOnlyDiff(e.target.checked)} />
@@ -530,8 +546,33 @@ function StockCount({ counts, setCounts, onSaved }) {
         <button onClick={load} className="cs-btn cs-btn-ghost px-4 py-2.5"><RefreshCw className="w-4 h-4 text-[#d9b24c]" aria-hidden="true" /><span>Reload system quantities</span></button>
       </div>
 
+      {groupKeys.length > 1 && (
+        <div className="flex flex-wrap gap-2" role="group" aria-label="Group to count">
+          {['', ...groupKeys].map((g) => {
+            const items = g === '' ? rows : rows.filter((r) => (r.group_name || '') === g);
+            const done = items.filter((r) => r.has).length;
+            const active = group === g;
+            const complete = items.length > 0 && done === items.length;
+            return (
+              <button
+                key={g || 'all'}
+                type="button"
+                onClick={() => setGroup(g)}
+                aria-pressed={active}
+                className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm border cursor-pointer transition-colors ${
+                  active ? 'bg-[#1f1b12] text-[#e3bf5a] border-[#3a3014]' : 'text-[#a8a090] border-[#2a2622] hover:bg-[#1a1816] hover:text-[#ece6d8]'
+                }`}
+              >
+                <span>{g === '' ? 'All' : groupLabel(g)}</span>
+                <span className={`text-xs ${complete ? 'text-[#3ecf8e]' : 'text-[#7d766a]'}`}>{complete ? '\u2713 ' : ''}{done}/{items.length}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <p className="text-sm">
-        {counted} counted · {off.length === 0 ? <span className="text-[#3ecf8e]">no differences</span> : <span className="text-[#e5736d]">{off.length} difference(s)</span>}
+        {counted} of {viewRows.length} counted · {off.length === 0 ? <span className="text-[#3ecf8e]">no differences</span> : <span className="text-[#e5736d]">{off.length} difference(s)</span>}
       </p>
 
       <div className="cs-card overflow-hidden">
@@ -554,7 +595,7 @@ function StockCount({ counts, setCounts, onSaved }) {
                   const bad = r.has && Math.abs(r.diff) > 0.0005;
                   return (
                     <tr key={r.item_id} className={`bg-[#141210] ${bad ? 'bg-[#2a1a19]/40' : ''}`}>
-                      <td className="px-4 py-3">{r.item_name}<div className="text-[10px] text-[#7d766a]">{r.group_name}</div></td>
+                      <td className="px-4 py-3">{r.item_name}<div className="text-[10px] text-[#7d766a]">{groupLabel(r.group_name)}</div></td>
                       <td className="px-4 py-3 text-right tabular-nums">{qty(r.system_qty)} <span className="text-xs text-[#7d766a]">{r.unit}</span></td>
                       <td className="px-4 py-3 text-right">
                         <input
@@ -598,8 +639,11 @@ function SaveCountModal({ sheet, counts, onClose, onSaved }) {
   const [busy, setBusy] = useState(false);
 
   const isTyped = (id) => counts[id] !== undefined && counts[id] !== '';
-  const kinds = [...new Set(sheet.filter((r) => isTyped(r.item_id)).map((r) => r.stock_kind))];
-  const covered = sheet.filter((r) => kinds.includes(r.stock_kind));
+  // Only the groups you actually counted are saved (for example just the oils), so the groups you
+  // did not touch are not reported as "not counted".
+  const keyOf = (r) => `${r.stock_kind}|${r.group_name || ''}`;
+  const keys = [...new Set(sheet.filter((r) => isTyped(r.item_id)).map(keyOf))];
+  const covered = sheet.filter((r) => keys.includes(keyOf(r)));
   const counted = covered.filter((r) => isTyped(r.item_id));
   const off = counted.filter((r) => Math.abs(Number(counts[r.item_id]) - Number(r.system_qty)) > 0.0005);
 
@@ -635,12 +679,12 @@ function SaveCountModal({ sheet, counts, onClose, onSaved }) {
         </p>
 
         <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 text-sm space-y-1.5">
-          {kinds.map((k) => {
-            const all = covered.filter((r) => r.stock_kind === k);
+          {keys.map((key) => {
+            const all = covered.filter((r) => keyOf(r) === key);
             const done = all.filter((r) => isTyped(r.item_id));
             return (
-              <div key={k} className="flex justify-between gap-3">
-                <span>{KIND_LABEL[k]}</span>
+              <div key={key} className="flex justify-between gap-3">
+                <span>{KIND_LABEL[all[0].stock_kind]}{all[0].group_name ? ` \u00B7 ${groupLabel(all[0].group_name)}` : ''}</span>
                 <span className="text-[#a8a090]">{done.length} of {all.length} counted</span>
               </div>
             );
@@ -758,7 +802,10 @@ function SavedReports({ highlight }) {
                   <tr key={r.id} className={`hover:bg-[#1c1916] transition-colors ${open === r.id ? 'bg-[#1c1916]' : 'bg-[#141210]'}`}>
                     <td className="px-4 py-3 font-mono text-xs text-[#e3bf5a] whitespace-nowrap">{reportNo(r.report_no)}</td>
                     <td className="px-4 py-3 whitespace-nowrap">{fmtDate(r.count_date)}</td>
-                    <td className="px-4 py-3 text-xs text-[#a8a090]">{(r.kinds || []).map((k) => KIND_LABEL[k] || k).join(', ')}</td>
+                    <td className="px-4 py-3 text-xs text-[#a8a090]">
+                      <div>{(r.kinds || []).map((k) => KIND_LABEL[k] || k).join(', ')}</div>
+                      {(r.groups || []).length > 0 && <div className="text-[10px] text-[#7d766a]">{r.groups.map(groupLabel).join(', ')}</div>}
+                    </td>
                     <td className="px-4 py-3">{r.counted_by || '-'}</td>
                     <td className="px-4 py-3 text-right tabular-nums">{r.items_counted} of {r.items_total}</td>
                     <td className={`px-4 py-3 text-right tabular-nums ${r.items_off > 0 ? 'text-[#e5736d]' : 'text-[#3ecf8e]'}`}>{r.items_off === 0 ? 'none' : r.items_off}</td>
@@ -816,12 +863,12 @@ function SavedReports({ highlight }) {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#24201c]">
-                    {lines.filter((l) => l.stock_kind === k).map((l) => {
+                    {lines.filter((l) => l.stock_kind === k).sort((a, b) => `${a.group_name || ''}|${a.item_name}`.localeCompare(`${b.group_name || ''}|${b.item_name}`, undefined, { numeric: true })).map((l) => {
                       const has = l.counted_qty !== null && l.counted_qty !== undefined;
                       const bad = has && Math.abs(Number(l.diff_qty)) > 0.0005;
                       return (
                         <tr key={l.id} className={`bg-[#141210] ${bad ? 'bg-[#2a1a19]/40' : ''}`}>
-                          <td className="px-4 py-3">{l.item_name}<div className="text-[10px] text-[#7d766a]">{l.group_name}</div></td>
+                          <td className="px-4 py-3">{l.item_name}<div className="text-[10px] text-[#7d766a]">{groupLabel(l.group_name)}</div></td>
                           <td className="px-4 py-3 text-right tabular-nums">{qty(l.system_qty)} <span className="text-xs text-[#7d766a]">{l.unit}</span></td>
                           <td className="px-4 py-3 text-right tabular-nums">{has ? qty(l.counted_qty) : <span className="text-[#7d766a]">not counted</span>}</td>
                           <td className={`px-4 py-3 text-right tabular-nums font-medium ${!has ? 'text-[#7d766a]' : bad ? 'text-[#e5736d]' : 'text-[#3ecf8e]'}`}>
