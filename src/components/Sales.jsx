@@ -105,6 +105,7 @@ export default function Sales({ user, onChanged }) {
   const [sf, setSf] = useState({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', downRef: '', lines: [] });
   const [sQuery, setSQuery] = useState(''); // perfume search in the New Sale picker
   const [sError, setSError] = useState('');
+  const [sFilter, setSFilter] = useState({ customer: '', from: '', to: '' }); // filters for the sales table
 
   // new return / exchange
   const [rOpen, setROpen] = useState(false);
@@ -196,6 +197,17 @@ export default function Sales({ user, onChanged }) {
   const linePrice = (l) => (l.price === '' ? 0 : Number(l.price) || 0);
   const listOf = (l) => Number(sizeById[l.size]?.price || 0);
   const saleById = useMemo(() => Object.fromEntries(sales.map((s) => [s.id, s])), [sales]);
+  const shownSales = useMemo(
+    () =>
+      sales.filter((s) => {
+        if (sFilter.customer === 'walkin' && s.customer_id) return false;
+        if (sFilter.customer && sFilter.customer !== 'walkin' && s.customer_id !== sFilter.customer) return false;
+        if (sFilter.from && s.sale_date < sFilter.from) return false;
+        if (sFilter.to && s.sale_date > sFilter.to) return false;
+        return true;
+      }),
+    [sales, sFilter]
+  );
 
   // How a damaged refund is settled. Approved returns show what was booked.
   // On a credit sale the refund first lowers what the customer still owes on that invoice;
@@ -676,6 +688,38 @@ export default function Sales({ user, onChanged }) {
       {loading ? (
         <p className="text-sm text-[#a8a090]">Loading...</p>
       ) : tab === 'sales' ? (
+        <div>
+          {sales.length > 0 && (
+            <div className="flex flex-wrap items-end gap-3 mb-4">
+              <div className="w-full sm:w-64">
+                <label htmlFor="sf-customer" className="cs-label">Customer</label>
+                <select id="sf-customer" value={sFilter.customer} onChange={(e) => setSFilter((f) => ({ ...f, customer: e.target.value }))} className="cs-input px-3 py-2.5">
+                  <option value="">All customers</option>
+                  <option value="walkin">Walk-in (no customer)</option>
+                  {customers.map((c) => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="sf-from" className="cs-label">From</label>
+                <input id="sf-from" type="date" value={sFilter.from} max={sFilter.to || undefined} onChange={(e) => setSFilter((f) => ({ ...f, from: e.target.value }))} className="cs-input px-3 py-2.5" />
+              </div>
+              <div>
+                <label htmlFor="sf-to" className="cs-label">To</label>
+                <input id="sf-to" type="date" value={sFilter.to} min={sFilter.from || undefined} onChange={(e) => setSFilter((f) => ({ ...f, to: e.target.value }))} className="cs-input px-3 py-2.5" />
+              </div>
+              {(sFilter.customer || sFilter.from || sFilter.to) && (
+                <>
+                  <button type="button" onClick={() => setSFilter({ customer: '', from: '', to: '' })} className="cs-btn cs-btn-ghost px-4 py-2.5 text-sm">Clear</button>
+                  <p className="text-xs text-[#a8a090] pb-3 sm:ml-auto">
+                    {shownSales.length} of {sales.length} sales · Posted total {peso(shownSales.filter((s) => s.status === 'Posted').reduce((t, s) => t + Number(s.total), 0))}
+                    {sales.length >= 200 && ' · searching the latest 200 sales only'}
+                  </p>
+                </>
+              )}
+            </div>
+          )}
         <div className="cs-card overflow-hidden">
           {sales.length === 0 ? (
             <EmptyState icon={ShoppingBag} title="No sales yet" text="Cash and bank sales post at once. Credit sales wait for the owner's approval." actionLabel="New Sale" onAction={openSale} />
@@ -695,7 +739,12 @@ export default function Sales({ user, onChanged }) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#24201c]">
-                  {sales.map((s) => {
+                  {shownSales.length === 0 && (
+                    <tr className="bg-[#141210]">
+                      <td colSpan={8} className="px-4 py-8 text-center text-sm text-[#a8a090]">No sales match these filters.</td>
+                    </tr>
+                  )}
+                  {shownSales.map((s) => {
                     const left = s.due_date ? daysUntil(s.due_date) : null;
                     return (
                       <tr key={s.id} className={`bg-[#141210] hover:bg-[#1c1916] transition-colors ${s.status === 'Voided' || s.status === 'Rejected' ? 'opacity-60' : ''}`}>
@@ -769,6 +818,7 @@ export default function Sales({ user, onChanged }) {
               </table>
             </div>
           )}
+        </div>
         </div>
       ) : (
         <div className="cs-card overflow-hidden">
