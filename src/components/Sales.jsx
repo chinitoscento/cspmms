@@ -102,7 +102,7 @@ export default function Sales({ user, onChanged }) {
 
   // new sale
   const [sOpen, setSOpen] = useState(false);
-  const [sf, setSf] = useState({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', lines: [] });
+  const [sf, setSf] = useState({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', lines: [] });
   const [sQuery, setSQuery] = useState(''); // perfume search in the New Sale picker
   const [sError, setSError] = useState('');
 
@@ -243,7 +243,7 @@ export default function Sales({ user, onChanged }) {
 
   // ---------- new sale ----------
   const openSale = () => {
-    setSf({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', lines: [] });
+    setSf({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', lines: [] });
     setSQuery('');
     setSError('');
     setSOpen(true);
@@ -261,6 +261,11 @@ export default function Sales({ user, onChanged }) {
     .filter(([id, n]) => n > (onHand[id] || 0))
     .map(([id, n]) => `${sizeName(id)}: ${qty(n)} needed, ${qty(onHand[id] || 0)} in stock.`);
   const sIsCredit = sf.pay === 'credit';
+  // Partial upfront payment on a credit sale: what the customer hands over now, the rest stays on credit
+  const sDownRaw = Math.round((Number(sf.down) || 0) * 100) / 100;
+  const sDown = sIsCredit && sDownRaw > 0 && sDownRaw < sTotal ? sDownRaw : 0;
+  const sBalance = sTotal - sDown;
+  const sDownError = !sIsCredit || sDownRaw <= 0 ? '' : sDownRaw >= sTotal ? 'The upfront payment must be less than the total. For a full payment, use Cash or Bank transfer.' : '';
   const sBlocked = !sIsCredit && sShort.length > 0; // credit sales do not reserve stock, so they only warn
   const shownPerfumes = perfumeGroups.filter((g) => g.name.toLowerCase().includes(sQuery.trim().toLowerCase()));
 
@@ -292,6 +297,7 @@ export default function Sales({ user, onChanged }) {
     if (used.some((l) => !(linePrice(l) > 0))) return setSError('Every item needs a price above zero.');
     if (sIsCredit && !sf.customer) return setSError('Choose the customer for a credit sale.');
     if (sBlocked) return setSError(sShort[0]);
+    if (sDownError) return setSError(sDownError);
     if (isLateEntry(sf.date) && !sf.lateReason.trim()) return setSError('This is a late entry. Enter why it was not recorded on the day.');
     setSaving(true);
     setSError('');
@@ -301,6 +307,8 @@ export default function Sales({ user, onChanged }) {
       p_payment: sf.pay,
       p_notes: withLateNote(nz(sf.notes), sf.date, sf.lateReason),
       p_lines: used.map((l) => ({ size_id: l.size, qty: parseInt(l.qty, 10), unit_price: linePrice(l) })),
+      // only sent when there is an upfront payment, so sales without one work exactly as before
+      ...(sDown > 0 ? { p_down_payment: sDown, p_down_method: sf.downMethod } : {}),
     });
     setSaving(false);
     if (error) return setSError(error.message);
@@ -696,7 +704,10 @@ export default function Sales({ user, onChanged }) {
                         </td>
                         <td className="px-4 py-3">{s.customers?.name || <span className="text-[#a8a090]">Walk-in</span>}</td>
                         <td className="px-4 py-3 text-xs">{PAY[s.payment_type]}</td>
-                        <td className="px-4 py-3 text-right font-mono">{peso(s.total)}</td>
+                        <td className="px-4 py-3 text-right font-mono">
+                          {peso(s.total)}
+                          {s.payment_type === 'credit' && Number(s.down_payment) > 0 && <div className="text-[10px] text-[#3ecf8e]">{peso(s.down_payment)} paid upfront</div>}
+                        </td>
                         <td className="px-4 py-3 font-mono text-xs whitespace-nowrap">{s.invoice_no ? `INV-${pad(s.invoice_no)}` : <span className="text-[#a8a090]">-</span>}</td>
                         <td className="px-4 py-3 text-xs whitespace-nowrap">
                           {s.payment_type !== 'credit' ? (
@@ -999,6 +1010,18 @@ export default function Sales({ user, onChanged }) {
                   <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Total</span>
                   <span className="font-mono text-xl text-[#e3bf5a]">{peso(sTotal)}</span>
                 </div>
+                {sDown > 0 && (
+                  <>
+                    <div className="flex items-baseline justify-between gap-3">
+                      <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Paid upfront ({sf.downMethod === 'bank' ? 'bank' : 'cash'})</span>
+                      <span className="font-mono text-[#3ecf8e]">{peso(sDown)}</span>
+                    </div>
+                    <div className="flex items-baseline justify-between gap-3">
+                      <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Balance on credit</span>
+                      <span className="font-mono text-base text-[#e3bf5a]">{peso(sBalance)}</span>
+                    </div>
+                  </>
+                )}
                 {sDiscount > 0 && (
                   <div className="flex items-baseline justify-between gap-3">
                     <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Discount given</span>
@@ -1017,6 +1040,31 @@ export default function Sales({ user, onChanged }) {
                 )}
               </div>
 
+              {sIsCredit && (
+                <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-2.5 space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <label htmlFor="s-down" className="text-[10px] uppercase tracking-wider text-[#a8a090]">Paid upfront (optional)</label>
+                    <input id="s-down" type="number" min="0" step="0.01" placeholder="0.00" value={sf.down} onChange={(e) => setSf((p) => ({ ...p, down: e.target.value }))} className="cs-input w-32 px-2 py-1.5 text-xs text-right" />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {[25, 50].map((pct) => (
+                      <button key={pct} type="button" disabled={sTotal <= 0} onClick={() => setSf((p) => ({ ...p, down: (Math.round(sTotal * pct) / 100).toFixed(2) }))} className="rounded-md border border-[#2a2622] px-2 py-1 text-[11px] text-[#a8a090] hover:border-[#d9b24c] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">{pct}%</button>
+                    ))}
+                    {sDown > 0 && (
+                      <div className="ml-auto flex gap-1.5" role="radiogroup" aria-label="How the upfront payment was received">
+                        {[['cash', 'Cash'], ['bank', 'Bank']].map(([val, label]) => (
+                          <label key={val} className={`cursor-pointer rounded-md border px-2.5 py-1 text-[11px] transition-colors ${sf.downMethod === val ? 'border-[#d9b24c] bg-[#1f1b12] text-[#e3bf5a]' : 'border-[#2a2622] text-[#a8a090] hover:bg-[#1a1816]'}`}>
+                            <input type="radio" name="s-down-method" value={val} checked={sf.downMethod === val} onChange={() => setSf((p) => ({ ...p, downMethod: val }))} className="sr-only" />
+                            {label}
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {sDownError && <p className="text-[11px] text-[#e5736d]" role="alert">{sDownError}</p>}
+                </div>
+              )}
+
               <LateEntryNotice date={sf.date} reason={sf.lateReason} onReason={(v) => setSf((p) => ({ ...p, lateReason: v }))} id="s-late" />
 
               <div>
@@ -1026,7 +1074,7 @@ export default function Sales({ user, onChanged }) {
 
               <p className="text-[11px] leading-snug text-[#a8a090]">
                 {sIsCredit
-                  ? 'Goes to the owner for approval. The invoice, stock movement and receivable are created only then. The due date counts from the sale date using the customer\u2019s credit terms.'
+                  ? `Goes to the owner for approval. The invoice, stock movement and receivable are created only then${sDown > 0 ? `, and the ${peso(sDown)} upfront payment is recorded as received on the sale date. Only ${peso(sBalance)} stays as a receivable` : ''}. The due date counts from the sale date using the customer\u2019s credit terms.`
                   : 'The invoice is issued now and the stock leaves Finished Goods. Prices start at the collection price; change a line\u2019s price for a discount.'}
               </p>
 
@@ -1332,7 +1380,9 @@ export default function Sales({ user, onChanged }) {
                 const s = deciding.row;
                 const cc = credit[s.customer_id];
                 const bal = arBal[s.customer_id] || 0;
-                const over = cc && Number(cc.credit_limit) > 0 && bal + Number(s.total) > Number(cc.credit_limit);
+                const down = Number(s.down_payment || 0);
+                const net = Number(s.total) - down; // only the part not paid upfront becomes a receivable
+                const over = cc && Number(cc.credit_limit) > 0 && bal + net > Number(cc.credit_limit);
                 // Counted from the sale date (not today), the same way the database sets it when approved.
                 const due = cc && s.sale_date ? (() => { const d = new Date(`${s.sale_date}T00:00:00`); d.setDate(d.getDate() + Number(cc.credit_days || 0)); return d.toLocaleDateString('en-CA'); })() : null;
                 return (
@@ -1341,7 +1391,9 @@ export default function Sales({ user, onChanged }) {
                       <Stat label="Customer" value={s.customers?.name} />
                       <Stat label="Sale total" value={peso(s.total)} tone="text-[#e3bf5a]" />
                       <Stat label="Owes now" value={peso(bal)} />
-                      <Stat label="After approval" value={peso(bal + Number(s.total))} tone={over ? 'text-[#e5736d]' : ''} />
+                      {down > 0 && <Stat label={`Paid upfront (${s.down_method === 'bank' ? 'bank' : 'cash'})`} value={peso(down)} tone="text-[#3ecf8e]" />}
+                      {down > 0 && <Stat label="Balance on credit" value={peso(net)} tone="text-[#e3bf5a]" />}
+                      <Stat label="After approval" value={peso(bal + net)} tone={over ? 'text-[#e5736d]' : ''} />
                       <Stat label="Credit limit" value={cc && Number(cc.credit_limit) > 0 ? peso(cc.credit_limit) : 'No limit set'} />
                       <Stat label={cc ? `Due date (${cc.credit_days} days from sale)` : 'Due date if approved'} value={due ? fmtDate(due) : '-'} />
                     </div>
@@ -1357,7 +1409,7 @@ export default function Sales({ user, onChanged }) {
                       })}
                     </ul>
                     {over && <p className="text-xs text-[#e5736d]">This would go over the customer&rsquo;s credit limit, so approval will be refused. Raise the limit in Customers first, or reject the sale.</p>}
-                    <p className="text-xs text-[#a8a090]">Approving takes the stock out, books the receivable and issues the invoice.</p>
+                    <p className="text-xs text-[#a8a090]">Approving takes the stock out, books the receivable and issues the invoice.{down > 0 ? ` The ${peso(down)} paid upfront is recorded as received by ${s.down_method === 'bank' ? 'bank transfer' : 'cash'} on ${fmtDate(s.sale_date)}, so the receivable is ${peso(net)}.` : ''}</p>
                   </>
                 );
               })()
