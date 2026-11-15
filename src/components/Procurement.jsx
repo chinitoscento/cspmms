@@ -840,7 +840,9 @@ export default function Procurement({ user, onChanged }) {
       {/* ---------- Record purchase ---------- */}
       {formOpen && (
         <Modal title="Record Purchase" onClose={() => setFormOpen(false)} dirty={lines.length > 0} xl>
-          <form onSubmit={savePurchase} className="space-y-4">
+          <form onSubmit={savePurchase} className="space-y-4 lg:flex lg:flex-col lg:space-y-0">
+            {/* Everything above the buttons scrolls as one block; the Post / Cancel bar stays pinned below it */}
+            <div className="space-y-4 lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pb-4">
             {/* Header fields: one compact band across the top */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-3">
               <div className="lg:col-span-2">
@@ -1149,6 +1151,8 @@ export default function Procurement({ user, onChanged }) {
                   <span className="font-mono text-lg">{peso((total + (plan && plan.valid ? plan.interestCents : oneInterestCents)) / 100)}</span>
                 </div>
               </div>
+            </div>
+
             </div>
 
             <ModalActions error={formError}>
