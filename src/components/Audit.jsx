@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { ClipboardCheck, RefreshCw, CheckCircle2, AlertTriangle, Search, ListChecks, ScrollText, FileSearch, Boxes, Archive, Download } from 'lucide-react';
+import { ClipboardCheck, RefreshCw, CheckCircle2, AlertTriangle, Search, ListChecks, ScrollText, FileSearch, Boxes, Archive, FileText, FileSpreadsheet } from 'lucide-react';
 import { supabase } from '../supabaseClient';
 import { EmptyState, PageHeader, ErrorNote, Modal, ModalActions, peso, fmtDate } from './ui';
+import { stockCountPdf, stockCountXlsx, reportFileName, saveBytes } from './stockCountExport';
 
 // ---------------------------------------------------------------------------
 // Audit (owner only). The checks are READ ONLY: they never save, edit or delete any record.
@@ -717,22 +718,10 @@ function SavedReports({ highlight }) {
   const current = (reports || []).find((r) => r.id === open);
   const kindsInOpen = [...new Set(lines.map((l) => l.stock_kind))];
 
-  const download = (r) => {
-    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const head = ['Report', 'Count date', 'Kind', 'Item', 'Group', 'Unit', 'System qty', 'Counted qty', 'Difference', 'Approx. value difference'];
-    const body = lines.map((l) => [
-      reportNo(r.report_no), r.count_date, KIND_LABEL[l.stock_kind] || l.stock_kind, l.item_name, l.group_name, l.unit,
-      l.system_qty, l.counted_qty ?? 'not counted', l.diff_qty ?? '', l.value_diff ?? '',
-    ]);
-    const csv = [head, ...body].map((row) => row.map(esc).join(',')).join('\r\n');
-    const url = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' }));
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `stock-count-${reportNo(r.report_no)}-${r.count_date}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+  // PDF and Excel copies of the open report
+  const download = (r, type) => {
+    if (type === 'pdf') saveBytes(stockCountPdf(r, lines, KIND_LABEL), reportFileName(r, 'pdf'), 'application/pdf');
+    else saveBytes(stockCountXlsx(r, lines, KIND_LABEL), reportFileName(r, 'xlsx'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   };
 
   return (
@@ -800,10 +789,16 @@ function SavedReports({ highlight }) {
               </p>
               {current.notes && <p className="text-sm mt-2 max-w-3xl">{current.notes}</p>}
             </div>
-            <button onClick={() => download(current)} disabled={lines.length === 0} className="cs-btn cs-btn-ghost px-4 py-2.5">
-              <Download className="w-4 h-4 text-[#d9b24c]" aria-hidden="true" />
-              <span>Download CSV</span>
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={() => download(current, 'pdf')} disabled={lines.length === 0} className="cs-btn cs-btn-ghost px-4 py-2.5">
+                <FileText className="w-4 h-4 text-[#d9b24c]" aria-hidden="true" />
+                <span>Download PDF</span>
+              </button>
+              <button onClick={() => download(current, 'xlsx')} disabled={lines.length === 0} className="cs-btn cs-btn-ghost px-4 py-2.5">
+                <FileSpreadsheet className="w-4 h-4 text-[#d9b24c]" aria-hidden="true" />
+                <span>Download Excel</span>
+              </button>
+            </div>
           </div>
 
           {kindsInOpen.map((k) => (
