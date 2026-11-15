@@ -1105,6 +1105,27 @@ export default function Sales({ user, onChanged }) {
           <form onSubmit={saveReturn} className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,28rem)] gap-6 lg:flex-1 lg:min-h-0">
             {/* ---------- LEFT: encode the transaction ---------- */}
             <div className="flex flex-col gap-4 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
+              <div className="flex flex-wrap items-end gap-x-4 gap-y-1">
+                <div className="w-44">
+                  <label htmlFor="r-date" className="cs-label">Transaction date</label>
+                  <input
+                    id="r-date"
+                    type="date"
+                    value={rf.date}
+                    min={rSale?.invoice_date || undefined}
+                    max={todayLocal()}
+                    onChange={(e) => setRf((p) => ({ ...p, date: e.target.value }))}
+                    required
+                    className="cs-input px-3 py-2"
+                  />
+                </div>
+                {rf.date && rf.date !== todayLocal() && (
+                  <p className="text-[11px] text-[#e5a93d] pb-2.5">
+                    {daysUntil(rf.date) < 0 ? `Dated ${-daysUntil(rf.date)} day${daysUntil(rf.date) === -1 ? '' : 's'} ago, not today.` : 'Dated in the future.'} Is this the day it really happened?
+                  </p>
+                )}
+              </div>
+
               <div>
                 <label htmlFor="r-find" className="cs-label">Original invoice</label>
                 {rSale ? (
@@ -1265,15 +1286,9 @@ export default function Sales({ user, onChanged }) {
                 )}
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div className="sm:col-span-2">
-                  <label htmlFor="r-notes" className="cs-label">Notes (optional)</label>
-                  <input id="r-notes" value={rf.notes} onChange={(e) => setRf((p) => ({ ...p, notes: e.target.value }))} className="cs-input px-3 py-2.5" />
-                </div>
-                <div>
-                  <label htmlFor="r-date" className="cs-label">Date</label>
-                  <input id="r-date" type="date" value={rf.date} onChange={(e) => setRf((p) => ({ ...p, date: e.target.value }))} required className="cs-input px-3 py-2.5" />
-                </div>
+              <div>
+                <label htmlFor="r-notes" className="cs-label">Notes (optional)</label>
+                <input id="r-notes" value={rf.notes} onChange={(e) => setRf((p) => ({ ...p, notes: e.target.value }))} className="cs-input px-3 py-2.5" />
               </div>
             </div>
 
