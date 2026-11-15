@@ -277,7 +277,8 @@ export default function App() {
       {/* ───────── Dashboard ───────── */}
       {activeTab === 'dashboard' && (
         <div className="space-y-6">
-          <InventoryAlertBanner onOpen={() => setActiveTab('stock')} />
+          <InventoryAlertBanner scope="material" onOpen={() => setActiveTab('stock')} />
+          <InventoryAlertBanner scope="finished" onOpen={() => setActiveTab('stock')} />
           <FastMoverBanner onOpen={() => navigate(user.role === 'owner' ? 'analytics' : 'stock')} />
           {readyBatches.length > 0 && (
             <button

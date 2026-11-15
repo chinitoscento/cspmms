@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Boxes, PlusCircle, AlertTriangle, Pencil, Check, X, ShoppingCart, FlaskConical } from 'lucide-react';
+import { Boxes, PlusCircle, AlertTriangle, Pencil, Check, X, ShoppingCart, FlaskConical, Package } from 'lucide-react';
 import { supabase } from '../supabaseClient';
 import { EmptyState, PageHeader, ErrorNote, Modal, nz, peso } from './ui';
 import { MATERIAL_CATEGORIES } from './materialCategories';
@@ -79,32 +79,62 @@ function LevelCell({ row, isOwner, onSave }) {
   );
 }
 
-// Small banner for the dashboard. Usage: <InventoryAlertBanner onOpen={() => setActiveTab('inventory')} />
-export function InventoryAlertBanner({ onOpen }) {
+// Small banners for the dashboard. Two separate ones, so raw materials and finished goods are not mixed:
+//   <InventoryAlertBanner scope="material" onOpen={() => setActiveTab('stock')} />   raw materials to purchase
+//   <InventoryAlertBanner scope="finished" onOpen={() => setActiveTab('stock')} />   finished goods to produce
+// Without scope it shows everything in one banner, as before.
+const itemLabel = (a) => (a.kind === 'finished' && a.size_ml ? `${a.item_name} ${Number(a.size_ml)} ml` : a.item_name);
+
+export function InventoryAlertBanner({ onOpen, scope }) {
   const [alerts, setAlerts] = useState([]);
   useEffect(() => {
     supabase
       .from('inventory_status')
-      .select('item_name, size_ml, status, action')
+      .select('kind, item_name, size_ml, status, action')
       .in('status', ['Low', 'Out'])
       .then(({ data }) => setAlerts(data || []));
   }, []);
-  if (alerts.length === 0) return null;
-  const buy = alerts.filter((a) => a.action === 'Purchase').length;
-  const make = alerts.filter((a) => a.action === 'Produce').length;
+  const list = (scope ? alerts.filter((a) => a.kind === scope) : alerts).sort((a, b) => (a.status === b.status ? 0 : a.status === 'Out' ? -1 : 1));
+  if (list.length === 0) return null;
+  const out = list.filter((a) => a.status === 'Out').length;
+  const low = list.length - out;
+  const plural = list.length > 1 ? 's' : '';
+  const names = list.slice(0, 3).map(itemLabel).join(', ');
+  const more = list.length > 3 ? ` +${list.length - 3} more` : '';
+
+  let title;
+  let tail;
+  if (scope === 'finished') {
+    title = `${list.length} finished goods alert${plural}`;
+    tail = `${out > 0 ? `${out} out of stock` : ''}${out > 0 && low > 0 ? ', ' : ''}${low > 0 ? `${low} low` : ''} · to produce`;
+  } else if (scope === 'material') {
+    title = `${list.length} raw material alert${plural}`;
+    tail = `${out > 0 ? `${out} out of stock` : ''}${out > 0 && low > 0 ? ', ' : ''}${low > 0 ? `${low} low` : ''} · to purchase`;
+  } else {
+    const buy = list.filter((a) => a.action === 'Purchase').length;
+    const make = list.filter((a) => a.action === 'Produce').length;
+    title = `${list.length} stock alert${plural}`;
+    tail = `${buy > 0 ? `${buy} to purchase` : ''}${buy > 0 && make > 0 ? ' · ' : ''}${make > 0 ? `${make} to produce` : ''}`;
+  }
+  // Finished goods that are completely out of stock cannot be sold, so that banner turns red
+  const red = scope === 'finished' && out > 0;
+  const Icon = scope === 'finished' ? Package : AlertTriangle;
+  const box = red
+    ? 'border-[#e5736d]/40 bg-[#e5736d]/10 hover:bg-[#e5736d]/15'
+    : 'border-[#e5a93d]/40 bg-[#e5a93d]/10 hover:bg-[#e5a93d]/15';
+  const tone = red ? 'text-[#e5736d]' : 'text-[#e5a93d]';
   return (
     <button
       onClick={onOpen}
-      className="w-full mb-5 flex items-center gap-3 rounded-xl border border-[#e5a93d]/40 bg-[#e5a93d]/10 px-4 py-3 text-left cursor-pointer hover:bg-[#e5a93d]/15 transition-colors"
+      className={`w-full mb-5 flex items-center gap-3 rounded-xl border px-4 py-3 text-left cursor-pointer transition-colors ${box}`}
     >
-      <AlertTriangle className="w-5 h-5 text-[#e5a93d] shrink-0" aria-hidden="true" />
+      <Icon className={`w-5 h-5 ${tone} shrink-0`} aria-hidden="true" />
       <span className="text-sm">
-        <strong className="text-[#e5a93d]">{alerts.length} stock alert{alerts.length > 1 ? 's' : ''}</strong>
+        <strong className={tone}>{title}</strong>
         <span className="text-[#a8a090]">
           {' '}
-          {buy > 0 && `${buy} to purchase`}
-          {buy > 0 && make > 0 && ' · '}
-          {make > 0 && `${make} to produce`}. Click to review.
+          {tail}
+          {scope ? ` · ${names}${more}` : ''}. Click to review.
         </span>
       </span>
     </button>
@@ -117,6 +147,7 @@ export default function Inventory({ user, onNavigate, onChanged }) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
 
+  const [view, setView] = useState('all'); // which part of the inventory is shown, so nobody has to scroll
   const [formOpen, setFormOpen] = useState(false);
   const [f, setF] = useState({ name: '', category: 'oil', unit: 'ml', notes: '' });
   const [formError, setFormError] = useState('');
@@ -151,6 +182,26 @@ export default function Inventory({ user, onNavigate, onChanged }) {
     [rows]
   );
   const unset = rows.filter((r) => r.status === 'No level').length;
+  function unsetText(base) {
+    return unset > 0
+      ? `${base} ${unset} item${unset > 1 ? 's have' : ' has'} no reorder level yet${isOwner ? ': click the pencil in the tables to set one.' : '; the owner sets these.'}`
+      : base;
+  }
+  const materialAlerts = alerts.filter((a) => a.kind === 'material');
+  const finishedAlerts = alerts.filter((a) => a.kind === 'finished');
+  const VIEWS = [
+    { id: 'all', label: 'All Inventory', n: rows.length },
+    { id: 'materials', label: 'All Raw Materials', n: materials.length },
+    { id: 'buy', label: 'Raw Materials To Purchase', n: materialAlerts.length, alert: true },
+    { id: 'finished', label: 'All Finished Goods', n: perfumes.length },
+    { id: 'low', label: 'Finished Goods Low in Stock', n: finishedAlerts.length, alert: true },
+  ];
+  const shownAlertGroups =
+    view === 'buy'
+      ? [{ key: 'material', title: 'Raw materials to purchase', list: materialAlerts, empty: unsetText('No raw material is low right now.') }]
+      : view === 'low'
+        ? [{ key: 'finished', title: 'Finished goods low in stock', list: finishedAlerts, empty: unsetText('No finished goods are low right now.') }]
+        : [];
   const materialsValue = materials.reduce((s, r) => s + Number(r.value), 0);
   const finishedUnits = perfumes.reduce((s, r) => s + Number(r.on_hand), 0);
   const finishedValue = perfumes.reduce((s, r) => s + Number(r.value), 0);
@@ -294,20 +345,36 @@ export default function Inventory({ user, onNavigate, onChanged }) {
             ))}
           </div>
 
-          <div className="cs-card mb-6 overflow-hidden">
+          <div className="flex flex-wrap gap-2 mb-5" role="group" aria-label="Show inventory">
+            {VIEWS.map((v) => {
+              const active = view === v.id;
+              return (
+                <button
+                  key={v.id}
+                  type="button"
+                  onClick={() => setView(v.id)}
+                  aria-pressed={active}
+                  className={`cs-btn px-3.5 py-2 text-xs ${active ? 'cs-btn-gold' : 'cs-btn-ghost'}`}
+                >
+                  <span>{v.label}</span>
+                  <span className={`font-mono ${!active && v.alert && v.n > 0 ? 'text-[#e5a93d]' : 'opacity-70'}`}>({v.n})</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {shownAlertGroups.map((g) => (
+          <div key={g.key} className="cs-card mb-6 overflow-hidden">
             <div className="p-4 border-b border-[#2a2622] flex items-center gap-2 text-sm">
               <AlertTriangle className="w-4 h-4 text-[#e5a93d]" aria-hidden="true" />
-              <span>Needs attention</span>
+              <span>{g.title}</span>
+              {g.list.length > 0 && <span className="text-xs text-[#a8a090]">({g.list.length})</span>}
             </div>
-            {alerts.length === 0 ? (
-              <p className="p-5 text-sm text-[#a8a090]">
-                {unset > 0
-                  ? `Nothing is low right now. ${unset} item${unset > 1 ? 's have' : ' has'} no reorder level yet${isOwner ? ': click the pencil in the tables below to set one.' : '; the owner sets these.'}`
-                  : 'Everything is above its reorder level.'}
-              </p>
+            {g.list.length === 0 ? (
+              <p className="p-5 text-sm text-[#a8a090]">{g.empty}</p>
             ) : (
               <ul className="divide-y divide-[#24201c]">
-                {alerts.map((a) => {
+                {g.list.map((a) => {
                   const isBuy = a.action === 'Purchase';
                   return (
                     <li key={`${a.kind}-${a.item_id}`} className="px-4 py-3 flex flex-wrap items-center gap-3 justify-between">
@@ -335,6 +402,7 @@ export default function Inventory({ user, onNavigate, onChanged }) {
               </ul>
             )}
           </div>
+          ))}
 
           {rows.length === 0 ? (
             <div className="cs-card">
@@ -348,8 +416,8 @@ export default function Inventory({ user, onNavigate, onChanged }) {
             </div>
           ) : (
             <>
-              {renderTable({ title: 'Raw materials and packaging', icon: Boxes, list: materials })}
-              {renderTable({ title: 'Perfumes available for sale', icon: Boxes, list: perfumes, perfume: true })}
+              {(view === 'all' || view === 'materials') && renderTable({ title: 'Raw materials and packaging', icon: Boxes, list: materials })}
+              {(view === 'all' || view === 'finished') && renderTable({ title: 'Perfumes available for sale', icon: Boxes, list: perfumes, perfume: true })}
             </>
           )}
           <p className="text-[11px] text-[#a8a090]">
