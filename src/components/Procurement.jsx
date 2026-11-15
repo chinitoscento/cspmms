@@ -106,6 +106,8 @@ export default function Procurement({ user, onChanged }) {
   const [firstDue, setFirstDue] = useState('');
   const [interestMode, setInterestMode] = useState('none'); // 'none' | 'rate' | 'amount'
   const [interestValue, setInterestValue] = useState('');
+  const [oneMode, setOneMode] = useState('none'); // interest on a one-date purchase: 'none' | 'rate' | 'amount'
+  const [oneValue, setOneValue] = useState('');
   const [lateReason, setLateReason] = useState('');
   const [formError, setFormError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -191,6 +193,8 @@ export default function Procurement({ user, onChanged }) {
     setFirstDue('');
     setInterestMode('none');
     setInterestValue('');
+    setOneMode('none');
+    setOneValue('');
     setLateReason('');
     setFormError('');
     setFormOpen(true);
@@ -272,6 +276,14 @@ export default function Procurement({ user, onChanged }) {
     return { n, valid: true, rows, interestCents, first };
   }, [payment, terms, instCount, firstDue, interestMode, interestValue, total, date]);
 
+  // Interest from the creditor on a purchase paid in full on one date (an expense only when it is paid)
+  const oneInterestCents = useMemo(() => {
+    if (payment !== 'credit' || terms !== 'full' || total <= 0) return 0;
+    if (oneMode === 'rate') return Math.round((total * (Number(oneValue) || 0)) / 100);
+    if (oneMode === 'amount') return cents(oneValue);
+    return 0;
+  }, [payment, terms, oneMode, oneValue, total]);
+
   const savePurchase = async (e) => {
     e.preventDefault();
     if (payment === 'credit' && !creditor) return setFormError('Choose the creditor (the party you owe) for a purchase on credit.');
@@ -280,6 +292,7 @@ export default function Procurement({ user, onChanged }) {
       if (firstDue && firstDue < date) return setFormError('The first due date cannot be before the purchase date.');
       if (interestMode !== 'none' && !(Number(interestValue) > 0)) return setFormError('Enter the interest, or choose no interest.');
     }
+    if (payment === 'credit' && terms === 'full' && oneMode !== 'none' && !(Number(oneValue) > 0)) return setFormError('Enter the interest, or choose no interest.');
     if (isLateEntry(date) && !lateReason.trim()) return setFormError('This is a late entry. Enter why it was not recorded on the day.');
     if (draftTouched(draft)) return setFormError('You have an item that is not added yet. Click "Add item" or clear it.');
     if (lines.length === 0) return setFormError('Add at least one item.');
@@ -295,7 +308,7 @@ export default function Procurement({ user, onChanged }) {
       p_due: payment === 'credit' && terms === 'full' && due ? due : null,
       p_installments: plan ? plan.n : null,
       p_first_due: plan && firstDue ? firstDue : null,
-      p_interest: plan ? plan.interestCents / 100 : 0,
+      p_interest: plan ? plan.interestCents / 100 : oneInterestCents / 100,
       p_interest_rate: plan && interestMode === 'rate' ? Number(interestValue) : null,
       p_notes: withLateNote(nz(notes), date, lateReason),
       p_lines: used.map((l) => ({
@@ -695,6 +708,9 @@ export default function Procurement({ user, onChanged }) {
                                 {i.installments} installments · includes {peso(i.interest_total)} interest{i.not_yet_due != null && ` · ${peso(i.not_yet_due)} not yet due`}
                               </div>
                             )}
+                            {!i.is_installment && Number(i.interest_total) > 0 && (
+                              <div className="text-[10px] text-[#a8a090] font-sans">includes {peso(i.interest_total)} interest</div>
+                            )}
                           </td>
                           <td className="px-4 py-2 text-xs whitespace-nowrap">
                             {i.is_installment ? (
@@ -873,11 +889,27 @@ export default function Procurement({ user, onChanged }) {
                     </select>
                   </div>
                   {terms === 'full' ? (
-                    <div className="lg:col-span-3">
-                      <label htmlFor="pu-due" className="cs-label">Due date</label>
-                      <input id="pu-due" type="date" value={due} onChange={(e) => setDue(e.target.value)} className="cs-input px-3 py-2.5" />
-                      <p className="text-[10px] text-[#a8a090] mt-1">Blank = supplier&rsquo;s terms</p>
-                    </div>
+                    <>
+                      <div className="lg:col-span-3">
+                        <label htmlFor="pu-due" className="cs-label">Due date</label>
+                        <input id="pu-due" type="date" value={due} onChange={(e) => setDue(e.target.value)} className="cs-input px-3 py-2.5" />
+                        <p className="text-[10px] text-[#a8a090] mt-1">Blank = supplier&rsquo;s terms</p>
+                      </div>
+                      <div className="lg:col-span-3">
+                        <label htmlFor="pu-omode" className="cs-label">Interest from creditor</label>
+                        <select id="pu-omode" value={oneMode} onChange={(e) => { setOneMode(e.target.value); setOneValue(''); }} className="cs-input px-3 py-2.5">
+                          <option value="none">No interest</option>
+                          <option value="rate">% of purchase (one time)</option>
+                          <option value="amount">Fixed amount</option>
+                        </select>
+                      </div>
+                      {oneMode !== 'none' && (
+                        <div className="lg:col-span-3">
+                          <label htmlFor="pu-oval" className="cs-label">{oneMode === 'rate' ? '% of purchase' : 'Interest (\u20B1)'}</label>
+                          <input id="pu-oval" type="number" min="0" step="any" value={oneValue} onChange={(e) => setOneValue(e.target.value)} className="cs-input px-3 py-2.5 text-right" />
+                        </div>
+                      )}
+                    </>
                   ) : (
                     <>
                       <div className="lg:col-span-2">
@@ -1097,11 +1129,24 @@ export default function Procurement({ user, onChanged }) {
                   </p>
                 )}
 
+                {payment === 'credit' && terms === 'full' && oneInterestCents > 0 && (
+                  <>
+                    <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 text-xs space-y-1">
+                      <div className="flex justify-between"><span className="text-[#a8a090]">Items</span><span className="font-mono">{peso(total / 100)}</span></div>
+                      <div className="flex justify-between"><span className="text-[#a8a090]">Interest</span><span className="font-mono">{peso(oneInterestCents / 100)}</span></div>
+                      <div className="flex justify-between"><span className="text-[#a8a090]">Pay on {due ? fmtDate(due) : 'the due date'}</span><span className="font-mono">{peso((total + oneInterestCents) / 100)}</span></div>
+                    </div>
+                    <p className="text-[10px] leading-relaxed text-[#a8a090]">
+                      Interest is not added to the cost of the materials. It is owed together with the purchase and recorded as Interest Expense only when it is paid.
+                    </p>
+                  </>
+                )}
+
                 <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 flex items-center justify-between text-sm mt-auto">
                   <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">
-                    Purchase total{plan && plan.valid ? ' (with interest)' : ''}
+                    Purchase total{(plan && plan.valid) || oneInterestCents > 0 ? ' (with interest)' : ''}
                   </span>
-                  <span className="font-mono text-lg">{peso((total + (plan && plan.valid ? plan.interestCents : 0)) / 100)}</span>
+                  <span className="font-mono text-lg">{peso((total + (plan && plan.valid ? plan.interestCents : oneInterestCents)) / 100)}</span>
                 </div>
               </div>
             </div>
@@ -1144,6 +1189,7 @@ export default function Procurement({ user, onChanged }) {
                     <span className="font-mono text-[#e3bf5a]">{purLabel(i.purchase_no)}</span>
                     <span className="text-[#a8a090]"> · balance {peso(i.balance)}</span>
                     {i.is_installment && <span className="block text-[10px] text-[#a8a090]">{overdueOf(i) > 0 ? `Overdue ${peso(overdueOf(i))}${i.overdue_installments != null ? ` (${i.overdue_installments} installment${Number(i.overdue_installments) === 1 ? '' : 's'})` : ''}` : `Next installment ${peso(i.next_due_balance)}`} · paid oldest installment first, interest first</span>}
+                    {!i.is_installment && Number(i.interest_total) > 0 && <span className="block text-[10px] text-[#a8a090]">includes {peso(i.interest_total)} interest · interest is paid first</span>}
                   </div>
                   <div className="col-span-5">
                     <label htmlFor={`pa-${i.purchase_id}`} className="sr-only">Amount for {purLabel(i.purchase_no)}</label>
