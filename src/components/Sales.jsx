@@ -102,7 +102,7 @@ export default function Sales({ user, onChanged }) {
 
   // new sale
   const [sOpen, setSOpen] = useState(false);
-  const [sf, setSf] = useState({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', lines: [] });
+  const [sf, setSf] = useState({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', downRef: '', lines: [] });
   const [sQuery, setSQuery] = useState(''); // perfume search in the New Sale picker
   const [sError, setSError] = useState('');
 
@@ -243,7 +243,7 @@ export default function Sales({ user, onChanged }) {
 
   // ---------- new sale ----------
   const openSale = () => {
-    setSf({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', lines: [] });
+    setSf({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', downRef: '', lines: [] });
     setSQuery('');
     setSError('');
     setSOpen(true);
@@ -298,6 +298,7 @@ export default function Sales({ user, onChanged }) {
     if (sIsCredit && !sf.customer) return setSError('Choose the customer for a credit sale.');
     if (sBlocked) return setSError(sShort[0]);
     if (sDownError) return setSError(sDownError);
+    if (sDown > 0 && sf.downMethod === 'bank' && !sf.downRef.trim()) return setSError('Enter the bank transfer reference number for the upfront payment.');
     if (isLateEntry(sf.date) && !sf.lateReason.trim()) return setSError('This is a late entry. Enter why it was not recorded on the day.');
     setSaving(true);
     setSError('');
@@ -308,7 +309,7 @@ export default function Sales({ user, onChanged }) {
       p_notes: withLateNote(nz(sf.notes), sf.date, sf.lateReason),
       p_lines: used.map((l) => ({ size_id: l.size, qty: parseInt(l.qty, 10), unit_price: linePrice(l) })),
       // only sent when there is an upfront payment, so sales without one work exactly as before
-      ...(sDown > 0 ? { p_down_payment: sDown, p_down_method: sf.downMethod } : {}),
+      ...(sDown > 0 ? { p_down_payment: sDown, p_down_method: sf.downMethod, p_down_reference: sf.downMethod === 'bank' ? sf.downRef.trim() : null } : {}),
     });
     setSaving(false);
     if (error) return setSError(error.message);
@@ -1061,6 +1062,12 @@ export default function Sales({ user, onChanged }) {
                       </div>
                     )}
                   </div>
+                  {sDown > 0 && sf.downMethod === 'bank' && (
+                    <div>
+                      <label htmlFor="s-down-ref" className="sr-only">Bank transfer reference number</label>
+                      <input id="s-down-ref" value={sf.downRef} onChange={(e) => setSf((p) => ({ ...p, downRef: e.target.value }))} placeholder="Bank transfer reference no. (required)" className="cs-input px-2 py-1.5 text-xs" />
+                    </div>
+                  )}
                   {sDownError && <p className="text-[11px] text-[#e5736d]" role="alert">{sDownError}</p>}
                 </div>
               )}
@@ -1409,7 +1416,7 @@ export default function Sales({ user, onChanged }) {
                       })}
                     </ul>
                     {over && <p className="text-xs text-[#e5736d]">This would go over the customer&rsquo;s credit limit, so approval will be refused. Raise the limit in Customers first, or reject the sale.</p>}
-                    <p className="text-xs text-[#a8a090]">Approving takes the stock out, books the receivable and issues the invoice.{down > 0 ? ` The ${peso(down)} paid upfront is recorded as received by ${s.down_method === 'bank' ? 'bank transfer' : 'cash'} on ${fmtDate(s.sale_date)}, so the receivable is ${peso(net)}.` : ''}</p>
+                    <p className="text-xs text-[#a8a090]">Approving takes the stock out, books the receivable and issues the invoice.{down > 0 ? ` The ${peso(down)} paid upfront is recorded as received by ${s.down_method === 'bank' ? `bank transfer (ref ${s.down_reference || '-'})` : 'cash'} on ${fmtDate(s.sale_date)}, so the receivable is ${peso(net)}.` : ''}</p>
                   </>
                 );
               })()

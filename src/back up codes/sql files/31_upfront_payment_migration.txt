@@ -1,0 +1,207 @@
+-- Partial upfront payment on credit sales
+-- Run once in the Supabase SQL editor. Safe to re-run.
+
+begin;
+
+-- 1. New columns on sales ---------------------------------------------------
+alter table public.sales
+  add column if not exists down_payment   numeric(14,2) not null default 0,
+  add column if not exists down_method    text,
+  add column if not exists down_reference text;
+
+alter table public.sales drop constraint if exists sales_down_payment_chk;
+alter table public.sales add constraint sales_down_payment_chk check (
+  down_payment >= 0
+  and (
+    (down_payment = 0 and down_method is null)
+    or (down_payment > 0 and down_method in ('cash', 'bank') and payment_type = 'credit')
+  )
+);
+
+-- 2. record_sale: accepts the upfront payment --------------------------------
+-- The old 5-argument version is dropped so only one version exists.
+drop function if exists public.record_sale(date, uuid, text, text, jsonb);
+
+create or replace function public.record_sale(
+  p_date date,
+  p_customer uuid,
+  p_payment text,
+  p_notes text,
+  p_lines jsonb,
+  p_down_payment numeric default 0,
+  p_down_method text default null,
+  p_down_reference text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path to 'public'
+as $function$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_today date := (now() at time zone 'Asia/Manila')::date;
+  v_date date := coalesce(p_date, (now() at time zone 'Asia/Manila')::date);
+  v_line jsonb;
+  v_n int := 0;
+  v_qty int;
+  v_sz public.perfume_sizes;
+  v_pname text;
+  v_price numeric(14,2);
+  v_total numeric(14,2) := 0;
+  v_down numeric(14,2) := round(coalesce(p_down_payment, 0), 2);
+  v_dmethod text := nullif(trim(coalesce(p_down_method, '')), '');
+  v_dref text := nullif(trim(coalesce(p_down_reference, '')), '');
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_payment is null or p_payment not in ('cash','bank','credit') then
+    raise exception 'Choose how the customer pays.';
+  end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) < 1 then
+    raise exception 'Add at least one item.';
+  end if;
+
+  if v_down < 0 then raise exception 'The upfront payment cannot be negative.'; end if;
+  if v_down > 0 then
+    if p_payment <> 'credit' then
+      raise exception 'An upfront payment only applies to credit sales.';
+    end if;
+    if v_dmethod is null or v_dmethod not in ('cash','bank') then
+      raise exception 'Choose whether the upfront payment was cash or bank transfer.';
+    end if;
+    if v_dmethod = 'bank' and v_dref is null then
+      raise exception 'Enter the bank transfer reference number for the upfront payment.';
+    end if;
+    if v_date > v_today then
+      raise exception 'A sale with an upfront payment cannot be dated in the future.';
+    end if;
+  else
+    v_dmethod := null;
+    v_dref := null;
+  end if;
+
+  if p_customer is not null then
+    perform 1 from public.customers where id = p_customer and status = 'Active';
+    if not found then raise exception 'Customer not found or inactive.'; end if;
+  end if;
+  if p_payment = 'credit' then
+    if p_customer is null then raise exception 'A credit sale needs a customer.'; end if;
+    perform 1 from public.customer_credit where customer_id = p_customer and credit_allowed;
+    if not found then
+      raise exception 'This customer is not allowed credit. Choose cash or bank, or ask the owner to allow credit.';
+    end if;
+  end if;
+
+  v_no := nextval('public.sale_no_seq');
+  insert into public.sales (id, sale_no, sale_date, customer_id, payment_type, status, notes,
+                            down_payment, down_method, down_reference)
+  values (v_id, v_no, v_date, p_customer, p_payment, 'Pending', nullif(trim(coalesce(p_notes, '')), ''),
+          v_down, v_dmethod, v_dref);
+
+  for v_line in select * from jsonb_array_elements(p_lines) loop
+    v_n := v_n + 1;
+    v_qty := coalesce((v_line->>'qty')::int, 0);
+    if v_qty <= 0 then raise exception 'Line %: quantity must be more than zero.', v_n; end if;
+
+    select ps.* into v_sz
+      from public.perfume_sizes ps join public.perfumes pf on pf.id = ps.perfume_id
+     where ps.id = nullif(v_line->>'size_id', '')::uuid and ps.is_active and pf.status <> 'Discontinued';
+    if not found then raise exception 'Line %: choose a perfume and size.', v_n; end if;
+    select name into v_pname from public.perfumes where id = v_sz.perfume_id;
+    if v_sz.price <= 0 then
+      raise exception 'No selling price is set for % % ml. Set it in the Signature Collection first.', v_pname, trim_scale(v_sz.size_ml);
+    end if;
+
+    v_price := round(coalesce(nullif(v_line->>'unit_price', '')::numeric, v_sz.price), 2);
+    if v_price <= 0 then raise exception 'Line %: the price must be more than zero.', v_n; end if;
+
+    insert into public.sale_lines (sale_id, line_no, size_id, qty, unit_price, list_price, amount)
+    values (v_id, v_n, v_sz.id, v_qty, v_price, v_sz.price, round(v_qty * v_price, 2));
+    v_total := v_total + round(v_qty * v_price, 2);
+  end loop;
+
+  if v_down > 0 and v_down >= v_total then
+    raise exception 'The upfront payment must be less than the sale total. For a full payment, use Cash or Bank transfer.';
+  end if;
+
+  update public.sales set total = v_total where id = v_id;
+
+  -- cash and bank sales post immediately; credit waits for the owner
+  if p_payment <> 'credit' then
+    perform public.post_sale_internal(v_id, v_date);
+  end if;
+  return v_id;
+end;
+$function$;
+
+-- the old function's permissions went with it; only signed-in users may call this
+revoke all on function public.record_sale(date, uuid, text, text, jsonb, numeric, text, text) from public, anon;
+grant execute on function public.record_sale(date, uuid, text, text, jsonb, numeric, text, text) to authenticated;
+
+-- 3. approve_credit_sale: limit check on the unpaid part, then book the upfront payment
+create or replace function public.approve_credit_sale(p_id uuid, p_date date default null::date)
+returns void
+language plpgsql
+security definer
+set search_path to 'public'
+as $function$
+declare
+  s public.sales;
+  cc public.customer_credit;
+  v_out numeric := 0;
+  v_net numeric;
+  v_date date;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can approve credit sales.'; end if;
+  select * into s from public.sales where id = p_id for update;
+  if not found then raise exception 'Sale not found.'; end if;
+  if s.status <> 'Pending' or s.payment_type <> 'credit' then
+    raise exception 'This is not a credit sale waiting for approval.';
+  end if;
+
+  -- booked on the sale's own date, as before
+  v_date := coalesce(p_date, s.sale_date, (now() at time zone 'Asia/Manila')::date);
+
+  select * into cc from public.customer_credit where customer_id = s.customer_id;
+  if not found or not cc.credit_allowed then
+    raise exception 'This customer is no longer allowed credit.';
+  end if;
+
+  select coalesce(sum(l.debit - l.credit), 0) into v_out
+  from public.journal_lines l join public.accounts a on a.id = l.account_id
+  where a.code = '1100' and l.customer_id = s.customer_id;
+
+  -- only the part not paid upfront stays as a receivable
+  v_net := s.total - s.down_payment;
+
+  -- a limit of 0 means no limit has been set
+  if cc.credit_limit > 0 and v_out + v_net > cc.credit_limit then
+    raise exception 'Approving this would bring the customer to % against a credit limit of %.',
+      round(v_out + v_net, 2), cc.credit_limit;
+  end if;
+
+  perform public.post_sale_internal(p_id, v_date);
+
+  -- the upfront payment is booked like any other customer payment (Dr cash/bank, Cr receivables),
+  -- applied to this invoice, in the same transaction
+  if s.down_payment > 0 then
+    perform public.record_customer_payment(
+      v_date,
+      s.customer_id,
+      s.down_method,
+      s.down_payment,
+      s.down_reference,
+      'Upfront payment on SL-' || lpad(s.sale_no::text, 8, '0'),
+      jsonb_build_array(jsonb_build_object('sale_id', p_id, 'amount', s.down_payment)),
+      false
+    );
+  end if;
+
+  update public.sales set decided_by = auth.uid(), decided_at = now() where id = p_id;
+end;
+$function$;
+
+commit;
+
+-- make the API pick up the new function signature
+notify pgrst, 'reload schema';
