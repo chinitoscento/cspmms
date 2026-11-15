@@ -25,6 +25,7 @@ import {
   Calculator,
   BarChart3,
   ClipboardCheck,
+  Gift,
 } from 'lucide-react';
 import logoImage from '../logo.png';
 import CommandPalette from './CommandPalette';
@@ -47,6 +48,7 @@ const NAV_ITEMS = [
   { id: 'packaging', name: 'Packaging', icon: PackageCheck },
   { id: 'sales', name: 'Sales and Return/Exchange', icon: ShoppingBag },
   { id: 'collections', name: 'Collections', icon: Wallet },
+  { id: 'gifts', name: 'Marketing Gifts', icon: Gift },
   { id: 'analytics', name: 'Sales Analytics', icon: BarChart3 },
   { id: 'costing', name: 'Costing', icon: Calculator },
   { id: 'reports', name: 'Accounting Reports', icon: Scale },
@@ -60,7 +62,7 @@ const NAV_GROUPS = [
   { id: 'partners', label: 'Partners & Catalog', ids: ['customers', 'suppliers', 'inventory', 'materials'] },
   { id: 'purchasing', label: 'Purchasing & Stock', ids: ['procurement', 'stock', 'writeoffs'] },
   { id: 'production', label: 'Production', ids: ['maceration', 'bottling', 'packaging'] },
-  { id: 'selling', label: 'Sales & Collections', ids: ['sales', 'collections', 'analytics'] },
+  { id: 'selling', label: 'Sales & Collections', ids: ['sales', 'collections', 'gifts', 'analytics'] },
   { id: 'finance', label: 'Finance & Accounting', ids: ['costing', 'ledger', 'reports', 'audit'] },
   { id: 'admin', label: 'Administration', ids: ['users'] },
 ];

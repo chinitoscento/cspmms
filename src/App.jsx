@@ -14,6 +14,7 @@ import Maceration from './components/Maceration';
 import Bottling from './components/Bottling';
 import Packaging from './components/Packaging';
 import StockWriteoffs from './components/StockWriteoffs';
+import MarketingGifts from './components/MarketingGifts';
 import RawMaterials from './components/RawMaterials';
 import Sales from './components/Sales';
 import Collections from './components/Collections';
@@ -545,6 +546,7 @@ export default function App() {
       {activeTab === 'bottling' && <Bottling user={user} onChanged={refresh} onNavigate={navigate} prefill={prefill} />}
       {activeTab === 'packaging' && <Packaging user={user} onChanged={refresh} prefill={prefill} />}
       {activeTab === 'writeoffs' && <StockWriteoffs user={user} onChanged={refresh} />}
+      {activeTab === 'gifts' && <MarketingGifts user={user} onChanged={refresh} />}
       {activeTab === 'ledger' && <Ledger user={user} onChanged={refresh} />}
       {activeTab === 'reports' && user.role === 'owner' && <Reports user={user} />}
       {activeTab === 'audit' && user.role === 'owner' && <Audit user={user} />}
