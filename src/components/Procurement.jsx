@@ -221,9 +221,9 @@ function CreditorStatement({ stmt, purchases, installmentRows, payAllocs, instPa
   );
 }
 
-export default function Procurement({ user, onChanged }) {
+export default function Procurement({ user, onChanged, prefill }) {
   const isOwner = user?.role === 'owner';
-  const [tab, setTab] = useState('purchases');
+  const [tab, setTab] = useState(prefill?.tab || 'purchases'); // the dashboard payables alert opens the Payables tab
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
 

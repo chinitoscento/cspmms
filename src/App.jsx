@@ -22,7 +22,7 @@ import Analytics, { FastMoverBanner } from './components/Analytics';
 import Audit from './components/Audit';
 import { EmptyState, peso } from './components/ui';
 import { supabase } from './supabaseClient';
-import { Sparkles, ArrowUpRight, FlaskConical, Droplets, PackageCheck, TrendingUp, Banknote, Receipt, CreditCard, ShoppingBag } from 'lucide-react';
+import { Sparkles, ArrowUpRight, FlaskConical, Droplets, PackageCheck, TrendingUp, Banknote, Receipt, CreditCard, ShoppingBag, Wallet } from 'lucide-react';
 
 function StatCard({ title, value, caption, icon: Icon, onClick, tone }) {
   return (
@@ -80,6 +80,9 @@ function ReadyCard({ title, count, items, empty, openLabel, onOpen, onItem, acti
 
 const daysUntil = (iso) => Math.round((new Date(`${iso}T00:00:00`) - new Date(`${new Date().toLocaleDateString('en-CA')}T00:00:00`)) / 86400000);
 
+// Dashboard warns about payables due within this many days
+const PAYABLE_ALERT_DAYS = 15;
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [booting, setBooting] = useState(true);
@@ -89,6 +92,7 @@ export default function App() {
   const [summary, setSummary] = useState({ netSales: 0, netIncome: 0, ar: 0, ap: 0, fgUnits: 0, bottlingReady: [], packagingReady: [] });
   const [macBatches, setMacBatches] = useState([]); // batches still macerating
   const [pendingSales, setPendingSales] = useState({ sales: 0, returns: 0 }); // waiting for owner approval
+  const [dueSoon, setDueSoon] = useState({ items: [], upcoming: 0, overdue: 0 }); // payables due within the warning window
   const [prefill, setPrefill] = useState(null); // hand-off between Maceration > Bottling > Packaging
   const [stockView, setStockView] = useState('all'); // which button of Stock & Alerts opens first
 
@@ -234,11 +238,36 @@ export default function App() {
     if (signedIn) loadPending();
   }, [signedIn, activeTab, loadPending]);
 
+  // Payables to creditors that fall due within the next PAYABLE_ALERT_DAYS days (drives the dashboard notice)
+  const loadDueSoon = useCallback(async () => {
+    const { data } = await supabase.from('payables_open').select('*');
+    const items = [];
+    let overdue = 0;
+    (data || []).forEach((p) => {
+      if (!(Number(p.balance) > 0.005)) return;
+      const od = Number(p.overdue_amount ?? (Number(p.days_overdue) > 0 ? p.balance : 0));
+      overdue += od;
+      // installment plans: the next installment that is not yet due; single-date purchases: the due date
+      const date = p.is_installment ? p.next_upcoming_date : od > 0 ? null : p.due_date;
+      const amount = p.is_installment ? Number(p.next_upcoming_amount || 0) : Number(p.balance);
+      if (!date) return;
+      const left = daysUntil(date);
+      if (left < 0 || left > PAYABLE_ALERT_DAYS) return;
+      items.push({ key: p.purchase_id, creditor: p.creditor_name || 'No creditor assigned yet', purchaseNo: p.purchase_no, date, left, amount });
+    });
+    items.sort((a, b) => a.date.localeCompare(b.date));
+    setDueSoon({ items, upcoming: items.reduce((s, i) => s + i.amount, 0), overdue });
+  }, []);
+  useEffect(() => {
+    if (signedIn && activeTab === 'dashboard') loadDueSoon();
+  }, [signedIn, activeTab, loadDueSoon]);
+
   const refresh = useCallback(() => {
     loadSummary();
     loadMac();
     loadPending();
-  }, [loadSummary, loadMac, loadPending]);
+    loadDueSoon();
+  }, [loadSummary, loadMac, loadPending, loadDueSoon]);
 
   // Go to a page, optionally handing it something to pre-fill. A plain tab click clears the hand-off.
   // Leaving Stock & Alerts resets it, so opening it from the menu later starts on All Inventory
@@ -308,6 +337,43 @@ export default function App() {
               </span>
               <span className="inline-flex items-center gap-1 text-xs text-[#3ecf8e] whitespace-nowrap">
                 Open Maceration Lab <ArrowUpRight className="w-3.5 h-3.5" aria-hidden="true" />
+              </span>
+            </button>
+          )}
+          {(dueSoon.items.length > 0 || dueSoon.overdue > 0) && (
+            <button
+              type="button"
+              onClick={() => navigate('procurement', { tab: 'payables' })}
+              className={`w-full flex items-center justify-between gap-4 rounded-xl border px-5 py-3.5 text-left cursor-pointer transition-colors ${
+                dueSoon.overdue > 0
+                  ? 'border-[#e5736d]/30 bg-[#e5736d]/10 hover:bg-[#e5736d]/15'
+                  : 'border-[#e5a93d]/30 bg-[#e5a93d]/10 hover:bg-[#e5a93d]/15'
+              }`}
+            >
+              <span className="flex items-center gap-3 text-sm">
+                <Wallet className={`w-4 h-4 shrink-0 ${dueSoon.overdue > 0 ? 'text-[#e5736d]' : 'text-[#e5a93d]'}`} aria-hidden="true" />
+                <span>
+                  {dueSoon.overdue > 0 && (
+                    <strong className="text-[#e5736d] block">{peso(dueSoon.overdue)} overdue to creditors</strong>
+                  )}
+                  {dueSoon.items.length > 0 && (
+                    <>
+                      <strong className="text-[#e5a93d]">
+                        {peso(dueSoon.upcoming)} due in the next {PAYABLE_ALERT_DAYS} days
+                      </strong>
+                      <span className="text-[#a8a090]">
+                        {' '}· {dueSoon.items
+                          .slice(0, 3)
+                          .map((i) => `${i.creditor} ${i.left === 0 ? 'today' : i.left === 1 ? 'tomorrow' : `in ${i.left} days`}`)
+                          .join(', ')}
+                        {dueSoon.items.length > 3 ? ` +${dueSoon.items.length - 3} more` : ''}
+                      </span>
+                    </>
+                  )}
+                </span>
+              </span>
+              <span className={`inline-flex items-center gap-1 text-xs whitespace-nowrap ${dueSoon.overdue > 0 ? 'text-[#e5736d]' : 'text-[#e5a93d]'}`}>
+                Open Payables <ArrowUpRight className="w-3.5 h-3.5" aria-hidden="true" />
               </span>
             </button>
           )}
@@ -474,7 +540,7 @@ export default function App() {
       {activeTab === 'inventory' && <PerfumeCollection />}
       {activeTab === 'materials' && <RawMaterials user={user} onNavigate={navigate} onChanged={refresh} />}
       {activeTab === 'stock' && <Inventory key={stockView} user={user} onNavigate={navigate} onChanged={refresh} initialView={stockView} />}
-      {activeTab === 'procurement' && <Procurement user={user} onChanged={refresh} />}
+      {activeTab === 'procurement' && <Procurement user={user} onChanged={refresh} prefill={prefill} />}
       {activeTab === 'maceration' && <Maceration user={user} onChanged={refresh} onNavigate={navigate} />}
       {activeTab === 'bottling' && <Bottling user={user} onChanged={refresh} onNavigate={navigate} prefill={prefill} />}
       {activeTab === 'packaging' && <Packaging user={user} onChanged={refresh} prefill={prefill} />}
