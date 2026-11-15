@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PackageCheck, PlusCircle, Ban } from 'lucide-react';
 import { supabase } from '../supabaseClient';
 import { EmptyState, PageHeader, ErrorNote, Modal, nz, peso, fmtDate, ModalActions, STICKY_TH, STICKY_TD } from './ui';
+import SearchBar, { EMPTY_FILTERS, matchesFilters } from './SearchBar';
 
 const todayLocal = () => new Date().toLocaleDateString('en-CA');
 const pad = (n) => String(n).padStart(8, '0');
@@ -51,6 +52,7 @@ export default function Packaging({ user, onChanged, prefill }) {
   const [stock, setStock] = useState([]); // inventory_status rows
   const [runs, setRuns] = useState([]);
   const [saving, setSaving] = useState(false);
+  const [filters, setFilters] = useState(EMPTY_FILTERS); // search by perfume, run no. and date
 
   // packaging
   const [pkOpen, setPkOpen] = useState(false);
@@ -100,6 +102,10 @@ export default function Packaging({ user, onChanged, prefill }) {
 
   const mats = useMemo(() => stock.filter((r) => r.kind === 'material'), [stock]);
   const matById = useMemo(() => Object.fromEntries(mats.map((m) => [m.item_id, m])), [mats]);
+  const shownRuns = useMemo(
+    () => runs.filter((r) => matchesFilters(filters, { perfume: r.perfume_sizes?.perfumes?.name, runNo: r.run_no, prefix: 'PK', date: r.run_date })),
+    [runs, filters]
+  );
   const finishedBySize = useMemo(() => Object.fromEntries(stock.filter((r) => r.kind === 'finished').map((r) => [r.item_id, r])), [stock]);
   const sizeOptions = useMemo(
     () => [...sizes].sort((a, b) => a.perfumes.name.localeCompare(b.perfumes.name) || Number(a.size_ml) - Number(b.size_ml)),
@@ -198,6 +204,18 @@ export default function Packaging({ user, onChanged, prefill }) {
         <p className="text-sm text-[#a8a090]">Loading...</p>
       ) : (
         <div className="cs-card overflow-hidden">
+          {runs.length > 0 && (
+            <SearchBar
+              idPrefix="pk-search"
+              filters={filters}
+              onChange={setFilters}
+              runLabel="Run"
+              runPlaceholder="e.g. PK-00000012 or 12"
+              dateLabel="Date"
+              shown={shownRuns.length}
+              total={runs.length}
+            />
+          )}
           {runs.length === 0 ? (
             <EmptyState icon={PackageCheck} title="No packaging yet" text="Packaging uses bottled perfume with either a box set or a pouch set." actionLabel="Record Packaging" onAction={openPackaging} />
           ) : (
@@ -217,7 +235,7 @@ export default function Packaging({ user, onChanged, prefill }) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#24201c]">
-                  {runs.map((r) => (
+                  {shownRuns.map((r) => (
                     <tr key={r.id} className={`bg-[#141210] hover:bg-[#1c1916] transition-colors ${r.status === 'Voided' ? 'opacity-60' : ''}`}>
                       <td className="px-4 py-3 font-mono text-xs text-[#e3bf5a]">PK-{pad(r.run_no)}</td>
                       <td className="px-4 py-3 text-xs text-[#a8a090] whitespace-nowrap">{fmtDate(r.run_date)}</td>
@@ -242,6 +260,11 @@ export default function Packaging({ user, onChanged, prefill }) {
                       )}
                     </tr>
                   ))}
+                  {shownRuns.length === 0 && (
+                    <tr>
+                      <td colSpan={isOwner ? 9 : 8} className="px-4 py-8 text-center text-sm text-[#a8a090]">No runs match your search.</td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>

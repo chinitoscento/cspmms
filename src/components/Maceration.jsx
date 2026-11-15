@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { FlaskConical, PlusCircle, Trash2, CheckCircle2, Settings2, Droplets, Ban } from 'lucide-react';
 import { supabase } from '../supabaseClient';
 import { EmptyState, PageHeader, ErrorNote, Modal, nz, peso, fmtDate, ModalActions, STICKY_TH, STICKY_TD } from './ui';
+import SearchBar, { EMPTY_FILTERS, matchesFilters } from './SearchBar';
 
 const todayLocal = () => new Date().toLocaleDateString('en-CA');
 const pad = (n) => String(n).padStart(8, '0');
@@ -60,6 +61,7 @@ export default function Maceration({ user, onChanged, onNavigate }) {
   const [bottledIds, setBottledIds] = useState(() => new Set()); // matured batches whose juice has all been bottled
 
   const [saving, setSaving] = useState(false);
+  const [filters, setFilters] = useState(EMPTY_FILTERS); // search by perfume, batch no. and start date
 
   // settings editor (owner)
   const [setOpen, setSetOpen] = useState(false);
@@ -146,6 +148,10 @@ export default function Maceration({ user, onChanged, onNavigate }) {
 
   const mats = useMemo(() => stock.filter((r) => r.kind === 'material'), [stock]);
   const matById = useMemo(() => Object.fromEntries(mats.map((m) => [m.item_id, m])), [mats]);
+  const shownBatches = useMemo(
+    () => batches.filter((r) => matchesFilters(filters, { perfume: r.perfumes?.name, runNo: r.batch_no, prefix: 'MB', date: r.start_date })),
+    [batches, filters]
+  );
   // ---------- settings ----------
   const openSettings = () => {
     setSetDays(settings.maceration_days == null ? '' : String(settings.maceration_days));
@@ -316,6 +322,18 @@ export default function Maceration({ user, onChanged, onNavigate }) {
           </div>
 
           <div className="cs-card overflow-hidden">
+            {batches.length > 0 && (
+              <SearchBar
+                idPrefix="mb-search"
+                filters={filters}
+                onChange={setFilters}
+                runLabel="Batch"
+                runPlaceholder="e.g. MB-00000012 or 12"
+                dateLabel="Started"
+                shown={shownBatches.length}
+                total={batches.length}
+              />
+            )}
             {batches.length === 0 ? (
               <EmptyState
                 icon={FlaskConical}
@@ -341,7 +359,7 @@ export default function Maceration({ user, onChanged, onNavigate }) {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#24201c]">
-                    {batches.map((b) => {
+                    {shownBatches.map((b) => {
                       const left = daysUntil(b.ready_date);
                       const ready = b.status === 'Macerating' && left <= 0;
                       const bottled = b.status === 'Matured' && bottledIds.has(b.id);
@@ -397,6 +415,11 @@ export default function Maceration({ user, onChanged, onNavigate }) {
                         </tr>
                       );
                     })}
+                    {shownBatches.length === 0 && (
+                      <tr>
+                        <td colSpan={9} className="px-4 py-8 text-center text-sm text-[#a8a090]">No batches match your search.</td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>

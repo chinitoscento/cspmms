@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Droplets, PlusCircle, Ban, PackageCheck, Check, X } from 'lucide-react';
 import { supabase } from '../supabaseClient';
 import { EmptyState, PageHeader, ErrorNote, Modal, nz, peso, fmtDate, ModalActions, STICKY_TH, STICKY_TD } from './ui';
+import SearchBar, { EMPTY_FILTERS, matchesFilters } from './SearchBar';
 
 const todayLocal = () => new Date().toLocaleDateString('en-CA');
 const pad = (n) => String(n).padStart(8, '0');
@@ -52,6 +53,7 @@ export default function Bottling({ user, onChanged, onNavigate, prefill }) {
   const [stock, setStock] = useState([]); // inventory_status rows
   const [runs, setRuns] = useState([]);
   const [saving, setSaving] = useState(false);
+  const [filters, setFilters] = useState(EMPTY_FILTERS); // search by perfume, run no. and date
 
   // bottling
   const [btOpen, setBtOpen] = useState(false);
@@ -115,6 +117,10 @@ export default function Bottling({ user, onChanged, onNavigate, prefill }) {
 
   const mats = useMemo(() => stock.filter((r) => r.kind === 'material'), [stock]);
   const matById = useMemo(() => Object.fromEntries(mats.map((m) => [m.item_id, m])), [mats]);
+  const shownRuns = useMemo(
+    () => runs.filter((r) => matchesFilters(filters, { perfume: r.perfume_sizes?.perfumes?.name, runNo: r.run_no, prefix: 'BT', date: r.run_date })),
+    [runs, filters]
+  );
   const finishedBySize = useMemo(() => Object.fromEntries(stock.filter((r) => r.kind === 'finished').map((r) => [r.item_id, r])), [stock]);
   const sizeOptions = useMemo(
     () => [...sizes].sort((a, b) => a.perfumes.name.localeCompare(b.perfumes.name) || Number(a.size_ml) - Number(b.size_ml)),
@@ -311,6 +317,18 @@ export default function Bottling({ user, onChanged, onNavigate, prefill }) {
         <p className="text-sm text-[#a8a090]">Loading...</p>
       ) : (
         <div className="cs-card overflow-hidden">
+          {runs.length > 0 && (
+            <SearchBar
+              idPrefix="bt-search"
+              filters={filters}
+              onChange={setFilters}
+              runLabel="Run"
+              runPlaceholder="e.g. BT-00000012 or 12"
+              dateLabel="Date"
+              shown={shownRuns.length}
+              total={runs.length}
+            />
+          )}
           {runs.length === 0 ? (
             <EmptyState icon={Droplets} title="No bottling yet" text="Bottling uses matured juice, a bottle and a bottle sticker." actionLabel="Record Bottling" onAction={openBottling} />
           ) : (
@@ -331,7 +349,7 @@ export default function Bottling({ user, onChanged, onNavigate, prefill }) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#24201c]">
-                  {runs.map((r) => (
+                  {shownRuns.map((r) => (
                     <tr key={r.id} className={`bg-[#141210] hover:bg-[#1c1916] transition-colors ${r.status === 'Voided' ? 'opacity-60' : ''}`}>
                       <td className="px-4 py-3 font-mono text-xs text-[#e3bf5a]">BT-{pad(r.run_no)}</td>
                       <td className="px-4 py-3 text-xs text-[#a8a090] whitespace-nowrap">{fmtDate(r.run_date)}</td>
@@ -368,6 +386,11 @@ export default function Bottling({ user, onChanged, onNavigate, prefill }) {
                       </td>
                     </tr>
                   ))}
+                  {shownRuns.length === 0 && (
+                    <tr>
+                      <td colSpan={10} className="px-4 py-8 text-center text-sm text-[#a8a090]">No runs match your search.</td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>

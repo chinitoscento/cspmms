@@ -228,75 +228,84 @@ export default function MarketingGifts({ user, onChanged }) {
       {open && (
         <Modal title="Record Marketing Gift" onClose={() => setOpen(false)} wide>
           <form onSubmit={save} className="space-y-4">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="sm:col-span-2">
-                <label htmlFor="gf-to" className="cs-label">Given to</label>
-                <input id="gf-to" value={f.recipient} onChange={(e) => setF((p) => ({ ...p, recipient: e.target.value }))} placeholder="e.g. Influencer name" autoFocus className="cs-input px-3 py-2.5" />
-              </div>
-              <div>
-                <label htmlFor="gf-date" className="cs-label">Date given</label>
-                <input id="gf-date" type="date" value={f.date} onChange={(e) => setF((p) => ({ ...p, date: e.target.value }))} required className="cs-input px-3 py-2.5" />
-              </div>
-            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-5 gap-x-6 gap-y-4 items-start">
+              {/* Left: who, when, notes and the running total */}
+              <div className="lg:col-span-2 space-y-4">
+                <div>
+                  <label htmlFor="gf-to" className="cs-label">Given to</label>
+                  <input id="gf-to" value={f.recipient} onChange={(e) => setF((p) => ({ ...p, recipient: e.target.value }))} placeholder="e.g. Influencer name" autoFocus className="cs-input px-3 py-2.5" />
+                </div>
+                <div>
+                  <label htmlFor="gf-date" className="cs-label">Date given</label>
+                  <input id="gf-date" type="date" value={f.date} onChange={(e) => setF((p) => ({ ...p, date: e.target.value }))} required className="cs-input px-3 py-2.5" />
+                </div>
+                <div>
+                  <label htmlFor="gf-notes" className="cs-label">Notes (optional)</label>
+                  <input id="gf-notes" value={f.notes} onChange={(e) => setF((p) => ({ ...p, notes: e.target.value }))} placeholder="e.g. Payment for a video review" className="cs-input px-3 py-2.5" />
+                </div>
 
-            <div className="rounded-xl border border-[#2a2622] p-4 space-y-3">
-              <div className="text-xs uppercase tracking-wider text-[#a8a090]">Perfumes given</div>
-              {items.map((it, i) => (
-                <div key={it.key} className="grid grid-cols-12 gap-3 items-end">
-                  <div className="col-span-8 sm:col-span-8">
-                    <label htmlFor={`gf-size-${it.key}`} className={i === 0 ? 'cs-label' : 'sr-only'}>Perfume</label>
-                    <select
-                      id={`gf-size-${it.key}`}
-                      value={it.size}
-                      onChange={(e) => updateItem(it.key, { size: e.target.value })}
-                      className="cs-input px-3 py-2.5"
-                    >
-                      <option value="">Select perfume...</option>
-                      {options.map((o) => (
-                        <option key={o.id} value={o.id}>{o.label} - {pcs(o.onHand)} pcs on hand</option>
-                      ))}
-                    </select>
+                <LateEntryNotice date={f.date} reason={lateReason} onReason={setLateReason} id="gf-late" />
+
+                <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 grid grid-cols-2 gap-3 text-sm">
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider text-[#a8a090]">Pieces</div>
+                    <div className="font-mono">{pcs(totalPieces)}</div>
                   </div>
-                  <div className="col-span-3 sm:col-span-3">
-                    <label htmlFor={`gf-qty-${it.key}`} className={i === 0 ? 'cs-label' : 'sr-only'}>Pieces</label>
-                    <input
-                      id={`gf-qty-${it.key}`}
-                      type="number"
-                      min="1"
-                      step="1"
-                      value={it.qty}
-                      onChange={(e) => updateItem(it.key, { qty: e.target.value })}
-                      className="cs-input px-3 py-2.5 text-right"
-                    />
-                  </div>
-                  <div className="col-span-1 pb-2.5 text-right">
-                    {items.length > 1 && (
-                      <button type="button" onClick={() => removeItem(it.key)} className="text-[#a8a090] hover:text-[#e5736d] cursor-pointer" aria-label={`Remove perfume ${i + 1}`}>
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    )}
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider text-[#a8a090]">Estimated cost (average)</div>
+                    <div className="font-mono text-[#e3bf5a]">{peso(estCost)}</div>
                   </div>
                 </div>
-              ))}
-              <button type="button" onClick={() => setItems((prev) => [...prev, newItem()])} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs">
-                <PlusCircle className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>Add another perfume</span>
-              </button>
-            </div>
-
-            <div>
-              <label htmlFor="gf-notes" className="cs-label">Notes (optional)</label>
-              <input id="gf-notes" value={f.notes} onChange={(e) => setF((p) => ({ ...p, notes: e.target.value }))} placeholder="e.g. Payment for a video review" className="cs-input px-3 py-2.5" />
-            </div>
-
-            <LateEntryNotice date={f.date} reason={lateReason} onReason={setLateReason} id="gf-late" />
-
-            {totalPieces > 0 && (
-              <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-3 text-sm flex items-center justify-between">
-                <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">{pcs(totalPieces)} pcs · estimated cost (average)</span>
-                <span className="font-mono">{peso(estCost)}</span>
               </div>
-            )}
+
+              {/* Right: the perfumes given */}
+              <div className="lg:col-span-3 rounded-xl border border-[#2a2622] p-4 space-y-3">
+                <div className="text-xs uppercase tracking-wider text-[#a8a090]">Perfumes given</div>
+                {items.map((it, i) => (
+                  <div key={it.key} className="grid grid-cols-12 gap-2 items-center">
+                    <div className="col-span-8">
+                      <label htmlFor={`gf-size-${it.key}`} className="sr-only">Perfume {i + 1}</label>
+                      <select
+                        id={`gf-size-${it.key}`}
+                        value={it.size}
+                        onChange={(e) => updateItem(it.key, { size: e.target.value })}
+                        className="cs-input px-3 py-2.5"
+                      >
+                        <option value="">Select perfume...</option>
+                        {options.map((o) => (
+                          <option key={o.id} value={o.id}>{o.label} - {pcs(o.onHand)} pcs on hand</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="col-span-3">
+                      <label htmlFor={`gf-qty-${it.key}`} className="sr-only">Pieces for perfume {i + 1}</label>
+                      <input
+                        id={`gf-qty-${it.key}`}
+                        type="number"
+                        min="1"
+                        step="1"
+                        placeholder="Pcs"
+                        value={it.qty}
+                        onChange={(e) => updateItem(it.key, { qty: e.target.value })}
+                        className="cs-input px-3 py-2.5 text-right"
+                      />
+                    </div>
+                    <div className="col-span-1 flex justify-end">
+                      {items.length > 1 && (
+                        <button type="button" onClick={() => removeItem(it.key)} className="text-[#a8a090] hover:text-[#e5736d] cursor-pointer" aria-label={`Remove perfume ${i + 1}`}>
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                <button type="button" onClick={() => setItems((prev) => [...prev, newItem()])} className="cs-btn cs-btn-ghost px-3 py-1.5 text-xs">
+                  <PlusCircle className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>Add another perfume</span>
+                </button>
+              </div>
+            </div>
+
             <p className="text-[11px] text-[#a8a090]">
               Each perfume gets its own gift number. The pieces leave finished goods, oldest stock first, and the exact cost is charged to
               Marketing and Advertising. Nothing is recorded as a sale, and no customer balance changes. If one line cannot be saved, none are.
