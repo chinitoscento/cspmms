@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ClipboardCheck, RefreshCw, CheckCircle2, AlertTriangle, Search, ListChecks, ScrollText, FileSearch, Boxes, Archive, FileText, FileSpreadsheet } from 'lucide-react';
 import { supabase } from '../supabaseClient';
 import { EmptyState, PageHeader, ErrorNote, Modal, ModalActions, peso, fmtDate } from './ui';
-import { stockCountPdf, stockCountXlsx, reportFileName, saveBytes } from './stockCountExport';
+import { stockCountPdf, stockCountXlsx, reportFileName, saveBytes } from './StockCountExport';
 
 // ---------------------------------------------------------------------------
 // Audit (owner only). The checks are READ ONLY: they never save, edit or delete any record.
