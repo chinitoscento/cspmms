@@ -11,6 +11,7 @@ const BLANK = {
   address: '',
   notes: '',
   status: 'Active',
+  category: 'Retail',
   credit_allowed: false,
   credit_limit: '0',
   credit_days: '0',
@@ -82,6 +83,7 @@ export default function Customers({ user }) {
       address: row.address || '',
       notes: row.notes || '',
       status: row.status || 'Active',
+      category: row.category || 'Retail',
       credit_allowed: !!c?.credit_allowed,
       credit_limit: String(c?.credit_limit ?? 0),
       credit_days: String(c?.credit_days ?? 0),
@@ -106,6 +108,8 @@ export default function Customers({ user }) {
       address: nz(f.address),
       notes: nz(f.notes),
       status: f.status,
+      // the customer type decides the price list, so only the owner can set it
+      ...(isOwner ? { category: f.category } : {}),
     };
 
     let id = editing === 'new' ? null : editing.id;
@@ -148,7 +152,7 @@ export default function Customers({ user }) {
   const q = query.trim().toLowerCase();
   const shown = q
     ? rows.filter((r) =>
-        [r.name, r.contact_person, r.phone, r.email].some((v) => (v || '').toLowerCase().includes(q))
+        [r.name, r.contact_person, r.phone, r.email, r.category].some((v) => (v || '').toLowerCase().includes(q))
       )
     : rows;
 
@@ -182,7 +186,7 @@ export default function Customers({ user }) {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search name, contact, phone or email"
+              placeholder="Search name, contact, phone, email or type"
               aria-label="Search customers"
               className="cs-input px-3.5 py-2 text-sm flex-1"
             />
@@ -194,6 +198,7 @@ export default function Customers({ user }) {
                 <tr>
                   <th className="px-6 py-3 font-medium">Customer</th>
                   <th className="px-6 py-3 font-medium">Contact</th>
+                  <th className="px-6 py-3 font-medium">Type</th>
                   {isOwner && <th className="px-6 py-3 font-medium">Credit</th>}
                   <th className="px-6 py-3 font-medium">Status</th>
                   <th className="px-6 py-3 font-medium text-right">
@@ -213,6 +218,13 @@ export default function Customers({ user }) {
                       <td className="px-6 py-4 text-xs text-[#a8a090]">
                         <div>{r.phone || '-'}</div>
                         <div>{r.email || ''}</div>
+                      </td>
+                      <td className="px-6 py-4 text-xs">
+                        {r.category && r.category !== 'Retail' ? (
+                          <span className="inline-flex px-2.5 py-0.5 rounded-full text-[10px] font-medium border bg-[#d9b24c]/10 text-[#e3bf5a] border-[#d9b24c]/30">{r.category}</span>
+                        ) : (
+                          <span className="text-[#a8a090]">Retail</span>
+                        )}
                       </td>
                       {isOwner && (
                         <td className="px-6 py-4 text-xs">
@@ -263,6 +275,19 @@ export default function Customers({ user }) {
               <option value="Active">Active</option>
               <option value="Inactive">Inactive</option>
             </SelectField>
+
+            {isOwner && (
+              <div>
+                <SelectField id="c-category" label="Customer type (price list, owner only)" value={f.category} onChange={set('category')}>
+                  <option value="Retail">Retail (retail prices)</option>
+                  <option value="Reseller">Reseller (reseller prices)</option>
+                  <option value="Distributor">Distributor (distributor prices)</option>
+                </SelectField>
+                <p className="text-[11px] text-[#a8a090] mt-1">
+                  Sales to this customer start at the price list of their type. Set those prices in the Perfume Collection.
+                </p>
+              </div>
+            )}
 
             {isOwner && (
               <fieldset className="rounded-xl border border-[#2a2622] p-4 space-y-4">

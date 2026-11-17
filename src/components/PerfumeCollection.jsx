@@ -23,7 +23,7 @@ const BLANK = {
 
 let keySeed = 0;
 const newKey = () => `k${++keySeed}`;
-const blankSize = () => ({ key: newKey(), id: null, size_ml: '50', price: '0', is_active: true });
+const blankSize = () => ({ key: newKey(), id: null, size_ml: '50', price: '0', reseller: '0', distributor: '0', premix: false, is_active: true });
 
 export default function PerfumeCollection() {
   const [rows, setRows] = useState([]);
@@ -73,7 +73,16 @@ export default function PerfumeCollection() {
     });
     const existing = [...(row.perfume_sizes || [])]
       .sort((a, b) => Number(a.size_ml) - Number(b.size_ml))
-      .map((s) => ({ key: newKey(), id: s.id, size_ml: String(Number(s.size_ml)), price: String(Number(s.price)), is_active: s.is_active }));
+      .map((s) => ({
+        key: newKey(),
+        id: s.id,
+        size_ml: String(Number(s.size_ml)),
+        price: String(Number(s.price)),
+        reseller: String(Number(s.reseller_price || 0)),
+        distributor: String(Number(s.distributor_price || 0)),
+        premix: !!s.is_premix,
+        is_active: s.is_active,
+      }));
     setSizes(existing);
     setFormError('');
     setEditing(row);
@@ -93,7 +102,7 @@ export default function PerfumeCollection() {
       if (!(ml > 0)) return setFormError('Every size needs an amount in ml greater than zero.');
       if (seen.has(ml)) return setFormError(`The ${ml} ml size is listed twice.`);
       seen.add(ml);
-      if (Number(s.price) < 0) return setFormError('Prices cannot be negative.');
+      if (Number(s.price) < 0 || Number(s.reseller) < 0 || Number(s.distributor) < 0) return setFormError('Prices cannot be negative.');
     }
     if (editing === 'new' && sizes.length === 0) return setFormError('Add at least one size.');
 
@@ -132,7 +141,15 @@ export default function PerfumeCollection() {
     let sizeError = '';
     const toInsert = sizes
       .filter((s) => !s.id)
-      .map((s) => ({ perfume_id: perfumeId, size_ml: Number(s.size_ml), price: Number(s.price) || 0, is_active: s.is_active }));
+      .map((s) => ({
+        perfume_id: perfumeId,
+        size_ml: Number(s.size_ml),
+        price: Number(s.price) || 0,
+        reseller_price: Number(s.reseller) || 0,
+        distributor_price: Number(s.distributor) || 0,
+        is_premix: !!s.premix,
+        is_active: s.is_active,
+      }));
     if (toInsert.length) {
       const { error } = await supabase.from('perfume_sizes').insert(toInsert);
       if (error) sizeError = error.message;
@@ -140,7 +157,7 @@ export default function PerfumeCollection() {
     for (const s of sizes.filter((x) => x.id)) {
       const { error } = await supabase
         .from('perfume_sizes')
-        .update({ price: Number(s.price) || 0, is_active: s.is_active })
+        .update({ price: Number(s.price) || 0, reseller_price: Number(s.reseller) || 0, distributor_price: Number(s.distributor) || 0, is_active: s.is_active })
         .eq('id', s.id);
       if (error) sizeError = error.message;
     }
@@ -212,9 +229,26 @@ export default function PerfumeCollection() {
                       <p className="text-xs text-[#a8a090]">No active sizes</p>
                     ) : (
                       activeSizes.map((s) => (
-                        <div key={s.id} className="flex justify-between text-xs rounded-lg bg-[#1c1916] border border-[#2a2622] px-3 py-2">
-                          <span>{Number(s.size_ml)} ml</span>
-                          <span className="font-mono text-[#e3bf5a]">{peso(s.price)}</span>
+                        <div key={s.id} className="text-xs rounded-lg bg-[#1c1916] border border-[#2a2622] px-3 py-2">
+                          <div className="flex justify-between">
+                            <span>
+                              {Number(s.size_ml)} ml
+                              {s.is_premix && <span className="ml-2 text-[10px] uppercase tracking-wider text-[#e3bf5a]">PreMix</span>}
+                            </span>
+                            <span className="font-mono text-[#e3bf5a]">{peso(s.price)}</span>
+                          </div>
+                          {Number(s.reseller_price) > 0 && (
+                            <div className="flex justify-between text-[11px] text-[#a8a090] mt-0.5">
+                              <span>Reseller</span>
+                              <span className="font-mono">{peso(s.reseller_price)}</span>
+                            </div>
+                          )}
+                          {Number(s.distributor_price) > 0 && (
+                            <div className="flex justify-between text-[11px] text-[#a8a090] mt-0.5">
+                              <span>Distributor</span>
+                              <span className="font-mono">{peso(s.distributor_price)}</span>
+                            </div>
+                          )}
                         </div>
                       ))
                     )}
@@ -265,33 +299,72 @@ export default function PerfumeCollection() {
             <fieldset className="rounded-xl border border-[#2a2622] p-4 space-y-3">
               <legend className="px-2 text-xs uppercase tracking-wider text-[#e3bf5a]">Sizes and prices</legend>
               {sizes.map((s, i) => (
-                <div key={s.key} className="grid grid-cols-12 gap-3 items-end">
-                  <div className="col-span-4">
-                    <label htmlFor={`sz-ml-${s.key}`} className="cs-label">{i === 0 ? 'Size (ml)' : <span className="sr-only">Size (ml)</span>}</label>
-                    <input
-                      id={`sz-ml-${s.key}`}
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      value={s.size_ml}
-                      onChange={(e) => updateSize(s.key, { size_ml: e.target.value })}
-                      disabled={!!s.id}
-                      className="cs-input px-3 py-2.5"
-                    />
+                <div key={s.key} className="space-y-2 pb-3 border-b border-[#24201c] last:border-b-0 last:pb-0">
+                  <div className="grid grid-cols-12 gap-3 items-end">
+                    <div className="col-span-6 sm:col-span-3">
+                      <label htmlFor={`sz-ml-${s.key}`} className="cs-label">{i === 0 ? 'Size (ml)' : <span className="sr-only">Size (ml)</span>}</label>
+                      <input
+                        id={`sz-ml-${s.key}`}
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={s.size_ml}
+                        onChange={(e) => updateSize(s.key, { size_ml: e.target.value })}
+                        disabled={!!s.id}
+                        className="cs-input px-3 py-2.5"
+                      />
+                    </div>
+                    <div className="col-span-6 sm:col-span-3">
+                      <label htmlFor={`sz-price-${s.key}`} className="cs-label">{i === 0 ? 'Retail price (default, ₱)' : <span className="sr-only">Retail price (default, ₱)</span>}</label>
+                      <input
+                        id={`sz-price-${s.key}`}
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={s.price}
+                        onChange={(e) => updateSize(s.key, { price: e.target.value })}
+                        className="cs-input px-3 py-2.5"
+                      />
+                    </div>
+                    <div className="col-span-6 sm:col-span-3">
+                      <label htmlFor={`sz-res-${s.key}`} className="cs-label">{i === 0 ? 'Reseller price (₱)' : <span className="sr-only">Reseller price (₱)</span>}</label>
+                      <input
+                        id={`sz-res-${s.key}`}
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={s.reseller}
+                        onChange={(e) => updateSize(s.key, { reseller: e.target.value })}
+                        className="cs-input px-3 py-2.5"
+                      />
+                    </div>
+                    <div className="col-span-6 sm:col-span-3">
+                      <label htmlFor={`sz-dist-${s.key}`} className="cs-label">{i === 0 ? 'Distributor price (₱)' : <span className="sr-only">Distributor price (₱)</span>}</label>
+                      <input
+                        id={`sz-dist-${s.key}`}
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={s.distributor}
+                        onChange={(e) => updateSize(s.key, { distributor: e.target.value })}
+                        className="cs-input px-3 py-2.5"
+                      />
+                    </div>
                   </div>
-                  <div className="col-span-5">
-                    <label htmlFor={`sz-price-${s.key}`} className="cs-label">{i === 0 ? 'Selling price (₱)' : <span className="sr-only">Selling price</span>}</label>
-                    <input
-                      id={`sz-price-${s.key}`}
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      value={s.price}
-                      onChange={(e) => updateSize(s.key, { price: e.target.value })}
-                      className="cs-input px-3 py-2.5"
-                    />
-                  </div>
-                  <div className="col-span-3 flex items-center justify-end pb-2.5">
+                  <div className="flex items-center justify-between gap-3">
+                    {s.id ? (
+                      <p className="text-[11px] text-[#e3bf5a]">{s.premix ? 'PreMix: goes straight to Finished Goods after bottling.' : ''}</p>
+                    ) : (
+                      <label className="flex items-center gap-2 text-[11px] text-[#a8a090] cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={s.premix}
+                          onChange={(e) => updateSize(s.key, { premix: e.target.checked })}
+                          className="w-3.5 h-3.5 accent-[#d9b24c]"
+                        />
+                        <span>PreMix (bottle and label only, goes straight to Finished Goods after bottling)</span>
+                      </label>
+                    )}
                     {s.id ? (
                       <label className="flex items-center gap-2 text-xs cursor-pointer">
                         <input
@@ -324,7 +397,9 @@ export default function PerfumeCollection() {
                 <span>Add another size</span>
               </button>
               <p className="text-[11px] text-[#a8a090]">
-                A saved size cannot be deleted or changed in ml. Untick Active to stop selling it.
+                The retail price is the default. Reseller and distributor prices are used for customers of that type (set the type on the Customers page); a price of 0 there means the retail price is used.
+                You can change any price at any time. It applies to new sales only, and existing invoices keep the price they were sold at.
+                A saved size cannot be deleted or changed in ml, and a PreMix cannot be switched back later. Untick Active to stop selling it.
               </p>
             </fieldset>
 

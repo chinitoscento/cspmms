@@ -1,0 +1,30 @@
+-- 39_catalog_visuals.sql
+-- Lets the website show bottle colors, collection and description, and photos.
+-- Run AFTER 37. Replaces only the public_catalog() function; no table is changed.
+
+drop function if exists public.public_catalog();
+
+create function public.public_catalog()
+returns table (
+  size_id uuid, perfume_name text, size_ml numeric, price numeric, in_stock boolean,
+  sku text, collection text, description text, gender text,
+  liquid_color text, lettering_color text, bottle_style text
+)
+language sql stable security definer set search_path = public as $$
+  select s.size_id, s.perfume_name, s.size_ml, s.price, s.in_stock,
+         p.sku, p.collection, p.description, p.gender,
+         p.liquid_color, p.lettering_color, p.bottle_style
+  from cs_sellable_sizes() s
+  join perfume_sizes ps on ps.id = s.size_id
+  join perfumes p on p.id = ps.perfume_id
+  order by s.perfume_name, s.size_ml;
+$$;
+revoke all on function public.public_catalog() from public;
+grant execute on function public.public_catalog() to anon, authenticated;
+
+-- Public storage bucket for product photos (upload files named <sku>.jpg)
+insert into storage.buckets (id, name, public)
+values ('perfume-photos', 'perfume-photos', true)
+on conflict (id) do nothing;
+
+notify pgrst, 'reload schema';

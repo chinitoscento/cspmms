@@ -78,7 +78,7 @@ export default function Bottling({ user, onChanged, onNavigate, prefill }) {
     setLoading(true);
     setLoadError('');
     const [sz, inv, rn, rq, bs] = await Promise.all([
-      supabase.from('perfume_sizes').select('id, size_ml, perfume_id, perfumes(name, status)').eq('is_active', true),
+      supabase.from('perfume_sizes').select('id, size_ml, perfume_id, is_premix, perfumes(name, status)').eq('is_active', true),
       supabase.from('inventory_status').select('*'),
       supabase.from('bottling_runs').select('*, perfume_sizes(id, size_ml, perfumes(name))').order('run_no', { ascending: false }).limit(100),
       supabase.from('bottling_requests').select('*, perfume_sizes(id, size_ml, perfumes(name))').in('status', ['Pending', 'Rejected']).order('request_no', { ascending: false }).limit(20),
@@ -189,7 +189,13 @@ export default function Bottling({ user, onChanged, onNavigate, prefill }) {
     setSaving(false);
     if (error) return setBtError(error.message);
     setBtOpen(false);
-    setNotice(data?.status === 'Pending' ? 'Sent to the owner for approval. Nothing is posted until it is approved.' : '');
+    setNotice(
+      data?.status === 'Pending'
+        ? 'Sent to the owner for approval. Nothing is posted until it is approved.'
+        : btSize?.is_premix
+          ? 'PreMix bottled and added straight to Finished Goods. No packaging step is needed.'
+          : ''
+    );
     await afterChange();
   };
 
@@ -409,9 +415,14 @@ export default function Bottling({ user, onChanged, onNavigate, prefill }) {
                 <select id="bt-size" value={bt.size} onChange={(e) => setBt((p) => ({ ...p, size: e.target.value }))} className="cs-input px-3 py-2.5">
                   <option value="">Select...</option>
                   {visibleSizes.map((s) => (
-                    <option key={s.id} value={s.id}>{s.perfumes.name} · {qty(s.size_ml)} ml</option>
+                    <option key={s.id} value={s.id}>{s.perfumes.name} · {qty(s.size_ml)} ml{s.is_premix ? ' (PreMix)' : ''}</option>
                   ))}
                 </select>
+                {btSize?.is_premix && (
+                  <p className="mt-1.5 text-[11px] text-[#e3bf5a]">
+                    PreMix: once bottled it goes straight into Finished Goods. No packaging step is needed.
+                  </p>
+                )}
                 {btPerfume && (
                   <button type="button" onClick={() => setBtPerfume('')} className="mt-1.5 text-[11px] text-[#e3bf5a] hover:underline cursor-pointer">
                     Show all perfumes

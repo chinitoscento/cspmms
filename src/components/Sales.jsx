@@ -105,7 +105,6 @@ export default function Sales({ user, onChanged }) {
   const [sf, setSf] = useState({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', downRef: '', lines: [] });
   const [sQuery, setSQuery] = useState(''); // perfume search in the New Sale picker
   const [sError, setSError] = useState('');
-  const [sFilter, setSFilter] = useState({ customer: '', from: '', to: '' }); // filters for the sales table
 
   // new return / exchange
   const [rOpen, setROpen] = useState(false);
@@ -129,9 +128,9 @@ export default function Sales({ user, onChanged }) {
     setLoading(true);
     setLoadError('');
     const calls = [
-      supabase.from('perfume_sizes').select('id, size_ml, price, is_active, perfume_id, perfumes(name, status)'),
+      supabase.from('perfume_sizes').select('id, size_ml, price, reseller_price, distributor_price, is_premix, is_active, perfume_id, perfumes(name, status)'),
       supabase.from('inventory_status').select('*').eq('kind', 'finished'),
-      supabase.from('customers').select('id, name, address, status').order('name'),
+      supabase.from('customers').select('id, name, address, status, category').order('name'),
       supabase.from('sales').select('*, customers(name, address), sale_lines(*)').order('sale_no', { ascending: false }).limit(200),
       supabase.from('sales_returns').select('*, sales(sale_no, invoice_no, payment_type, customers(name))').order('return_no', { ascending: false }).limit(200),
     ];
@@ -175,7 +174,7 @@ export default function Sales({ user, onChanged }) {
   };
 
   const sizeById = useMemo(() => Object.fromEntries(allSizes.map((s) => [s.id, s])), [allSizes]);
-  const sizeName = (id) => (sizeById[id] ? `${sizeById[id].perfumes?.name} · ${qty(sizeById[id].size_ml)} ml` : '-');
+  const sizeName = (id) => (sizeById[id] ? `${sizeById[id].perfumes?.name} · ${qty(sizeById[id].size_ml)} ml${sizeById[id].is_premix ? ' PreMix' : ''}` : '-');
   const onHand = useMemo(() => Object.fromEntries(stock.map((r) => [r.item_id, Number(r.on_hand || 0)])), [stock]);
   const sellable = useMemo(
     () =>
@@ -196,18 +195,31 @@ export default function Sales({ user, onChanged }) {
   // price on a sale line: starts at the collection price, staff can change it
   const linePrice = (l) => (l.price === '' ? 0 : Number(l.price) || 0);
   const listOf = (l) => Number(sizeById[l.size]?.price || 0);
-  const saleById = useMemo(() => Object.fromEntries(sales.map((s) => [s.id, s])), [sales]);
-  const shownSales = useMemo(
-    () =>
-      sales.filter((s) => {
-        if (sFilter.customer === 'walkin' && s.customer_id) return false;
-        if (sFilter.customer && sFilter.customer !== 'walkin' && s.customer_id !== sFilter.customer) return false;
-        if (sFilter.from && s.sale_date < sFilter.from) return false;
-        if (sFilter.to && s.sale_date > sFilter.to) return false;
-        return true;
+  // Price list: follows the customer's type (retail, reseller or distributor). A price of 0 on a list means "use the retail price".
+  // The list price on the invoice stays the retail price, so a reseller price shows as a price below the retail price.
+  const tierOf = (customerId) => (customers.find((c) => c.id === customerId)?.category || 'Retail').toLowerCase();
+  const priceIn = (s, tier) => {
+    const t = tier === 'reseller' ? Number(s.reseller_price || 0) : tier === 'distributor' ? Number(s.distributor_price || 0) : 0;
+    return t > 0 ? t : Number(s.price || 0);
+  };
+  const sTier = tierOf(sf.customer);
+  const priceOf = (s) => priceIn(s, sTier);
+  // choosing another customer can change the price list: lines still at the old list price move to the new one,
+  // lines whose price was changed by hand stay as they are
+  const applyCustomer = (p, id) => {
+    const from = tierOf(p.customer);
+    const to = tierOf(id);
+    if (from === to) return { ...p, customer: id };
+    return {
+      ...p,
+      customer: id,
+      lines: p.lines.map((l) => {
+        const sz = sizeById[l.size];
+        return sz && Number(l.price) === priceIn(sz, from) ? { ...l, price: String(priceIn(sz, to)) } : l;
       }),
-    [sales, sFilter]
-  );
+    };
+  };
+  const saleById = useMemo(() => Object.fromEntries(sales.map((s) => [s.id, s])), [sales]);
 
   // How a damaged refund is settled. Approved returns show what was booked.
   // On a credit sale the refund first lowers what the customer still owes on that invoice;
@@ -290,9 +302,9 @@ export default function Sales({ user, onChanged }) {
       const have = onHand[s.id] || 0;
       if (have <= 0) return p; // nothing in stock, whatever the payment type
       if (!sIsCredit && planned >= have) return p; // cash and bank sales cannot go past the stock
-      const same = p.lines.find((l) => l.size === s.id && Number(l.price) === Number(s.price));
+      const same = p.lines.find((l) => l.size === s.id && Number(l.price) === priceOf(s));
       if (same) return { ...p, lines: p.lines.map((l) => (l === same ? { ...l, qty: String((parseInt(l.qty, 10) || 0) + 1) } : l)) };
-      return { ...p, lines: [...p.lines, newLine(s.id, String(s.price))] };
+      return { ...p, lines: [...p.lines, newLine(s.id, String(priceOf(s)))] };
     });
   };
   const stepLine = (l, delta) => {
@@ -688,38 +700,6 @@ export default function Sales({ user, onChanged }) {
       {loading ? (
         <p className="text-sm text-[#a8a090]">Loading...</p>
       ) : tab === 'sales' ? (
-        <div>
-          {sales.length > 0 && (
-            <div className="flex flex-wrap items-end gap-3 mb-4">
-              <div className="w-full sm:w-64">
-                <label htmlFor="sf-customer" className="cs-label">Customer</label>
-                <select id="sf-customer" value={sFilter.customer} onChange={(e) => setSFilter((f) => ({ ...f, customer: e.target.value }))} className="cs-input px-3 py-2.5">
-                  <option value="">All customers</option>
-                  <option value="walkin">Walk-in (no customer)</option>
-                  {customers.map((c) => (
-                    <option key={c.id} value={c.id}>{c.name}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="sf-from" className="cs-label">From</label>
-                <input id="sf-from" type="date" value={sFilter.from} max={sFilter.to || undefined} onChange={(e) => setSFilter((f) => ({ ...f, from: e.target.value }))} className="cs-input px-3 py-2.5" />
-              </div>
-              <div>
-                <label htmlFor="sf-to" className="cs-label">To</label>
-                <input id="sf-to" type="date" value={sFilter.to} min={sFilter.from || undefined} onChange={(e) => setSFilter((f) => ({ ...f, to: e.target.value }))} className="cs-input px-3 py-2.5" />
-              </div>
-              {(sFilter.customer || sFilter.from || sFilter.to) && (
-                <>
-                  <button type="button" onClick={() => setSFilter({ customer: '', from: '', to: '' })} className="cs-btn cs-btn-ghost px-4 py-2.5 text-sm">Clear</button>
-                  <p className="text-xs text-[#a8a090] pb-3 sm:ml-auto">
-                    {shownSales.length} of {sales.length} sales · Posted total {peso(shownSales.filter((s) => s.status === 'Posted').reduce((t, s) => t + Number(s.total), 0))}
-                    {sales.length >= 200 && ' · searching the latest 200 sales only'}
-                  </p>
-                </>
-              )}
-            </div>
-          )}
         <div className="cs-card overflow-hidden">
           {sales.length === 0 ? (
             <EmptyState icon={ShoppingBag} title="No sales yet" text="Cash and bank sales post at once. Credit sales wait for the owner's approval." actionLabel="New Sale" onAction={openSale} />
@@ -739,12 +719,7 @@ export default function Sales({ user, onChanged }) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#24201c]">
-                  {shownSales.length === 0 && (
-                    <tr className="bg-[#141210]">
-                      <td colSpan={8} className="px-4 py-8 text-center text-sm text-[#a8a090]">No sales match these filters.</td>
-                    </tr>
-                  )}
-                  {shownSales.map((s) => {
+                  {sales.map((s) => {
                     const left = s.due_date ? daysUntil(s.due_date) : null;
                     return (
                       <tr key={s.id} className={`bg-[#141210] hover:bg-[#1c1916] transition-colors ${s.status === 'Voided' || s.status === 'Rejected' ? 'opacity-60' : ''}`}>
@@ -753,7 +728,10 @@ export default function Sales({ user, onChanged }) {
                           <div className="text-xs text-[#a8a090] mt-0.5">{fmtDate(s.sale_date)}</div>
                         </td>
                         <td className="px-4 py-3">{s.customers?.name || <span className="text-[#a8a090]">Walk-in</span>}</td>
-                        <td className="px-4 py-3 text-xs">{PAY[s.payment_type]}</td>
+                        <td className="px-4 py-3 text-xs">
+                          {PAY[s.payment_type]}
+                          {s.price_tier && s.price_tier !== 'retail' && <div className="text-[10px] text-[#e3bf5a] capitalize">{s.price_tier}</div>}
+                        </td>
                         <td className="px-4 py-3 text-right font-mono">
                           {peso(s.total)}
                           {s.payment_type === 'credit' && Number(s.down_payment) > 0 && <div className="text-[10px] text-[#3ecf8e]">{peso(s.down_payment)} paid upfront</div>}
@@ -818,7 +796,6 @@ export default function Sales({ user, onChanged }) {
               </table>
             </div>
           )}
-        </div>
         </div>
       ) : (
         <div className="cs-card overflow-hidden">
@@ -922,7 +899,7 @@ export default function Sales({ user, onChanged }) {
                           name="s-pay"
                           value={val}
                           checked={sf.pay === val}
-                          onChange={() => setSf((p) => ({ ...p, pay: val, customer: val === 'credit' && !credit[p.customer]?.credit_allowed && isOwner ? '' : p.customer }))}
+                          onChange={() => setSf((p) => applyCustomer({ ...p, pay: val }, val === 'credit' && !credit[p.customer]?.credit_allowed && isOwner ? '' : p.customer))}
                           className="sr-only"
                         />
                         {label}
@@ -939,12 +916,13 @@ export default function Sales({ user, onChanged }) {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label htmlFor="s-customer" className="cs-label">Customer{sIsCredit ? '' : ' (optional)'}</label>
-                  <select id="s-customer" value={sf.customer} onChange={(e) => setSf((p) => ({ ...p, customer: e.target.value }))} className="cs-input px-3 py-2">
+                  <select id="s-customer" value={sf.customer} onChange={(e) => setSf((p) => applyCustomer(p, e.target.value))} className="cs-input px-3 py-2">
                     <option value="">{sIsCredit ? 'Select customer...' : 'Walk-in customer'}</option>
                     {customerOptions.map((c) => (
                       <option key={c.id} value={c.id}>{c.name}</option>
                     ))}
                   </select>
+                  {sTier !== 'retail' && <p className="text-[11px] text-[#e3bf5a] mt-1 capitalize">{sTier} prices apply to this customer</p>}
                   {sIsCredit && isOwner && customerOptions.length === 0 && (
                     <p className="text-[11px] text-[#e5a93d] mt-1">No customer is allowed credit yet. Turn it on in Customers.</p>
                   )}
@@ -967,7 +945,7 @@ export default function Sales({ user, onChanged }) {
                     <div className="flex flex-wrap gap-1.5">
                       {g.sizes.map((s) => {
                         const have = onHand[s.id] || 0;
-                        const noPrice = !(Number(s.price) > 0);
+                        const noPrice = !(priceOf(s) > 0);
                         const inSale = needBySize[s.id] || 0;
                         const off = noPrice || have <= 0; // greyed out and not tappable, whatever the payment type
                         const stockTone = have <= 0 ? 'text-[#e5736d]' : have <= 5 ? 'text-[#e5a93d]' : 'text-[#a8a090]';
@@ -978,14 +956,14 @@ export default function Sales({ user, onChanged }) {
                             disabled={off}
                             title={noPrice ? 'No price set' : have <= 0 ? 'Out of stock' : undefined}
                             onClick={() => tapSize(s)}
-                            aria-label={`Add ${g.name} ${qty(s.size_ml)} ml${noPrice ? ', no price set' : `, ${peso(s.price)}, ${qty(have)} in stock`}`}
+                            aria-label={`Add ${g.name} ${qty(s.size_ml)} ml${s.is_premix ? ' PreMix' : ''}${noPrice ? ', no price set' : `, ${peso(priceOf(s))}, ${qty(have)} in stock`}`}
                             className={`relative rounded-md border px-2 py-1 text-center leading-tight transition-colors cursor-pointer disabled:cursor-not-allowed ${inSale > 0 ? 'border-[#d9b24c] bg-[#1f1b12]' : off ? 'border-dashed border-[#2a2622] bg-[#14120f] opacity-45 grayscale' : 'border-[#2a2622] bg-[#181613] hover:border-[#d9b24c]'}`}
                           >
                             {inSale > 0 && (
                               <span className="absolute -top-2 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-[#d9b24c] text-[#0e0d0c] text-[10px] font-semibold flex items-center justify-center">{inSale}</span>
                             )}
                             <span className="block text-xs font-medium whitespace-nowrap">
-                              {qty(s.size_ml)} ml <span className="font-mono text-[#e3bf5a]">{noPrice ? '-' : peso(s.price)}</span>
+                              {qty(s.size_ml)} ml{s.is_premix ? ' PreMix' : ''} <span className="font-mono text-[#e3bf5a]">{noPrice ? '-' : peso(priceOf(s))}</span>
                             </span>
                             <span className={`block text-[10px] ${noPrice ? 'text-[#a8a090]' : stockTone}`}>{noPrice ? 'no price set' : have <= 0 ? 'out of stock' : `${qty(have)} left`}</span>
                           </button>
@@ -1040,7 +1018,9 @@ export default function Sales({ user, onChanged }) {
                             {l.size && list > 0 && price > 0 && price !== list && (
                               <div className={`mt-1 text-[10px] ${price < list ? 'text-[#e5a93d]' : 'text-[#a8a090]'}`}>
                                 {price < list
-                                  ? `Discount of ${peso(list - price)} per piece (${(((list - price) / list) * 100).toFixed(1)}% off the collection price of ${peso(list)})`
+                                  ? sTier !== 'retail' && price === priceIn(sizeById[l.size], sTier)
+                                    ? `${sTier.charAt(0).toUpperCase() + sTier.slice(1)} price, ${peso(list - price)} below the retail price of ${peso(list)}`
+                                    : `Discount of ${peso(list - price)} per piece (${(((list - price) / list) * 100).toFixed(1)}% off the collection price of ${peso(list)})`
                                   : `${peso(price - list)} above the collection price of ${peso(list)}`}
                               </div>
                             )}
