@@ -1,0 +1,149 @@
+-- =====================================================================
+-- Chinito Scento - a paid website order records its sale automatically.
+-- Run AFTER 37_order_requests.sql (and 09_sales.sql, which you already have).
+-- Safe to re-run. Run in the Supabase SQL Editor.
+--
+-- What "Mark as paid" now does (one step, all or nothing)
+--   1. Records the sale through your existing record_sale(): same rules, same books.
+--        Dr Cash (1010) or Bank (1020)   Cr Sales (4000)
+--        Dr Cost of Goods Sold (5000)    Cr Finished Goods (1330)
+--      Stock leaves Finished Goods oldest first, and an invoice is issued.
+--   2. Flags the order as paid and links it to the sale.
+--   If anything fails (for example not enough stock), NOTHING is saved and the order stays
+--   unpaid, with a clear message.
+--
+-- Prices: the prices the customer saw on the website, kept on the order.
+-- Customer: matched to your Customers list by mobile number (last 10 digits, so 0917... and +63917...
+--           are the same person). No match: the customer is added as Retail, Active. The sale is
+--           recorded under that customer, and the payment reference is written in the sale's notes.
+-- E-wallets (GCash, Maya): recorded as a bank-transfer sale, like any other transfer.
+--
+-- Undoing (owner only): "Mark as unpaid" voids the sale (stock returns, books reversed) and the
+-- order becomes unpaid again. An influencer commission follows the order automatically.
+-- A paid order cannot be cancelled until the owner marks it unpaid.
+-- =====================================================================
+
+-- ---------- 1. What was paid, and the sale it created -----------------
+alter table public.order_requests
+  add column if not exists pay_method text check (pay_method in ('cash','bank')),
+  add column if not exists pay_ref text,
+  add column if not exists sale_id uuid references public.sales(id),
+  add column if not exists customer_id uuid references public.customers(id);
+
+-- ---------- 2. Mark an order as paid (records the sale) ---------------
+create or replace function public.mark_order_paid(p_id uuid, p_method text, p_reference text default null)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  r public.order_requests;
+  v_lines jsonb;
+  v_notes text;
+  v_sale uuid;
+  v_cust uuid;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_method is null or p_method not in ('cash','bank') then raise exception 'Choose how the customer paid.'; end if;
+  if p_method = 'bank' and coalesce(trim(p_reference), '') = '' then
+    raise exception 'Enter the bank or e-wallet reference number.';
+  end if;
+
+  select * into r from public.order_requests where id = p_id for update;
+  if not found then raise exception 'Order request not found.'; end if;
+  if r.status = 'Cancelled' then raise exception 'A cancelled order cannot be paid.'; end if;
+  if r.sale_id is not null then raise exception 'This order is already paid and recorded as a sale.'; end if;
+
+  select jsonb_agg(jsonb_build_object('size_id', l.size_id, 'qty', l.qty, 'unit_price', l.unit_price) order by l.id)
+    into v_lines
+    from public.order_request_lines l
+   where l.request_id = p_id;
+  if v_lines is null then raise exception 'This order has no items.'; end if;
+
+  -- the customer: matched by mobile number, otherwise added to Customers as Retail
+  select c.id into v_cust
+    from public.customers c
+   where c.status = 'Active'
+     and length(regexp_replace(coalesce(c.phone, ''), '\D', '', 'g')) >= 7
+     and right(regexp_replace(coalesce(c.phone, ''), '\D', '', 'g'), 10) = right(r.contact_digits, 10)
+   order by c.created_at
+   limit 1;
+  if v_cust is null then
+    insert into public.customers (id, name, phone, email, address, notes, status, category, created_by, created_at)
+    values (gen_random_uuid(), r.name, r.contact, r.email, r.address,
+            'Added from website order WR-' || lpad(r.request_no::text, 4, '0'), 'Active', 'Retail', auth.uid(), now())
+    returning id into v_cust;
+  end if;
+
+  v_notes := 'Website order WR-' || lpad(r.request_no::text, 4, '0') || ' - ' || r.name || ' (' || r.contact || ')'
+             || case when p_method = 'bank' then ' - Ref ' || trim(p_reference) else '' end;
+
+  -- the existing sales function does the stock, the invoice and the books
+  v_sale := public.record_sale(
+              p_date     => (now() at time zone 'Asia/Manila')::date,
+              p_customer => v_cust,
+              p_payment  => p_method,
+              p_notes    => v_notes,
+              p_lines    => v_lines);
+
+  perform set_config('cs.order_pay_rpc', '1', true);   -- tells the guard below this change is allowed
+  update public.order_requests
+     set paid = true, pay_method = p_method, pay_ref = nullif(trim(coalesce(p_reference, '')), ''), sale_id = v_sale, customer_id = v_cust
+   where id = p_id;
+
+  return v_sale;
+end;
+$$;
+
+-- ---------- 3. Mark an order as unpaid (owner only; voids the sale) ---
+create or replace function public.mark_order_unpaid(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  r public.order_requests;
+begin
+  if not public.is_owner() then raise exception 'Only the owner can undo a payment.'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'Please give a reason.'; end if;
+
+  select * into r from public.order_requests where id = p_id for update;
+  if not found then raise exception 'Order request not found.'; end if;
+  if not r.paid and r.sale_id is null then raise exception 'This order is not marked as paid.'; end if;
+
+  if r.sale_id is not null then
+    perform public.void_sale(r.sale_id, 'Website order WR-' || lpad(r.request_no::text, 4, '0') || ' marked unpaid: ' || trim(p_reason));
+  end if;
+
+  perform set_config('cs.order_pay_rpc', '1', true);
+  update public.order_requests set paid = false, pay_method = null, pay_ref = null, sale_id = null, customer_id = null where id = p_id;
+end;
+$$;
+
+-- ---------- 4. Guard: payment only changes through the two functions ---
+-- Stops "paid" being switched on without a sale, and a paid order being cancelled
+-- while its sale and money are still on the books.
+create or replace function public.cs_guard_order_paid() returns trigger
+language plpgsql as $$
+begin
+  if (new.paid is distinct from old.paid or new.sale_id is distinct from old.sale_id)
+     and coalesce(current_setting('cs.order_pay_rpc', true), '') <> '1' then
+    raise exception 'Use Mark as paid on the Website Orders page. It records the payment and the sale together.';
+  end if;
+  if new.status = 'Cancelled' and old.status <> 'Cancelled' and (new.paid or new.sale_id is not null) then
+    raise exception 'This order is paid. The owner must mark it as unpaid first, then it can be cancelled.';
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists cs_guard_order_paid on public.order_requests;
+create trigger cs_guard_order_paid before update on public.order_requests
+for each row execute function public.cs_guard_order_paid();
+
+-- ---------- 5. Permissions ---------------------------------------------
+revoke all on function public.mark_order_paid(uuid,text,text) from public, anon;
+revoke all on function public.mark_order_unpaid(uuid,text) from public, anon;
+grant execute on function public.mark_order_paid(uuid,text,text) to authenticated;
+grant execute on function public.mark_order_unpaid(uuid,text) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- Checks (run one at a time) -----------------------------------
+-- select request_no, status, paid, pay_method, pay_ref, sale_id from public.order_requests order by request_no desc limit 10;
+-- select s.sale_no, s.invoice_no, s.total, s.status, s.notes from public.sales s order by s.sale_no desc limit 5;

@@ -157,3 +157,5 @@ begin
 end $$;
 revoke all on function public.submit_order_request(text,text,text,text,text,jsonb,text,text) from public;
 grant execute on function public.submit_order_request(text,text,text,text,text,jsonb,text,text) to anon, authenticated;
+
+notify pgrst, 'reload schema';

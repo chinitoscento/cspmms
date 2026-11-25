@@ -1,0 +1,196 @@
+-- =====================================================================
+-- 42_stock_writeoffs_multi.sql
+-- One write-off entry can now hold SEVERAL items, from any stage of stock:
+--   Raw material | Produced juice | Bottled | Packed (finished goods)
+-- Run after 08_stock_writeoffs.sql. Safe to re-run. Run in the Supabase SQL Editor.
+--
+-- Each entry keeps ONE WO number and ONE journal entry:
+--   Dr 5120 Inventory Write-off (Spillage/Damage)   (the total cost)
+--   Cr 1200 Oils | 1210 Solvent | 1220 Packaging materials   (raw materials, by category)
+--   Cr 1310 Matured juice | 1320 Bottled perfume | 1330 Finished goods
+-- Stock leaves oldest first at its exact cost. If any line fails (for example not enough
+-- stock), nothing at all is saved.
+--
+-- Existing write-offs are kept and shown as entries with one line each.
+-- Voiding (owner only) works exactly as before and now returns every line's stock
+-- and reverses the entry's journal entry.
+-- =====================================================================
+
+-- ---------- 1. The lines of an entry -----------------------------------
+create table if not exists public.stock_writeoff_lines (
+  id           uuid primary key default gen_random_uuid(),
+  writeoff_id  uuid not null references public.stock_writeoffs(id) on delete cascade,
+  line_no      int not null,
+  stock_kind   text not null check (stock_kind in ('material','juice','bottled','finished')),
+  material_id  uuid references public.materials(id),
+  perfume_id   uuid references public.perfumes(id),
+  size_id      uuid references public.perfume_sizes(id),
+  qty          numeric(14,3) not null check (qty > 0),
+  cost         numeric(14,2) not null check (cost >= 0),
+  reason       text not null check (reason in ('spilled','broken','expired','contaminated','other')),
+  notes        text,
+  check (
+       (stock_kind = 'material' and material_id is not null and perfume_id is null and size_id is null)
+    or (stock_kind = 'juice'    and perfume_id  is not null and material_id is null and size_id is null)
+    or (stock_kind in ('bottled','finished') and size_id is not null and material_id is null and perfume_id is null)
+  )
+);
+create index if not exists stock_writeoff_lines_writeoff_idx on public.stock_writeoff_lines (writeoff_id);
+
+-- Existing write-offs become entries with one line each (only once)
+insert into public.stock_writeoff_lines (writeoff_id, line_no, stock_kind, material_id, qty, cost, reason)
+select w.id, 1, 'material', w.material_id, w.qty, w.cost, w.reason
+  from public.stock_writeoffs w
+ where w.material_id is not null
+   and not exists (select 1 from public.stock_writeoff_lines l where l.writeoff_id = w.id);
+
+-- The entry itself no longer needs to name one material, quantity and reason
+alter table public.stock_writeoffs
+  alter column material_id drop not null,
+  alter column qty drop not null,
+  alter column reason drop not null;
+
+-- ---------- 2. Record an entry with many items -------------------------
+-- p_lines: [{ "kind": "material|juice|bottled|finished", "item": "<id>", "qty": 2,
+--             "reason": "spilled|broken|expired|contaminated|other", "notes": "..." }]
+--   material -> item is the material id        juice -> item is the perfume id
+--   bottled / finished -> item is the perfume size id
+create or replace function public.record_writeoff(p_date date, p_notes text, p_lines jsonb)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid := gen_random_uuid();
+  v_no bigint;
+  v_date date := coalesce(p_date, current_date);
+  v_label text;
+  it jsonb;
+  v_n int := 0;
+  v_kind text;
+  v_item uuid;
+  v_qty numeric;
+  v_reason text;
+  v_lnotes text;
+  v_mat public.materials;
+  v_pf public.perfumes;
+  v_sz public.perfume_sizes;
+  v_acct text;
+  v_name text;
+  v_cost numeric(14,2);
+  v_total numeric(14,2) := 0;
+  v_acc jsonb := '{}'::jsonb;
+  v_lines jsonb;
+  v_je uuid;
+  k text;
+begin
+  if not public.is_active_user() then raise exception 'Not allowed.'; end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+    raise exception 'Add at least one item to write off.';
+  end if;
+  if jsonb_array_length(p_lines) > 40 then raise exception 'Too many items in one write-off.'; end if;
+
+  v_no := nextval('public.writeoff_no_seq');
+  v_label := 'WO-' || lpad(v_no::text, 8, '0');
+
+  insert into public.stock_writeoffs (id, writeoff_no, writeoff_date, cost, notes)
+  values (v_id, v_no, v_date, 0, nullif(trim(coalesce(p_notes, '')), ''));
+
+  for it in select * from jsonb_array_elements(p_lines) loop
+    v_n := v_n + 1;
+    v_kind := it->>'kind';
+    v_item := nullif(it->>'item', '')::uuid;
+    v_qty := (it->>'qty')::numeric;
+    v_reason := it->>'reason';
+    v_lnotes := nullif(trim(coalesce(it->>'notes', '')), '');
+
+    if v_qty is null or v_qty <= 0 then raise exception 'Line %: enter the quantity lost.', v_n; end if;
+    if v_reason is null or v_reason not in ('spilled','broken','expired','contaminated','other') then
+      raise exception 'Line %: choose what happened.', v_n;
+    end if;
+    if v_reason = 'other' and v_lnotes is null then raise exception 'Line %: describe what happened.', v_n; end if;
+    if v_kind in ('bottled','finished') and v_qty <> trunc(v_qty) then
+      raise exception 'Line %: enter whole pieces.', v_n;
+    end if;
+
+    if v_kind = 'material' then
+      select * into v_mat from public.materials where id = v_item and is_active;
+      if not found then raise exception 'Line %: choose a raw material.', v_n; end if;
+      v_acct := case v_mat.category when 'oil' then '1200' when 'solvent' then '1210' else '1220' end;
+      v_name := v_mat.name;
+    elsif v_kind = 'juice' then
+      select * into v_pf from public.perfumes where id = v_item;
+      if not found then raise exception 'Line %: choose a perfume.', v_n; end if;
+      v_acct := '1310';
+      v_name := v_pf.name || ' (matured juice)';
+    elsif v_kind in ('bottled','finished') then
+      select * into v_sz from public.perfume_sizes where id = v_item;
+      if not found then raise exception 'Line %: choose a perfume size.', v_n; end if;
+      select * into v_pf from public.perfumes where id = v_sz.perfume_id;
+      v_acct := case v_kind when 'bottled' then '1320' else '1330' end;
+      v_name := v_pf.name || ' ' || v_sz.size_ml || ' ml (' || case v_kind when 'bottled' then 'bottled' else 'packed' end || ')';
+    else
+      raise exception 'Line %: choose the section.', v_n;
+    end if;
+
+    begin
+      v_cost := public.stock_out(v_kind, v_item, v_qty, v_date, 'writeoff', v_id);
+    exception when others then
+      raise exception '%: %', v_name, sqlerrm;   -- names the item, and nothing at all is saved
+    end;
+    if v_cost <= 0 then raise exception '%: this stock has no recorded cost, so there is nothing to write off.', v_name; end if;
+
+    insert into public.stock_writeoff_lines (writeoff_id, line_no, stock_kind, material_id, perfume_id, size_id, qty, cost, reason, notes)
+    values (v_id, v_n, v_kind,
+            case when v_kind = 'material' then v_item end,
+            case when v_kind = 'juice' then v_item end,
+            case when v_kind in ('bottled','finished') then v_item end,
+            v_qty, v_cost, v_reason, v_lnotes);
+
+    v_total := v_total + v_cost;
+    v_acc := jsonb_set(v_acc, array[v_acct], to_jsonb(coalesce((v_acc->>v_acct)::numeric, 0) + v_cost));
+  end loop;
+
+  v_lines := jsonb_build_array(jsonb_build_object('account_code', '5120', 'debit', v_total, 'memo', 'Write-off ' || v_label));
+  for k in select jsonb_object_keys(v_acc) loop
+    v_lines := v_lines || jsonb_build_array(jsonb_build_object('account_code', k, 'credit', (v_acc->>k)::numeric, 'memo', 'Stock written off'));
+  end loop;
+
+  v_je := public.post_module_entry(
+    v_date, v_label,
+    'Stock write-off ' || v_label || ' - ' || v_n || ' item(s)',
+    v_lines, 'writeoff', v_id);
+
+  update public.stock_writeoffs set cost = v_total, journal_entry_id = v_je where id = v_id;
+  return v_id;
+end;
+$$;
+
+-- The old one-item function now simply uses the new one, so nothing that still calls it can
+-- create an entry without lines.
+create or replace function public.record_stock_writeoff(
+  p_date date, p_material uuid, p_qty numeric, p_reason text, p_notes text
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+begin
+  return public.record_writeoff(
+    p_date, null,
+    jsonb_build_array(jsonb_build_object('kind', 'material', 'item', p_material, 'qty', p_qty, 'reason', p_reason, 'notes', p_notes)));
+end;
+$$;
+
+-- ---------- 3. Security -------------------------------------------------
+alter table public.stock_writeoff_lines enable row level security;
+drop policy if exists writeoff_lines_read on public.stock_writeoff_lines;
+create policy writeoff_lines_read on public.stock_writeoff_lines for select using (public.is_active_user());
+revoke insert, update, delete on public.stock_writeoff_lines from anon, authenticated;
+
+revoke all on function public.record_writeoff(date,text,jsonb) from public, anon;
+grant execute on function public.record_writeoff(date,text,jsonb) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- ---------- Checks (run one at a time) ------------------------------------
+-- select w.writeoff_no, w.cost, l.line_no, l.stock_kind, l.qty, l.cost, l.reason
+--   from public.stock_writeoffs w join public.stock_writeoff_lines l on l.writeoff_id = w.id
+--  order by w.writeoff_no desc, l.line_no;
+-- select count(*) as entries_without_lines from public.stock_writeoffs w
+--  where not exists (select 1 from public.stock_writeoff_lines l where l.writeoff_id = w.id);

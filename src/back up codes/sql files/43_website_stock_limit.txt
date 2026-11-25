@@ -1,0 +1,117 @@
+-- =====================================================================
+-- Chinito Scento - WEBSITE: only finished goods can be ordered, and orders are checked one at a time.
+-- Run in the Supabase SQL Editor. Safe to re-run. Replaces two functions; no table is changed.
+--
+-- What was wrong
+--   public_catalog() and submit_order_request() added up EVERY stock layer of a perfume size,
+--   including bottled pieces that are not packaged yet. The internal app can only sell FINISHED
+--   goods (post_sale_internal checks stock_kind = 'finished'), so the website could offer more
+--   than the internal app can actually deliver.
+--
+-- What this does
+--   1. The website quantity limit (max_qty), "few left" and "in stock" all use finished goods only.
+--   2. submit_order_request() checks the same finished-goods quantity.
+--   3. Requests are processed one at a time (advisory lock), so two customers sending at the
+--      same moment cannot both pass the check.
+-- =====================================================================
+
+create or replace function public.public_catalog()
+returns table(size_id uuid, perfume_name text, size_ml numeric, price numeric,
+              in_stock boolean, few_left boolean, max_qty integer, gender text)
+language sql
+stable
+security definer
+set search_path to 'public'
+as $function$
+  select s.size_id, s.perfume_name, s.size_ml, s.price,
+         (s.in_stock and st.qty >= 1),
+         (s.in_stock and st.qty >= 1 and st.qty <= 10),
+         least(greatest(floor(st.qty), 0), 20)::int,
+         p.gender::text
+  from cs_sellable_sizes() s
+  join perfume_sizes ps on ps.id = s.size_id
+  join perfumes p on p.id = ps.perfume_id
+  cross join lateral (select coalesce(sum(sl.qty_remaining), 0) as qty
+                      from stock_layers sl
+                      where sl.size_id = s.size_id and sl.stock_kind = 'finished') st
+  order by s.perfume_name, s.size_ml;
+$function$;
+
+create or replace function public.submit_order_request(
+  p_name text, p_contact text, p_email text, p_address text, p_notes text,
+  p_items jsonb, p_hp text default ''::text, p_ref text default null::text)
+returns bigint
+language plpgsql
+security definer
+set search_path to 'public'
+as $function$
+declare
+  v_id uuid; v_no bigint; v_digits text; v_want int; v_got int;
+  v_over_name text; v_over_avail numeric;
+begin
+  if coalesce(trim(p_hp), '') <> '' then return 0; end if;
+  if coalesce(trim(p_name), '') = '' then raise exception 'Please enter your name.'; end if;
+  v_digits := regexp_replace(coalesce(p_contact, ''), '\D', '', 'g');
+  if length(v_digits) < 7 then raise exception 'Please enter a valid mobile number.'; end if;
+  if length(p_name) > 120 or length(coalesce(p_contact,'')) > 40
+     or length(coalesce(p_email,'')) > 160 or length(coalesce(p_address,'')) > 500
+     or length(coalesce(p_notes,'')) > 1000 then
+    raise exception 'One of the fields is too long.';
+  end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'Please add at least one perfume to your order.';
+  end if;
+  if jsonb_array_length(p_items) > 30 then raise exception 'Too many items in one request.'; end if;
+
+  -- One request at a time, so the stock check below cannot be passed by two customers at once
+  perform pg_advisory_xact_lock(hashtext('cs_order_requests'));
+
+  if (select count(*) from order_requests
+      where contact_digits = v_digits and created_at > now() - interval '1 hour') >= 5 then
+    raise exception 'Too many requests from this number. Please try again later.';
+  end if;
+
+  insert into order_requests (name, contact, contact_digits, email, address, notes, ref_code)
+  values (trim(p_name), trim(p_contact), v_digits,
+          nullif(trim(coalesce(p_email,'')), ''), nullif(trim(coalesce(p_address,'')), ''),
+          nullif(trim(coalesce(p_notes,'')), ''), nullif(trim(coalesce(p_ref,'')), ''))
+  returning id, request_no into v_id, v_no;
+
+  begin
+    insert into order_request_lines (request_id, size_id, perfume_name, size_ml, unit_price, qty)
+    select v_id, s.size_id, s.perfume_name, s.size_ml, s.price, i.q
+    from (select (e->>'size_id')::uuid as sid, sum((e->>'qty')::int) as q
+          from jsonb_array_elements(p_items) e group by 1) i
+    join cs_sellable_sizes() s on s.size_id = i.sid and s.in_stock
+    where i.q between 1 and 20;
+
+    select count(distinct (e->>'size_id')::uuid) into v_want from jsonb_array_elements(p_items) e;
+  exception when others then
+    raise exception 'Some items in your order are not valid. Please refresh the page and try again.';
+  end;
+
+  select count(*) into v_got from order_request_lines where request_id = v_id;
+  if v_got <> v_want then
+    raise exception 'Some items in your order are sold out or no longer available. Please refresh the page and try again.';
+  end if;
+
+  -- Quantity must not exceed the FINISHED goods on hand (what the internal app can actually sell)
+  select l.perfume_name, st.qty into v_over_name, v_over_avail
+  from order_request_lines l
+  cross join lateral (select coalesce(sum(sl.qty_remaining), 0) as qty
+                      from stock_layers sl
+                      where sl.size_id = l.size_id and sl.stock_kind = 'finished') st
+  where l.request_id = v_id and l.qty > st.qty
+  limit 1;
+  if v_over_name is not null then
+    raise exception 'Sorry, only % of % available right now. Please lower the quantity and try again.',
+      floor(v_over_avail), v_over_name;
+  end if;
+
+  return v_no;
+end $function$;
+
+notify pgrst, 'reload schema';
+
+-- Check: this should now match "On hand" in Stock & Alerts for the same perfume.
+--   select perfume_name, size_ml, in_stock, max_qty from public_catalog() order by 1;

@@ -1,0 +1,56 @@
+-- =====================================================================
+-- 41_affiliates_fit.sql
+-- Builds on the affiliate tables and the automatic commission trigger that are
+-- ALREADY in your database (affiliates, affiliate_commissions, affiliate_payouts,
+-- cs_resolve_affiliate, cs_sync_commission). Nothing is dropped or replaced there.
+-- Safe to re-run. Run in the Supabase SQL Editor.
+--
+-- 1. Owner only. Today every signed-in user can read AND change the rates, commissions
+--    and payouts. After this, only the owner can. The automatic commission trigger still
+--    works for staff, because it runs with its own permissions.
+-- 2. Payouts get a number, how it was paid, a reference, and void support, so a wrong
+--    payout can be cancelled and still stays on record.
+-- 3. An influencer code can only be used once, whatever the capital letters.
+-- =====================================================================
+
+-- ---------- 1. Owner only ----------------------------------------------
+alter table public.affiliates enable row level security;
+alter table public.affiliate_commissions enable row level security;
+alter table public.affiliate_payouts enable row level security;
+
+drop policy if exists staff_all on public.affiliates;
+drop policy if exists staff_all on public.affiliate_commissions;
+drop policy if exists staff_all on public.affiliate_payouts;
+
+drop policy if exists owner_all on public.affiliates;
+create policy owner_all on public.affiliates
+  for all to authenticated using (public.is_owner()) with check (public.is_owner());
+
+drop policy if exists owner_all on public.affiliate_commissions;
+create policy owner_all on public.affiliate_commissions
+  for all to authenticated using (public.is_owner()) with check (public.is_owner());
+
+drop policy if exists owner_all on public.affiliate_payouts;
+create policy owner_all on public.affiliate_payouts
+  for all to authenticated using (public.is_owner()) with check (public.is_owner());
+
+revoke all on public.affiliates, public.affiliate_commissions, public.affiliate_payouts from anon;
+
+-- ---------- 2. Payout details ------------------------------------------
+alter table public.affiliate_payouts
+  add column if not exists payout_no bigint generated always as identity,
+  add column if not exists method text check (method in ('cash','bank','gcash','other')),
+  add column if not exists reference text,
+  add column if not exists status text not null default 'Posted' check (status in ('Posted','Voided')),
+  add column if not exists void_reason text,
+  add column if not exists voided_at timestamptz,
+  add column if not exists created_by uuid references auth.users(id) default auth.uid();
+
+-- ---------- 3. One code, one influencer ---------------------------------
+create unique index if not exists affiliates_code_lower_idx on public.affiliates (lower(code));
+
+notify pgrst, 'reload schema';
+
+-- ---------- Checks (run one at a time) ------------------------------------
+-- select tablename, policyname, cmd from pg_policies where tablename like 'affiliate%';
+-- select column_name from information_schema.columns where table_name = 'affiliate_payouts' order by ordinal_position;

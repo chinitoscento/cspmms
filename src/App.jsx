@@ -17,13 +17,14 @@ import StockWriteoffs from './components/StockWriteoffs';
 import MarketingGifts from './components/MarketingGifts';
 import RawMaterials from './components/RawMaterials';
 import Sales from './components/Sales';
+import OrderRequests from './components/OrderRequests';
 import Collections from './components/Collections';
 import Costing from './components/Costing';
 import Analytics, { FastMoverBanner } from './components/Analytics';
 import Audit from './components/Audit';
 import { EmptyState, peso } from './components/ui';
 import { supabase } from './supabaseClient';
-import { Sparkles, ArrowUpRight, FlaskConical, Droplets, PackageCheck, TrendingUp, Banknote, Receipt, CreditCard, ShoppingBag, Wallet } from 'lucide-react';
+import { Globe, Sparkles, ArrowUpRight, FlaskConical, Droplets, PackageCheck, TrendingUp, Banknote, Receipt, CreditCard, ShoppingBag, Wallet } from 'lucide-react';
 
 function StatCard({ title, value, caption, icon: Icon, onClick, tone }) {
   return (
@@ -93,6 +94,7 @@ export default function App() {
   const [summary, setSummary] = useState({ netSales: 0, netIncome: 0, ar: 0, ap: 0, fgUnits: 0, bottlingReady: [], packagingReady: [] });
   const [macBatches, setMacBatches] = useState([]); // batches still macerating
   const [pendingSales, setPendingSales] = useState({ sales: 0, returns: 0 }); // waiting for owner approval
+  const [newOrders, setNewOrders] = useState(0); // website order requests nobody has answered yet
   const [dueSoon, setDueSoon] = useState({ items: [], upcoming: 0, overdue: 0 }); // payables due within the warning window
   const [prefill, setPrefill] = useState(null); // hand-off between Maceration > Bottling > Packaging
   const [stockView, setStockView] = useState('all'); // which button of Stock & Alerts opens first
@@ -239,6 +241,19 @@ export default function App() {
     if (signedIn) loadPending();
   }, [signedIn, activeTab, loadPending]);
 
+  // Website order requests with status 'New' (drives the dashboard notice and the menu badge)
+  const loadOrders = useCallback(async () => {
+    const { data, error } = await supabase.from('order_requests').select('id').eq('status', 'New').limit(500);
+    if (error) console.warn('Could not check website orders:', error.message);
+    setNewOrders(error ? 0 : (data || []).length);
+  }, []);
+  useEffect(() => {
+    if (!signedIn) return undefined;
+    loadOrders();
+    const t = setInterval(loadOrders, 60000); // check again every minute while the app is open
+    return () => clearInterval(t);
+  }, [signedIn, activeTab, loadOrders]);
+
   // Payables to creditors that fall due within the next PAYABLE_ALERT_DAYS days (drives the dashboard notice)
   const loadDueSoon = useCallback(async () => {
     const { data } = await supabase.from('payables_open').select('*');
@@ -314,13 +329,29 @@ export default function App() {
   const readyNames = [...new Set(readyBatches.map((b) => b.perfumes?.name).filter(Boolean))];
 
   return (
-    <Layout activeTab={activeTab} setActiveTab={navigate} onSignOut={handleSignOut} user={user} badges={{ maceration: readyBatches.length, sales: pendingTotal }}>
+    <Layout activeTab={activeTab} setActiveTab={navigate} onSignOut={handleSignOut} user={user} badges={{ maceration: readyBatches.length, sales: pendingTotal, orders: newOrders }}>
       {/* ───────── Dashboard ───────── */}
       {activeTab === 'dashboard' && (
         <div className="space-y-6">
           <InventoryAlertBanner scope="material" onOpen={() => openStock('buy')} />
           <InventoryAlertBanner scope="finished" onOpen={() => openStock('low')} />
           <FastMoverBanner onOpen={() => navigate(user.role === 'owner' ? 'analytics' : 'stock')} />
+          {newOrders > 0 && (
+            <button
+              type="button"
+              onClick={() => navigate('orders')}
+              className="w-full flex items-center justify-between gap-4 rounded-xl border border-[#e5a93d]/30 bg-[#e5a93d]/10 px-5 py-3.5 text-left cursor-pointer hover:bg-[#e5a93d]/15 transition-colors"
+            >
+              <span className="flex items-center gap-3 text-sm">
+                <Globe className="w-4 h-4 text-[#e5a93d] shrink-0" aria-hidden="true" />
+                <span>
+                  <strong className="text-[#e5a93d]">{newOrders} new website order request{newOrders === 1 ? '' : 's'}</strong>
+                  <span className="text-[#a8a090]"> · message the customer to arrange delivery and payment. Click to review.</span>
+                </span>
+              </span>
+              <ArrowUpRight className="w-4 h-4 text-[#e5a93d] shrink-0" aria-hidden="true" />
+            </button>
+          )}
           {readyBatches.length > 0 && (
             <button
               type="button"
@@ -535,6 +566,7 @@ export default function App() {
       {activeTab === 'costing' && user.role === 'owner' && <Costing user={user} />}
       {activeTab === 'analytics' && user.role === 'owner' && <Analytics user={user} onNavigate={navigate} />}
       {activeTab === 'sales' && <Sales user={user} onChanged={refresh} />}
+      {activeTab === 'orders' && <OrderRequests onChanged={loadOrders} />}
       {activeTab === 'collections' && <Collections user={user} onChanged={refresh} />}
       {activeTab === 'customers' && <Customers user={user} />}
       {activeTab === 'suppliers' && <Suppliers />}

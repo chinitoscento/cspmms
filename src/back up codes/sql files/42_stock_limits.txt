@@ -1,0 +1,89 @@
+-- 1) Catalog: also tell the website how many can be ordered (max_qty) and the "Few left" flag (10 or fewer)
+drop function if exists public.public_catalog();
+create function public.public_catalog()
+returns table (size_id uuid, perfume_name text, size_ml numeric, price numeric,
+               in_stock boolean, few_left boolean, max_qty integer, gender text)
+language sql stable security definer set search_path = public as $$
+  select s.size_id, s.perfume_name, s.size_ml, s.price, s.in_stock,
+         (s.in_stock and st.qty <= 10),
+         least(greatest(floor(st.qty), 0), 20)::int,
+         p.gender::text
+  from cs_sellable_sizes() s
+  join perfume_sizes ps on ps.id = s.size_id
+  join perfumes p on p.id = ps.perfume_id
+  cross join lateral (select coalesce(sum(sl.qty_remaining), 0) as qty
+                      from stock_layers sl where sl.size_id = s.size_id) st
+  order by s.perfume_name, s.size_ml;
+$$;
+revoke all on function public.public_catalog() from public;
+grant execute on function public.public_catalog() to anon, authenticated;
+
+-- 2) Server-side guard: refuse a request that asks for more than the stock on hand
+create or replace function public.submit_order_request(
+  p_name text, p_contact text, p_email text, p_address text, p_notes text,
+  p_items jsonb, p_hp text default '', p_ref text default null
+) returns bigint
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid; v_no bigint; v_digits text; v_want int; v_got int;
+  v_over_name text; v_over_avail numeric;
+begin
+  if coalesce(trim(p_hp), '') <> '' then return 0; end if;
+  if coalesce(trim(p_name), '') = '' then raise exception 'Please enter your name.'; end if;
+  v_digits := regexp_replace(coalesce(p_contact, ''), '\D', '', 'g');
+  if length(v_digits) < 7 then raise exception 'Please enter a valid mobile number.'; end if;
+  if length(p_name) > 120 or length(coalesce(p_contact,'')) > 40
+     or length(coalesce(p_email,'')) > 160 or length(coalesce(p_address,'')) > 500
+     or length(coalesce(p_notes,'')) > 1000 then
+    raise exception 'One of the fields is too long.';
+  end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'Please add at least one perfume to your order.';
+  end if;
+  if jsonb_array_length(p_items) > 30 then raise exception 'Too many items in one request.'; end if;
+
+  if (select count(*) from order_requests
+      where contact_digits = v_digits and created_at > now() - interval '1 hour') >= 5 then
+    raise exception 'Too many requests from this number. Please try again later.';
+  end if;
+
+  insert into order_requests (name, contact, contact_digits, email, address, notes, ref_code)
+  values (trim(p_name), trim(p_contact), v_digits,
+          nullif(trim(coalesce(p_email,'')), ''), nullif(trim(coalesce(p_address,'')), ''),
+          nullif(trim(coalesce(p_notes,'')), ''), nullif(trim(coalesce(p_ref,'')), ''))
+  returning id, request_no into v_id, v_no;
+
+  begin
+    insert into order_request_lines (request_id, size_id, perfume_name, size_ml, unit_price, qty)
+    select v_id, s.size_id, s.perfume_name, s.size_ml, s.price, i.q
+    from (select (e->>'size_id')::uuid as sid, sum((e->>'qty')::int) as q
+          from jsonb_array_elements(p_items) e group by 1) i
+    join cs_sellable_sizes() s on s.size_id = i.sid and s.in_stock
+    where i.q between 1 and 20;
+
+    select count(distinct (e->>'size_id')::uuid) into v_want from jsonb_array_elements(p_items) e;
+  exception when others then
+    raise exception 'Some items in your order are not valid. Please refresh the page and try again.';
+  end;
+
+  select count(*) into v_got from order_request_lines where request_id = v_id;
+  if v_got <> v_want then
+    raise exception 'Some items in your order are sold out or no longer available. Please refresh the page and try again.';
+  end if;
+
+  -- NEW: quantity must not exceed what is on hand
+  select l.perfume_name, st.qty into v_over_name, v_over_avail
+  from order_request_lines l
+  cross join lateral (select coalesce(sum(sl.qty_remaining), 0) as qty
+                      from stock_layers sl where sl.size_id = l.size_id) st
+  where l.request_id = v_id and l.qty > st.qty
+  limit 1;
+  if v_over_name is not null then
+    raise exception 'Sorry, only % of % available right now. Please lower the quantity and try again.',
+      floor(v_over_avail), v_over_name;
+  end if;
+
+  return v_no;
+end $$;
+revoke all on function public.submit_order_request(text,text,text,text,text,jsonb,text,text) from public;
+grant execute on function public.submit_order_request(text,text,text,text,text,jsonb,text,text) to anon, authenticated;

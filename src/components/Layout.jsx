@@ -26,6 +26,7 @@ import {
   BarChart3,
   ClipboardCheck,
   Gift,
+  Globe,
 } from 'lucide-react';
 import logoImage from '../logo.png';
 import CommandPalette from './CommandPalette';
@@ -46,6 +47,7 @@ const NAV_ITEMS = [
   { id: 'maceration', name: 'Maceration Lab', icon: FlaskConical },
   { id: 'bottling', name: 'Bottling', icon: Droplets },
   { id: 'packaging', name: 'Packaging', icon: PackageCheck },
+  { id: 'orders', name: 'Website Orders', icon: Globe },
   { id: 'sales', name: 'Sales and Return/Exchange', icon: ShoppingBag },
   { id: 'collections', name: 'Collections', icon: Wallet },
   { id: 'gifts', name: 'Marketing Gifts', icon: Gift },
@@ -62,7 +64,7 @@ const NAV_GROUPS = [
   { id: 'partners', label: 'Partners & Catalog', ids: ['customers', 'suppliers', 'inventory', 'materials'] },
   { id: 'purchasing', label: 'Purchasing & Stock', ids: ['procurement', 'stock', 'writeoffs'] },
   { id: 'production', label: 'Production', ids: ['maceration', 'bottling', 'packaging'] },
-  { id: 'selling', label: 'Sales & Collections', ids: ['sales', 'collections', 'gifts', 'analytics'] },
+  { id: 'selling', label: 'Sales & Collections', ids: ['orders', 'sales', 'collections', 'gifts', 'analytics'] },
   { id: 'finance', label: 'Finance & Accounting', ids: ['costing', 'ledger', 'reports', 'audit'] },
   { id: 'admin', label: 'Administration', ids: ['users'] },
 ];
@@ -129,8 +131,8 @@ export default function Layout({ children, activeTab, setActiveTab, onSignOut, u
   });
 
   // Badges that mean 'waiting for the owner' rather than 'ready for the next step'
-  const APPROVAL_BADGES = ['sales'];
-  const badgeText = (id) => (APPROVAL_BADGES.includes(id) ? 'awaiting approval' : 'ready');
+  const APPROVAL_BADGES = ['sales', 'orders'];
+  const badgeText = (id) => (id === 'orders' ? 'new request(s)' : APPROVAL_BADGES.includes(id) ? 'awaiting approval' : 'ready');
 
   const OWNER_ONLY = ['users', 'reports', 'costing', 'analytics', 'audit'];
   const navItems = NAV_ITEMS.filter((item) => !OWNER_ONLY.includes(item.id) || user?.role === 'owner');
