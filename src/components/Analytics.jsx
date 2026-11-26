@@ -339,7 +339,8 @@ export default function Analytics({ user, onNavigate }) {
       const p = map[r.perfume_id] || (map[r.perfume_id] = { id: r.perfume_id, name: r.perfume_name, gender: r.gender, units: 0, revenue: 0, sizes: [] });
       p.units += Number(r.units);
       p.revenue += Number(r.revenue);
-      p.sizes.push({ ml: Number(r.size_ml), units: Number(r.units) });
+      // an other item (for example a Tester Kit) has no size
+      p.sizes.push({ ml: r.size_ml == null ? null : Number(r.size_ml), units: Number(r.units) });
     });
     const prevUnits = {};
     data.prevPerfumeRows.forEach((r) => {
@@ -523,14 +524,14 @@ export default function Analytics({ user, onNavigate }) {
                           <td className="px-4 py-3 text-right font-mono">{peso(p.revenue)}</td>
                           <td className="px-4 py-3 text-right font-mono text-xs text-[#a8a090]">{totalRevenue > 0 ? `${((p.revenue / totalRevenue) * 100).toFixed(1)}%` : '-'}</td>
                           {compare && <td className="px-4 py-3 text-right"><Delta cur={p.units} prev={p.prevUnits} /></td>}
-                          <td className="px-4 py-3 text-xs text-[#a8a090]">{[...p.sizes].sort((a, b) => a.ml - b.ml).map((z) => `${num(z.ml, 2)} ml ×${num(z.units)}`).join(' · ')}</td>
+                          <td className="px-4 py-3 text-xs text-[#a8a090]">{[...p.sizes].sort((a, b) => (a.ml ?? 0) - (b.ml ?? 0)).map((z) => (z.ml == null ? `other item ×${num(z.units)}` : `${num(z.ml, 2)} ml ×${num(z.units)}`)).join(' · ')}</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
               </div>
-              {perfumes.some((p) => p.gender === 'Unisex') && perfumes.every((p) => p.gender === 'Unisex') && (
+              {perfumes.some((p) => p.gender === 'Unisex') && perfumes.filter((p) => p.gender !== 'Other').every((p) => p.gender === 'Unisex') && (
                 <p className="text-xs text-[#e5a93d]">Every perfume is still set to Unisex. Open Signature Collection and set each one to Men, Women or Unisex so the groups above are meaningful.</p>
               )}
             </section>

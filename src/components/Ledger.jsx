@@ -23,7 +23,11 @@ const stamp = (iso) =>
 const posterOf = (e) => e.posted_by_name || e.posted_by_username || 'System';
 
 let keySeed = 0;
-const newLine = () => ({ key: `l${++keySeed}`, account_code: '', debit: '', credit: '', memo: '' });
+const newLine = () => ({ key: `l${++keySeed}`, account_code: '', debit: '', credit: '', memo: '', party: '' });
+
+// Accounts whose lines should name who they belong to: the balance of each customer (Accounts Receivable)
+// and each supplier (Accounts Payable and Interest Payable) is worked out from these tags.
+const PARTY_KIND = { '1100': 'customer', '2000': 'supplier', '2310': 'supplier' };
 
 function StatusBadge({ kind }) {
   const styles = {
@@ -62,6 +66,9 @@ export default function Ledger({ user, onChanged }) {
   const [reference, setReference] = useState('');
   const [description, setDescription] = useState('');
   const [lines, setLines] = useState([newLine(), newLine()]);
+  const [customers, setCustomers] = useState([]);
+  const [suppliers, setSuppliers] = useState([]);
+  const [partyWarned, setPartyWarned] = useState(false);
   const [formError, setFormError] = useState('');
   const [saving, setSaving] = useState(false);
 
@@ -124,7 +131,14 @@ export default function Ledger({ user, onChanged }) {
       .eq('is_active', true)
       .order('code')
       .then(({ data }) => setAccounts(data || []));
+    supabase.from('customers').select('id, name').order('name').then(({ data }) => setCustomers(data || []));
+    supabase.from('suppliers').select('id, name').order('name').then(({ data }) => setSuppliers(data || []));
   }, []);
+
+  const partyName = (l) =>
+    (l.customer_id && customers.find((c) => c.id === l.customer_id)?.name) ||
+    (l.supplier_id && suppliers.find((x) => x.id === l.supplier_id)?.name) ||
+    '';
 
   const clearFilters = () => {
     setSearch('');
@@ -136,12 +150,20 @@ export default function Ledger({ user, onChanged }) {
     if (openId === id) return setOpenId(null);
     setOpenId(id);
     if (!details[id]) {
-      const { data, error } = await supabase
+      // the customer / supplier of each line is shown when the view provides it
+      let res = await supabase
         .from('ledger_lines')
-        .select('id, account_code, account_name, debit, credit, memo')
+        .select('id, account_code, account_name, debit, credit, memo, customer_id, supplier_id')
         .eq('entry_id', id)
         .order('debit', { ascending: false });
-      setDetails((prev) => ({ ...prev, [id]: error ? [] : data || [] }));
+      if (res.error) {
+        res = await supabase
+          .from('ledger_lines')
+          .select('id, account_code, account_name, debit, credit, memo')
+          .eq('entry_id', id)
+          .order('debit', { ascending: false });
+      }
+      setDetails((prev) => ({ ...prev, [id]: res.error ? [] : res.data || [] }));
     }
   };
 
@@ -151,11 +173,15 @@ export default function Ledger({ user, onChanged }) {
     setReference('');
     setDescription('');
     setLines([newLine(), newLine()]);
+    setPartyWarned(false);
     setFormError('');
     setFormOpen(true);
   };
 
-  const updateLine = (key, patch) => setLines((prev) => prev.map((l) => (l.key === key ? { ...l, ...patch } : l)));
+  const updateLine = (key, patch) => {
+    setPartyWarned(false);
+    setLines((prev) => prev.map((l) => (l.key === key ? { ...l, ...patch } : l)));
+  };
 
   const totalDebit = lines.reduce((s, l) => s + cents(l.debit), 0);
   const totalCredit = lines.reduce((s, l) => s + cents(l.credit), 0);
@@ -178,9 +204,20 @@ export default function Ledger({ user, onChanged }) {
         debit: cents(l.debit) / 100,
         credit: cents(l.credit) / 100,
         memo: nz(l.memo),
+        ...(PARTY_KIND[l.account_code] === 'customer' && l.party ? { customer_id: l.party } : {}),
+        ...(PARTY_KIND[l.account_code] === 'supplier' && l.party ? { supplier_id: l.party } : {}),
       }));
     if (payloadLines.length < 2) return setFormError('An entry needs at least two lines with amounts.');
     if (!balanced) return setFormError('Debits must equal credits before you can post.');
+
+    // Receivable and payable lines should name the customer or supplier. Warn once; posting again goes ahead.
+    const untagged = used.filter((l) => PARTY_KIND[l.account_code] && !l.party && (cents(l.debit) > 0 || cents(l.credit) > 0));
+    if (untagged.length > 0 && !partyWarned) {
+      setPartyWarned(true);
+      return setFormError(
+        'A line to Accounts Receivable or Accounts Payable has no customer or supplier chosen, so it will not count toward anyone\u2019s balance. Choose one, or press Post again to post without it.'
+      );
+    }
 
     setSaving(true);
     setFormError('');
@@ -387,6 +424,7 @@ export default function Ledger({ user, onChanged }) {
                                       <td className={`py-2 ${Number(l.credit) > 0 ? 'pl-6' : ''}`}>
                                         <span className="font-mono text-[#a8a090] mr-2">{l.account_code}</span>
                                         {l.account_name}
+                                        {partyName(l) && <span className="block text-[10px] text-[#e3bf5a]">{partyName(l)}</span>}
                                       </td>
                                       <td className="py-2 text-right font-mono">{Number(l.debit) > 0 ? peso(l.debit) : ''}</td>
                                       <td className="py-2 text-right font-mono">{Number(l.credit) > 0 ? peso(l.credit) : ''}</td>
@@ -456,7 +494,7 @@ export default function Ledger({ user, onChanged }) {
                     <select
                       id={`acc-${l.key}`}
                       value={l.account_code}
-                      onChange={(e) => updateLine(l.key, { account_code: e.target.value })}
+                      onChange={(e) => updateLine(l.key, { account_code: e.target.value, party: '' })}
                       className="cs-input px-3 py-2.5"
                     >
                       <option value="">Select account...</option>
@@ -464,6 +502,26 @@ export default function Ledger({ user, onChanged }) {
                         <option key={a.code} value={a.code}>{a.code} · {a.name}</option>
                       ))}
                     </select>
+                    {PARTY_KIND[l.account_code] && (
+                      <>
+                        <label htmlFor={`party-${l.key}`} className="sr-only">
+                          {PARTY_KIND[l.account_code] === 'customer' ? 'Customer' : 'Supplier'} for line {i + 1}
+                        </label>
+                        <select
+                          id={`party-${l.key}`}
+                          value={l.party}
+                          onChange={(e) => updateLine(l.key, { party: e.target.value })}
+                          className="cs-input px-3 py-2 mt-1.5 text-xs"
+                        >
+                          <option value="">
+                            {PARTY_KIND[l.account_code] === 'customer' ? 'Customer (whose balance this is)...' : 'Supplier (whose balance this is)...'}
+                          </option>
+                          {(PARTY_KIND[l.account_code] === 'customer' ? customers : suppliers).map((p) => (
+                            <option key={p.id} value={p.id}>{p.name}</option>
+                          ))}
+                        </select>
+                      </>
+                    )}
                   </div>
                   <div className="col-span-6 sm:col-span-2">
                     <label htmlFor={`dr-${l.key}`} className="sr-only">Debit for line {i + 1}</label>

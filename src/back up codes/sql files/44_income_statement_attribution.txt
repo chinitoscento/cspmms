@@ -1,0 +1,61 @@
+-- =====================================================================
+-- 43_income_statement_attribution.sql
+-- The Income Statement now counts a reversal in the month of the entry it cancels.
+-- Run in the Supabase SQL Editor. Safe to re-run.
+--
+-- Why: when a sale (or any other entry) is voided, the system posts a reversal dated the day
+-- of the void. A voided July sale therefore reduced November's sales, even though the sale
+-- belonged to July. Voids in this system fix mistakes, so the correction now belongs to the
+-- month of the original entry. Real customer returns are NOT reversals and still count in the
+-- month they happen.
+--
+-- What changes: only period_movement(), which the Income Statement reads.
+-- What does not change: no journal entry, balance, the Trial Balance, the Balance Sheet or the
+-- General Ledger. Over a full period (for example "All time") the totals are identical; only the
+-- month in which a correction is shown moves.
+--
+-- Note: if you file taxes for a month, a later void of one of its entries will change that
+-- month's Income Statement. Tell Claude if you want months locked after filing.
+-- =====================================================================
+
+create or replace function public.period_movement(p_from date, p_to date)
+returns table(code text, name text, type text, debit numeric, credit numeric)
+language sql stable
+set search_path to 'public'
+as $$
+  select a.code, a.name, a.type, coalesce(sum(l.debit), 0), coalesce(sum(l.credit), 0)
+  from public.accounts a
+  join public.journal_lines l on l.account_id = a.id
+  join public.journal_entries e on e.id = l.entry_id
+  left join public.journal_entries o on o.id = e.reverses_id   -- the entry this one reverses, if any
+  where a.type in ('revenue', 'expense') and public.is_owner()
+    and (p_from is null or coalesce(o.entry_date, e.entry_date) >= p_from)
+    and (p_to   is null or coalesce(o.entry_date, e.entry_date) <= p_to)
+  group by a.code, a.name, a.type
+  order by a.code;
+$$;
+
+grant execute on function public.period_movement(date, date) to authenticated;
+notify pgrst, 'reload schema';
+
+-- ---------- To undo this change, run the original function below ------------
+-- create or replace function public.period_movement(p_from date, p_to date)
+--  returns table(code text, name text, type text, debit numeric, credit numeric)
+--  language sql stable set search_path to 'public'
+-- as $$
+--   select a.code, a.name, a.type, coalesce(sum(l.debit), 0), coalesce(sum(l.credit), 0)
+--   from public.accounts a
+--   join public.journal_lines l on l.account_id = a.id
+--   join public.journal_entries e on e.id = l.entry_id
+--    and (p_from is null or e.entry_date >= p_from)
+--    and (p_to is null or e.entry_date <= p_to)
+--   where a.type in ('revenue', 'expense') and public.is_owner()
+--   group by a.code, a.name, a.type
+--   order by a.code;
+-- $$;
+
+-- ---------- Check -----------------------------------------------------------
+-- Open Accounting Reports > Income Statement for Nov 1 to Nov 25, 2026 in the app
+-- (it only shows figures to the owner, so the SQL editor cannot show them).
+-- Expected: Sales about 10,811, Sales Returns about 3,900, Net sales about 6,911, and
+-- Cost of Goods Sold back to a normal positive amount.

@@ -5,6 +5,8 @@ import { EmptyState, PageHeader, ErrorNote, Modal, nz, peso, fmtDate, ModalActio
 import { LateEntryNotice, isLateEntry, withLateNote } from './lateEntry';
 
 const todayLocal = () => new Date().toLocaleDateString('en-CA');
+// no business transaction is dated before this; it catches a mistyped year such as 0006
+const MIN_DATE = '2020-01-01';
 const pad = (n) => String(n).padStart(8, '0');
 const qty = (v) => Number(v || 0).toLocaleString('en-PH', { maximumFractionDigits: 3 });
 const daysUntil = (iso) => Math.round((new Date(`${iso}T00:00:00`) - new Date(`${todayLocal()}T00:00:00`)) / 86400000);
@@ -26,6 +28,8 @@ const kindOf = (x) => (x?.reason === 'returned' ? 'Returned, refund' : KIND[x?.r
 let keySeed = 0;
 const blankReturn = (sale = '') => ({ date: todayLocal(), sale, reason: 'wrong_item', resolution: 'exchange', notes: '', lines: [] });
 const newLine = (size = '', price = '') => ({ key: `l${++keySeed}`, size, qty: size ? '1' : '', price });
+// an item that is not a perfume (for example a Tester Kit): a description, a quantity and a price
+const newOther = (desc, qty, price) => ({ key: `l${++keySeed}`, size: '', other: true, desc, qty: String(qty), price: String(price) });
 
 function Badge({ tone, children }) {
   const tones = {
@@ -103,6 +107,8 @@ export default function Sales({ user, onChanged }) {
   // new sale
   const [sOpen, setSOpen] = useState(false);
   const [sf, setSf] = useState({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', downRef: '', lines: [] });
+  const [oth, setOth] = useState({ desc: '', qty: '1', price: '' }); // the "Other item" box in the sale form
+  const [othError, setOthError] = useState('');
   const [sQuery, setSQuery] = useState(''); // perfume search in the New Sale picker
   const [sError, setSError] = useState('');
 
@@ -174,6 +180,8 @@ export default function Sales({ user, onChanged }) {
   };
 
   const sizeById = useMemo(() => Object.fromEntries(allSizes.map((s) => [s.id, s])), [allSizes]);
+  // a sale line is a perfume size or an "other item" with a description
+  const lineLabel = (l) => (l.size_id ? sizeName(l.size_id) : l.description || 'Other item');
   const sizeName = (id) => (sizeById[id] ? `${sizeById[id].perfumes?.name} · ${qty(sizeById[id].size_ml)} ml${sizeById[id].is_premix ? ' PreMix' : ''}` : '-');
   const onHand = useMemo(() => Object.fromEntries(stock.map((r) => [r.item_id, Number(r.on_hand || 0)])), [stock]);
   const sellable = useMemo(
@@ -268,9 +276,31 @@ export default function Sales({ user, onChanged }) {
   // ---------- new sale ----------
   const openSale = () => {
     setSf({ date: todayLocal(), customer: '', pay: 'cash', notes: '', lateReason: '', down: '', downMethod: 'cash', downRef: '', lines: [] });
+    setOth({ desc: '', qty: '1', price: '' });
+    setOthError('');
     setSQuery('');
     setSError('');
     setSOpen(true);
+  };
+  // descriptions used before (for suggestions) and the price they were last sold at
+  const otherSeen = [];
+  sales.forEach((sa) => (sa.sale_lines || []).forEach((l) => {
+    if (!l.size_id && l.description && !otherSeen.some((o) => o.desc === l.description)) otherSeen.push({ desc: l.description, price: Number(l.unit_price) });
+  }));
+  const setOthDesc = (v) => setOth((o) => {
+    setOthError('');
+    const hit = otherSeen.find((x) => x.desc === v);
+    return { ...o, desc: v, price: hit && o.price === '' ? String(hit.price) : o.price };
+  });
+  const addOther = () => {
+    const desc = oth.desc.trim();
+    const q = parseInt(oth.qty, 10) || 0;
+    const pr = Number(oth.price) || 0;
+    if (!desc) return setOthError('Describe the item you are selling.');
+    if (q <= 0 || pr <= 0) return setOthError('Enter a quantity and a price above zero.');
+    setOthError('');
+    setSf((p) => ({ ...p, lines: [...p.lines, newOther(desc, q, pr)] }));
+    setOth({ desc: '', qty: '1', price: '' });
   };
   const setLine = (key, patch) => setSf((p) => ({ ...p, lines: p.lines.map((l) => (l.key === key ? { ...l, ...patch } : l)) }));
 
@@ -316,13 +346,14 @@ export default function Sales({ user, onChanged }) {
   const saveSale = async (e) => {
     e.preventDefault();
     const used = sf.lines.filter((l) => l.size || l.qty);
-    if (used.length === 0) return setSError('Tap a perfume size to add at least one item.');
-    if (used.some((l) => !l.size || !(parseInt(l.qty, 10) > 0))) return setSError('Every item needs a perfume size and a quantity.');
+    if (used.length === 0) return setSError('Tap a perfume size, or add an other item, to start the sale.');
+    if (used.some((l) => (!l.size && !l.other) || !(parseInt(l.qty, 10) > 0))) return setSError('Every item needs a perfume size and a quantity.');
     if (used.some((l) => !(linePrice(l) > 0))) return setSError('Every item needs a price above zero.');
     if (sIsCredit && !sf.customer) return setSError('Choose the customer for a credit sale.');
     if (sBlocked) return setSError(sShort[0]);
     if (sDownError) return setSError(sDownError);
     if (sDown > 0 && sf.downMethod === 'bank' && !sf.downRef.trim()) return setSError('Enter the bank transfer reference number for the upfront payment.');
+    if (!sf.date || sf.date < MIN_DATE) return setSError('Check the sale date: the year looks wrong.');
     if (isLateEntry(sf.date) && !sf.lateReason.trim()) return setSError('This is a late entry. Enter why it was not recorded on the day.');
     setSaving(true);
     setSError('');
@@ -331,7 +362,11 @@ export default function Sales({ user, onChanged }) {
       p_customer: sf.customer || null,
       p_payment: sf.pay,
       p_notes: withLateNote(nz(sf.notes), sf.date, sf.lateReason),
-      p_lines: used.map((l) => ({ size_id: l.size, qty: parseInt(l.qty, 10), unit_price: linePrice(l) })),
+      p_lines: used.map((l) =>
+        l.other
+          ? { description: l.desc.trim(), qty: parseInt(l.qty, 10), unit_price: linePrice(l) }
+          : { size_id: l.size, qty: parseInt(l.qty, 10), unit_price: linePrice(l) }
+      ),
       // only sent when there is an upfront payment, so sales without one work exactly as before
       ...(sDown > 0 ? { p_down_payment: sDown, p_down_method: sf.downMethod, p_down_reference: sf.downMethod === 'bank' ? sf.downRef.trim() : null } : {}),
     });
@@ -345,7 +380,7 @@ export default function Sales({ user, onChanged }) {
   // ---------- return / exchange ----------
   const soldBySize = (sale) => {
     const m = {};
-    (sale?.sale_lines || []).forEach((l) => {
+    (sale?.sale_lines || []).filter((l) => l.size_id).forEach((l) => {
       m[l.size_id] = m[l.size_id] || { size_id: l.size_id, qty: 0, amount: 0, list: 0 };
       m[l.size_id].qty += l.qty;
       m[l.size_id].amount += Number(l.amount);
@@ -550,7 +585,7 @@ export default function Sales({ user, onChanged }) {
     const refunds = doneLines.reduce((t, l) => t + (l.resolution === 'refund' ? Number(l.refund_amount || 0) : 0), 0);
     const paidBack = doneLines.reduce((t, l) => t + Number(l.refund_paid || 0), 0);
     const held = {};
-    linesOf(s).forEach((l) => { held[l.size_id] = (held[l.size_id] || 0) + l.qty; });
+    linesOf(s).filter((l) => l.size_id).forEach((l) => { held[l.size_id] = (held[l.size_id] || 0) + l.qty; });
     doneLines.forEach((l) => {
       held[l.size_id] = (held[l.size_id] || 0) - l.qty;
       if (l.repl_size_id) held[l.repl_size_id] = (held[l.repl_size_id] || 0) + l.qty;
@@ -625,7 +660,7 @@ export default function Sales({ user, onChanged }) {
          ${s.payment_type === 'credit' ? `<br><strong>Due date: ${esc(fmtDate(s.due_date))}</strong>` : ''}</div>
        </div>
        <table><thead><tr><th>Item</th><th class="r">Qty</th><th class="r">Unit price</th><th class="r">Amount</th></tr></thead><tbody>
-       ${linesOf(s).map((l) => `<tr><td>${esc(sizeName(l.size_id))}</td><td class="r">${l.qty}</td><td class="r">${esc(peso(l.unit_price))}</td><td class="r">${esc(peso(l.amount))}</td></tr>`).join('')}
+       ${linesOf(s).map((l) => `<tr><td>${esc(lineLabel(l))}</td><td class="r">${l.qty}</td><td class="r">${esc(peso(l.unit_price))}</td><td class="r">${esc(peso(l.amount))}</td></tr>`).join('')}
        </tbody></table>
        <div class="total">Total: ${esc(peso(s.total))}</div>
        ${adjustmentsHtml(s, internal)}
@@ -909,7 +944,7 @@ export default function Sales({ user, onChanged }) {
                 </fieldset>
                 <div className="w-44">
                   <label htmlFor="s-date" className="cs-label">Date</label>
-                  <input id="s-date" type="date" value={sf.date} onChange={(e) => setSf((p) => ({ ...p, date: e.target.value }))} required className="cs-input px-3 py-2" />
+                  <input id="s-date" type="date" min={MIN_DATE} value={sf.date} onChange={(e) => setSf((p) => ({ ...p, date: e.target.value }))} required className="cs-input px-3 py-2" />
                 </div>
               </div>
 
@@ -976,6 +1011,32 @@ export default function Sales({ user, onChanged }) {
                   <p className="col-span-full text-xs text-[#a8a090] text-center py-4">{perfumeGroups.length === 0 ? 'No perfume is ready to sell yet.' : 'No perfume matches that search.'}</p>
                 )}
               </div>
+
+              {/* Anything sold that is not a perfume, for example a Tester Kit. No stock is used and no cost is booked. */}
+              <div className="rounded-lg border border-[#2a2622] bg-[#14120f] p-2.5 space-y-2">
+                <div className="text-xs font-medium">Other item (not a perfume)</div>
+                <div className="grid grid-cols-12 gap-2">
+                  <div className="col-span-12 sm:col-span-6">
+                    <label htmlFor="oth-desc" className="sr-only">Description of the other item</label>
+                    <input id="oth-desc" list="oth-items" maxLength={80} value={oth.desc} onChange={(e) => setOthDesc(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addOther(); } }} placeholder="Description, e.g. Tester Kit" className="cs-input px-2.5 py-1.5 text-xs" />
+                    <datalist id="oth-items">
+                      {otherSeen.map((o) => <option key={o.desc} value={o.desc} />)}
+                    </datalist>
+                  </div>
+                  <div className="col-span-4 sm:col-span-2">
+                    <label htmlFor="oth-qty" className="sr-only">Quantity</label>
+                    <input id="oth-qty" type="number" min="1" step="1" value={oth.qty} onChange={(e) => { setOthError(''); setOth((o) => ({ ...o, qty: e.target.value })); }} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addOther(); } }} placeholder="Qty" className="cs-input px-2.5 py-1.5 text-xs text-right" />
+                  </div>
+                  <div className="col-span-5 sm:col-span-2">
+                    <label htmlFor="oth-price" className="sr-only">Price each</label>
+                    <input id="oth-price" type="number" min="0.01" step="0.01" value={oth.price} onChange={(e) => { setOthError(''); setOth((o) => ({ ...o, price: e.target.value })); }} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addOther(); } }} placeholder="Price" className="cs-input px-2.5 py-1.5 text-xs text-right" />
+                  </div>
+                  <div className="col-span-3 sm:col-span-2">
+                    <button type="button" onClick={addOther} className="cs-btn cs-btn-ghost px-2 py-1.5 text-xs w-full">Add</button>
+                  </div>
+                </div>
+                {othError && <p role="alert" className="text-[11px] text-[#e5736d]">{othError}</p>}
+              </div>
             </div>
 
             {/* ---------- RIGHT: the sale, the total and the save buttons ---------- */}
@@ -984,18 +1045,20 @@ export default function Sales({ user, onChanged }) {
                 <div className="cs-label">Items in this sale{sf.lines.length > 0 ? ` (${sf.lines.length})` : ''}</div>
                 <div className="lg:flex-1 lg:min-h-0 lg:overflow-y-auto lg:pr-1">
                   {sf.lines.length === 0 ? (
-                    <p className="text-xs text-[#a8a090] rounded-xl border border-dashed border-[#2a2622] px-4 py-5 text-center">Tap a size on the left to add it to the sale.</p>
+                    <p className="text-xs text-[#a8a090] rounded-xl border border-dashed border-[#2a2622] px-4 py-5 text-center">Tap a size on the left to add it to the sale, or add an other item.</p>
                   ) : (
                     <div className="space-y-1.5">
                       {sf.lines.map((l, n) => {
                         const list = listOf(l);
                         const price = linePrice(l);
                         const q = parseInt(l.qty, 10) || 0;
-                        const atStock = !sIsCredit && (needBySize[l.size] || 0) >= (onHand[l.size] || 0);
+                        const atStock = !l.other && !sIsCredit && (needBySize[l.size] || 0) >= (onHand[l.size] || 0);
                         return (
                           <div key={l.key} className="rounded-lg border border-[#2a2622] bg-[#14120f] px-2 py-1.5">
                             <div className="flex items-center gap-2">
-                              <div className="flex-1 min-w-0 text-xs leading-tight">{sizeName(l.size)}</div>
+                              <div className="flex-1 min-w-0 text-xs leading-tight">
+                                {l.other ? <>{l.desc} <span className="text-[10px] text-[#a8a090]">(other item)</span></> : sizeName(l.size)}
+                              </div>
                               <div className="flex items-center rounded-md border border-[#2a2622] shrink-0">
                                 <button type="button" onClick={() => stepLine(l, -1)} className="w-6 h-8 flex items-center justify-center text-[#e3bf5a] cursor-pointer" aria-label={`Decrease quantity for item ${n + 1}`}>
                                   <Minus className="w-3 h-3" aria-hidden="true" />
@@ -1035,7 +1098,7 @@ export default function Sales({ user, onChanged }) {
               <div className="rounded-xl border border-[#2a2622] bg-[#14120f] px-4 py-2.5 text-sm space-y-1.5">
                 <div className="flex items-baseline justify-between gap-3">
                   <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Total bottles</span>
-                  <span className="font-mono text-base">{sf.lines.reduce((n, l) => n + (parseInt(l.qty, 10) || 0), 0)}</span>
+                  <span className="font-mono text-base">{sf.lines.filter((l) => l.size).reduce((n, l) => n + (parseInt(l.qty, 10) || 0), 0)}</span>
                 </div>
                 <div className="flex items-baseline justify-between gap-3">
                   <span className="text-[10px] uppercase tracking-wider text-[#a8a090]">Total</span>
@@ -1451,11 +1514,15 @@ export default function Sales({ user, onChanged }) {
                     </div>
                     <ul className="text-sm divide-y divide-[#24201c] rounded-xl border border-[#2a2622]">
                       {linesOf(s).map((l) => {
-                        const short = l.qty > (onHand[l.size_id] || 0);
+                        const short = !!l.size_id && l.qty > (onHand[l.size_id] || 0);
                         return (
                           <li key={l.id} className="flex justify-between gap-3 px-4 py-2.5">
-                            <span>{sizeName(l.size_id)} × {l.qty}</span>
-                            <span className={`font-mono text-xs ${short ? 'text-[#e5736d]' : 'text-[#3ecf8e]'}`}>{qty(onHand[l.size_id] || 0)} in stock</span>
+                            <span>{lineLabel(l)} × {l.qty}</span>
+                            {l.size_id ? (
+                              <span className={`font-mono text-xs ${short ? 'text-[#e5736d]' : 'text-[#3ecf8e]'}`}>{qty(onHand[l.size_id] || 0)} in stock</span>
+                            ) : (
+                              <span className="text-xs text-[#a8a090]">no stock used</span>
+                            )}
                           </li>
                         );
                       })}
@@ -1596,7 +1663,7 @@ export default function Sales({ user, onChanged }) {
             <ul className="divide-y divide-[#24201c] rounded-xl border border-[#2a2622]">
               {linesOf(invoice).map((l) => (
                 <li key={l.id} className="flex justify-between gap-3 px-4 py-2.5">
-                  <span>{sizeName(l.size_id)} × {l.qty} <span className="text-xs text-[#a8a090]">@ {peso(l.unit_price)}</span></span>
+                  <span>{lineLabel(l)} × {l.qty} <span className="text-xs text-[#a8a090]">@ {peso(l.unit_price)}</span></span>
                   <span className="font-mono">{peso(l.amount)}</span>
                 </li>
               ))}

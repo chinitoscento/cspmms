@@ -1,0 +1,189 @@
+-- Sales Analytics: include sales of other items (for example a Tester Kit)
+-- Run once in the Supabase SQL editor, after file 37. Safe to re-run.
+--
+-- Orders, net sales, the trend chart and the customer list already add up the invoice totals, so they
+-- already include other items. What changes:
+--   * "Pieces sold" now counts perfume pieces only (an other item is not a perfume piece).
+--   * Sales by perfume gets one row per other item description (for example "Tester Kit"), so that the
+--     rows add up to the net sales.
+--   * Margin by perfume is unchanged: other items carry no cost, so a margin for them would be misleading.
+
+begin;
+
+-- 1. Summary cards: pieces = perfume lines only ------------------------------------------
+create or replace function public.analytics_sales_summary(p_from date, p_to date)
+ RETURNS TABLE(orders bigint, units bigint, customers bigint, gross numeric, refunds numeric, net numeric, avg_order numeric, cost numeric)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can view sales analytics.'; end if;
+  return query
+  with s as (
+    select x.id, x.customer_id as cid, x.total, x.cost_total,
+           coalesce((select sum(l.qty) from public.sale_lines l where l.sale_id = x.id and l.size_id is not null), 0) as q
+    from public.sales x
+    where x.status = 'Posted'
+      and coalesce(x.invoice_date, x.sale_date) between p_from and p_to
+  ), r as (
+    select coalesce(sum(rt.refund_amount), 0) as amt, coalesce(sum(rt.qty), 0) as q
+    from public.sales_returns rt
+    where rt.status = 'Approved' and rt.resolution = 'refund' and rt.return_date between p_from and p_to
+  )
+  select count(*)::bigint,
+         (coalesce(sum(s.q), 0) - (select r.q from r))::bigint,
+         count(distinct s.cid)::bigint,
+         coalesce(sum(s.total), 0)::numeric,
+         (select r.amt from r)::numeric,
+         (coalesce(sum(s.total), 0) - (select r.amt from r))::numeric,
+         (case when count(*) > 0 then round(coalesce(sum(s.total), 0) / count(*), 2) else 0 end)::numeric,
+         coalesce(sum(s.cost_total), 0)::numeric
+  from s;
+end;
+$function$;
+
+-- 2. Trend chart: pieces = perfume lines only ---------------------------------------------
+create or replace function public.analytics_sales_trend(p_from date, p_to date, p_bucket text)
+ RETURNS TABLE(bucket date, orders bigint, units bigint, net numeric)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can view sales analytics.'; end if;
+  if p_bucket is null or p_bucket not in ('day', 'week', 'month') then raise exception 'Bucket must be day, week or month.'; end if;
+  if p_from is null or p_to is null or p_from > p_to then raise exception 'Choose a valid period.'; end if;
+  return query
+  with b as (
+    select generate_series(date_trunc(p_bucket, p_from::timestamp), p_to::timestamp, ('1 ' || p_bucket)::interval)::date as bk
+  ), s as (
+    select date_trunc(p_bucket, coalesce(x.invoice_date, x.sale_date)::timestamp)::date as bk,
+           count(*) as n, sum(x.total) as amt,
+           sum(coalesce((select sum(l.qty) from public.sale_lines l where l.sale_id = x.id and l.size_id is not null), 0)) as q
+    from public.sales x
+    where x.status = 'Posted' and coalesce(x.invoice_date, x.sale_date) between p_from and p_to
+    group by 1
+  ), r as (
+    select date_trunc(p_bucket, rt.return_date::timestamp)::date as bk, sum(rt.refund_amount) as amt, sum(rt.qty) as q
+    from public.sales_returns rt
+    where rt.status = 'Approved' and rt.resolution = 'refund' and rt.return_date between p_from and p_to
+    group by 1
+  )
+  select b.bk,
+         coalesce(s.n, 0)::bigint,
+         (coalesce(s.q, 0) - coalesce(r.q, 0))::bigint,
+         (coalesce(s.amt, 0) - coalesce(r.amt, 0))::numeric
+  from b
+  left join s on s.bk = b.bk
+  left join r on r.bk = b.bk
+  order by b.bk;
+end;
+$function$;
+
+-- 3. Customers: pieces = perfume lines only -----------------------------------------------
+create or replace function public.analytics_sales_by_customer(p_from date, p_to date)
+ RETURNS TABLE(customer_id uuid, customer_name text, orders bigint, units bigint, gross numeric, refunds numeric, net numeric, avg_order numeric, last_purchase date)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can view sales analytics.'; end if;
+  return query
+  with per as (
+    select s.customer_id as cid, count(*) as n, sum(coalesce(q.q, 0)) as u, sum(s.total) as g
+    from public.sales s
+    left join (select l.sale_id, sum(l.qty) as q from public.sale_lines l where l.size_id is not null group by l.sale_id) q on q.sale_id = s.id
+    where s.status = 'Posted' and coalesce(s.invoice_date, s.sale_date) between p_from and p_to
+    group by s.customer_id
+  ), rf as (
+    select s.customer_id as cid, sum(r.refund_amount) as amt, sum(r.qty) as q
+    from public.sales_returns r
+    join public.sales s on s.id = r.sale_id
+    where r.status = 'Approved' and r.resolution = 'refund' and r.return_date between p_from and p_to
+    group by s.customer_id
+  ), lastp as (
+    select s.customer_id as cid, max(coalesce(s.invoice_date, s.sale_date)) as d
+    from public.sales s where s.status = 'Posted' group by s.customer_id
+  )
+  select c.id, c.name::text,
+         coalesce(per.n, 0)::bigint,
+         (coalesce(per.u, 0) - coalesce(rf.q, 0))::bigint,
+         coalesce(per.g, 0)::numeric,
+         coalesce(rf.amt, 0)::numeric,
+         (coalesce(per.g, 0) - coalesce(rf.amt, 0))::numeric,
+         (case when coalesce(per.n, 0) > 0 then round(per.g / per.n, 2) else 0 end)::numeric,
+         lastp.d
+  from public.customers c
+  left join per on per.cid = c.id
+  left join rf on rf.cid = c.id
+  left join lastp on lastp.cid = c.id
+  union all
+  select null::uuid, 'Walk-in customers'::text,
+         per.n::bigint,
+         (per.u - coalesce(rf.q, 0))::bigint,
+         per.g::numeric,
+         coalesce(rf.amt, 0)::numeric,
+         (per.g - coalesce(rf.amt, 0))::numeric,
+         round(per.g / per.n, 2)::numeric,
+         lastp.d
+  from per
+  left join rf on rf.cid is null
+  left join lastp on lastp.cid is null
+  where per.cid is null;
+end;
+$function$;
+
+-- 4. Sales by perfume: one row per other item, so the rows add up to the net sales ----------
+-- An other item has no perfume, so its row gets a stable id made from its description,
+-- the gender "Other" and no size.
+create or replace function public.analytics_sales_by_perfume(p_from date, p_to date)
+ RETURNS TABLE(perfume_id uuid, perfume_name text, gender text, size_id uuid, size_ml numeric, units bigint, revenue numeric)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+#variable_conflict use_column
+begin
+  if not public.is_owner() then raise exception 'Only the owner can view sales analytics.'; end if;
+  return query
+  with sold as (
+    select l.size_id as sid, sum(l.qty) as u, sum(l.amount) as rev
+    from public.sale_lines l
+    join public.sales s on s.id = l.sale_id
+    where s.status = 'Posted' and coalesce(s.invoice_date, s.sale_date) between p_from and p_to
+    group by l.size_id
+  ), ref as (
+    select r.size_id as sid, sum(r.qty) as u, sum(r.refund_amount) as rev
+    from public.sales_returns r
+    where r.status = 'Approved' and r.resolution = 'refund' and r.return_date between p_from and p_to
+    group by r.size_id
+  )
+  select pf.id, pf.name::text, pf.gender::text, ps.id, ps.size_ml::numeric,
+         (coalesce(so.u, 0) - coalesce(rf.u, 0))::bigint,
+         (coalesce(so.rev, 0) - coalesce(rf.rev, 0))::numeric
+  from public.perfume_sizes ps
+  join public.perfumes pf on pf.id = ps.perfume_id
+  left join sold so on so.sid = ps.id
+  left join ref rf on rf.sid = ps.id
+  where so.sid is not null or rf.sid is not null
+  union all
+  select md5('other:' || o.description)::uuid, o.description::text, 'Other'::text, null::uuid, null::numeric,
+         sum(o.qty)::bigint, sum(o.amount)::numeric
+  from public.sale_lines o
+  join public.sales s2 on s2.id = o.sale_id
+  where o.size_id is null
+    and s2.status = 'Posted' and coalesce(s2.invoice_date, s2.sale_date) between p_from and p_to
+  group by o.description
+  order by 7 desc;
+end;
+$function$;
+
+commit;
+
+-- make the API pick up the changed functions
+notify pgrst, 'reload schema';

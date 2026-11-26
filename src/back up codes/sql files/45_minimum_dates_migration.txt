@@ -1,0 +1,36 @@
+-- Refuse impossible transaction dates (for example a mistyped year such as 0006)
+-- Run once in the Supabase SQL editor. Safe to re-run.
+--
+-- New and changed rows must be dated 2020-01-01 or later. Voided and rejected rows are exempt,
+-- so a voided entry that already carries a bad date can still be kept and reversed.
+-- The constraints are added NOT VALID: they apply to new and changed rows only, and old rows are
+-- not checked. After you have voided and re-entered sale 110, you may also run the VALIDATE lines
+-- at the bottom to confirm that no old row is left with a bad date.
+
+begin;
+
+alter table public.sales drop constraint if exists sales_date_min_chk;
+alter table public.sales add constraint sales_date_min_chk
+  check (sale_date >= date '2020-01-01' or status in ('Voided', 'Rejected')) not valid;
+
+alter table public.purchases drop constraint if exists purchases_date_min_chk;
+alter table public.purchases add constraint purchases_date_min_chk
+  check (purchase_date >= date '2020-01-01' or status = 'Voided') not valid;
+
+alter table public.supplier_payments drop constraint if exists supplier_payments_date_min_chk;
+alter table public.supplier_payments add constraint supplier_payments_date_min_chk
+  check (pay_date >= date '2020-01-01' or status = 'Voided') not valid;
+
+alter table public.packaging_runs drop constraint if exists packaging_runs_date_min_chk;
+alter table public.packaging_runs add constraint packaging_runs_date_min_chk
+  check (run_date >= date '2020-01-01' or status = 'Voided') not valid;
+
+commit;
+
+-- Optional, after sale 110 is voided: each of these fails if an old row still has a bad date.
+-- alter table public.sales validate constraint sales_date_min_chk;
+-- alter table public.purchases validate constraint purchases_date_min_chk;
+-- alter table public.supplier_payments validate constraint supplier_payments_date_min_chk;
+-- alter table public.packaging_runs validate constraint packaging_runs_date_min_chk;
+
+notify pgrst, 'reload schema';

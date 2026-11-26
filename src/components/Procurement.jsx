@@ -4,23 +4,15 @@ import { supabase } from '../supabaseClient';
 import { EmptyState, PageHeader, ErrorNote, Modal, nz, peso, fmtDate, ModalActions, STICKY_TH, STICKY_TD } from './ui';
 import { MATERIAL_CATEGORIES } from './materialCategories';
 import { LateEntryNotice, isLateEntry, withLateNote } from './lateEntry';
-import FieldSearch, { emptyFieldFilter, hasFieldFilter, textMatch, numberMatch, dateMatch } from './FieldSearch';
 
 const todayLocal = () => new Date().toLocaleDateString('en-CA');
+// no business transaction is dated before this; it catches a mistyped year such as 0006
+const MIN_DATE = '2020-01-01';
 const pad = (n) => String(n).padStart(8, '0');
 const purLabel = (n) => `PUR-${pad(n)}`;
 const payLabel = (n) => `PAY-${pad(n)}`;
 const cents = (v) => Math.round((Number(v) || 0) * 100);
 const qty = (v) => Number(v || 0).toLocaleString('en-PH', { maximumFractionDigits: 3 });
-
-// What the Purchases tab can be searched by (the "Search by" dropdown)
-const PURCHASE_SEARCH_FIELDS = [
-  { id: 'supplier', label: 'Supplier', type: 'text', placeholder: 'Supplier name' },
-  { id: 'date', label: 'Date', type: 'date' },
-  { id: 'material', label: 'Raw material', type: 'text', placeholder: 'e.g. oil, bottle, box' },
-  { id: 'pur', label: 'PUR number', type: 'text', placeholder: 'e.g. PUR-00000012 or 12' },
-  { id: 'creditor', label: 'Creditor', type: 'text', placeholder: 'Creditor name' },
-];
 
 const PAYMENT_LABEL = { cash: 'Cash', bank: 'Bank', credit: 'On credit' };
 const ASSET_ACCOUNTS = [
@@ -231,9 +223,9 @@ function CreditorStatement({ stmt, purchases, installmentRows, payAllocs, instPa
   );
 }
 
-export default function Procurement({ user, onChanged, prefill }) {
+export default function Procurement({ user, onChanged }) {
   const isOwner = user?.role === 'owner';
-  const [tab, setTab] = useState(prefill?.tab || 'purchases'); // the dashboard payables alert opens the Payables tab
+  const [tab, setTab] = useState('purchases');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
 
@@ -249,7 +241,6 @@ export default function Procurement({ user, onChanged, prefill }) {
   const [instPays, setInstPays] = useState([]); // which payment went to which installment
   const [stmt, setStmt] = useState(null); // creditor whose statement is open
   const [openId, setOpenId] = useState(null);
-  const [pfilter, setPfilter] = useState(() => emptyFieldFilter('supplier')); // search on the Purchases tab
 
   // new purchase
   const [formOpen, setFormOpen] = useState(false);
@@ -462,6 +453,7 @@ export default function Procurement({ user, onChanged, prefill }) {
       if (interestMode !== 'none' && !(Number(interestValue) > 0)) return setFormError('Enter the interest, or choose no interest.');
     }
     if (payment === 'credit' && terms === 'full' && oneMode !== 'none' && !(Number(oneValue) > 0)) return setFormError('Enter the interest, or choose no interest.');
+    if (!date || date < MIN_DATE) return setFormError('Check the purchase date: the year looks wrong.');
     if (isLateEntry(date) && !lateReason.trim()) return setFormError('This is a late entry. Enter why it was not recorded on the day.');
     if (draftTouched(draft)) return setFormError('You have an item that is not added yet. Click "Add item" or clear it.');
     if (lines.length === 0) return setFormError('Add at least one item.');
@@ -513,6 +505,7 @@ export default function Procurement({ user, onChanged, prefill }) {
     const allocations = paying.items
       .map((i) => ({ purchase_id: i.purchase_id, amount: cents(payAmounts[i.purchase_id]) / 100 }))
       .filter((a) => a.amount > 0);
+    if (!payDate || payDate < MIN_DATE) return setPayError('Check the payment date: the year looks wrong.');
     if (allocations.length === 0) return setPayError('Enter an amount to pay.');
     const tooMuch = paying.items.find((i) => cents(payAmounts[i.purchase_id]) > cents(i.balance));
     if (tooMuch) return setPayError(`${purLabel(tooMuch.purchase_no)} has only ${peso(tooMuch.balance)} left to pay.`);
@@ -580,28 +573,6 @@ export default function Procurement({ user, onChanged, prefill }) {
   const overdueOwed = payables.reduce((s, p) => s + overdueOf(p), 0);
 
   const lineLabel = (l) => (l.line_type === 'material' ? l.description : `${l.description} (${l.account_code})`);
-
-  const shownPurchases = useMemo(() => {
-    if (!hasFieldFilter(pfilter)) return purchases;
-    return purchases.filter((p) => {
-      switch (pfilter.field) {
-        case 'supplier':
-          return textMatch(p.suppliers?.name, pfilter.text);
-        case 'creditor':
-          return textMatch(p.creditors?.name, pfilter.text);
-        case 'material': // any material line of the purchase, by its current name or the name written on the line
-          return (p.purchase_lines || []).some(
-            (l) => l.line_type === 'material' && (textMatch(matById.get(l.material_id)?.name, pfilter.text) || textMatch(l.description, pfilter.text))
-          );
-        case 'pur':
-          return numberMatch(pfilter.text, 'PUR', p.purchase_no);
-        case 'date':
-          return dateMatch(pfilter.from, pfilter.to, p.purchase_date);
-        default:
-          return true;
-      }
-    });
-  }, [purchases, pfilter, matById]);
 
   // ---------- creditors ----------
   const owedByCreditor = useMemo(() => {
@@ -705,17 +676,6 @@ export default function Procurement({ user, onChanged, prefill }) {
         <p className="text-sm text-[#a8a090]">Loading...</p>
       ) : tab === 'purchases' ? (
         <div className="cs-card overflow-hidden">
-          {purchases.length > 0 && (
-            <FieldSearch
-              idPrefix="pu-search"
-              fields={PURCHASE_SEARCH_FIELDS}
-              filter={pfilter}
-              onChange={setPfilter}
-              shown={shownPurchases.length}
-              total={purchases.length}
-              loadedLimit={200}
-            />
-          )}
           {purchases.length === 0 ? (
             <EmptyState
               icon={ShoppingCart}
@@ -741,7 +701,7 @@ export default function Procurement({ user, onChanged, prefill }) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#24201c]">
-                  {shownPurchases.map((p) => {
+                  {purchases.map((p) => {
                     const isOpen = openId === p.id;
                     return (
                       <React.Fragment key={p.id}>
@@ -844,11 +804,6 @@ export default function Procurement({ user, onChanged, prefill }) {
                       </React.Fragment>
                     );
                   })}
-                  {shownPurchases.length === 0 && (
-                    <tr>
-                      <td colSpan={isOwner ? 9 : 8} className="px-4 py-8 text-center text-sm text-[#a8a090]">No purchases match your search.</td>
-                    </tr>
-                  )}
                 </tbody>
               </table>
             </div>
@@ -1066,7 +1021,7 @@ export default function Procurement({ user, onChanged, prefill }) {
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-3">
               <div className="lg:col-span-2">
                 <label htmlFor="pu-date" className="cs-label">Date</label>
-                <input id="pu-date" type="date" value={date} onChange={(e) => setDate(e.target.value)} required className="cs-input px-3 py-2.5" />
+                <input id="pu-date" type="date" min={MIN_DATE} value={date} onChange={(e) => setDate(e.target.value)} required className="cs-input px-3 py-2.5" />
               </div>
               <div className="lg:col-span-4">
                 <label htmlFor="pu-sup" className="cs-label">Supplier (who sold it, optional)</label>
@@ -1403,7 +1358,7 @@ export default function Procurement({ user, onChanged, prefill }) {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label htmlFor="py-date" className="cs-label">Date</label>
-                <input id="py-date" type="date" value={payDate} onChange={(e) => setPayDate(e.target.value)} required className="cs-input px-3 py-2.5" />
+                <input id="py-date" type="date" min={MIN_DATE} value={payDate} onChange={(e) => setPayDate(e.target.value)} required className="cs-input px-3 py-2.5" />
               </div>
               <div>
                 <label htmlFor="py-method" className="cs-label">Paid from</label>
